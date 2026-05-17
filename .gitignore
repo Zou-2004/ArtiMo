@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.env
+outputs/
+validation_outputs/
+logs/
+*.mp4
+*.blend
+benchmark/
+scripts/
