@@ -7,4 +7,4 @@ logs/
 *.mp4
 *.blend
 benchmark/
-scripts/
+benchmark_release/

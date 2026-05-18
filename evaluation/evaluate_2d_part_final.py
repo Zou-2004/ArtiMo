@@ -223,6 +223,76 @@ def _read_csv_rows(path: Path) -> list[dict[str, str]]:
         return list(csv.DictReader(f))
 
 
+def _read_3d_metric_rows(root: Path | None, *, required: bool) -> list[dict[str, str]]:
+    if root is None:
+        if required:
+            raise FileNotFoundError("Missing 3D evaluation directory")
+        return []
+    candidates = [root / "aam_metrics.csv", root / "ablation_metrics.csv"]
+    for path in candidates:
+        if path.exists():
+            rows = _read_csv_rows(path)
+            per_case_path = root / "diagnose/per_case_metrics.json"
+            if per_case_path.exists():
+                try:
+                    per_case_rows = _read_json(per_case_path)
+                except Exception:
+                    per_case_rows = []
+                if isinstance(per_case_rows, list):
+                    by_key = {
+                        (
+                            str(r.get("case_id") or ""),
+                            str(r.get("class") or ""),
+                            str(r.get("asset_name") or ""),
+                            str(r.get("action_name") or ""),
+                            str(r.get("variant") or ""),
+                        ): r
+                        for r in per_case_rows
+                        if isinstance(r, dict)
+                    }
+                    for row in rows:
+                        detail = by_key.get(
+                            (
+                                str(row.get("case_id") or ""),
+                                str(row.get("class") or ""),
+                                str(row.get("asset_name") or ""),
+                                str(row.get("action_name") or ""),
+                                str(row.get("variant") or ""),
+                            )
+                        )
+                        if not isinstance(detail, dict):
+                            continue
+                        if not row.get("prediction_file"):
+                            row["prediction_file"] = str(detail.get("prediction_glb") or "")
+                        for key in ("prediction_glb", "prediction_trajectory", "prediction_plan"):
+                            if detail.get(key) is not None and not row.get(key):
+                                row[key] = str(detail.get(key))
+            return rows
+    if required:
+        raise FileNotFoundError(f"No 3D metrics CSV found under {root}; expected aam_metrics.csv or ablation_metrics.csv")
+    return []
+
+
+def _read_matched_rows(root: Path | None, *, required: bool) -> dict[tuple[str, str], list[dict[str, Any]]]:
+    if root is None:
+        if required:
+            raise FileNotFoundError("Missing 3D evaluation directory")
+        return {}
+    path = root / "diagnose/matched_frames.json"
+    if path.exists():
+        return _matched_by_key(path)
+    if required:
+        raise FileNotFoundError(f"No matched frames found: {path}")
+    return {}
+
+
+def _load_matching_or_none(path: Path) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    obj = _read_json(path)
+    return obj if isinstance(obj, dict) else None
+
+
 def _mean(values: list[float | None]) -> float | None:
     vals = [float(v) for v in values if v is not None and np.isfinite(float(v))]
     return float(np.mean(vals)) if vals else None
@@ -271,9 +341,80 @@ def _matched_by_key(path: Path) -> dict[tuple[str, str], dict[str, Any]]:
     return out
 
 
-def _manifest_cases(path: Path) -> dict[tuple[str, str, str], dict[str, Any]]:
+def _manifest_search_bases(path: Path) -> list[Path]:
+    p = Path(path).expanduser().resolve()
+    bases = [p.parent, *p.parents, REPO_ROOT]
+    out: list[Path] = []
+    seen: set[Path] = set()
+    for base in bases:
+        try:
+            key = base.resolve()
+        except Exception:
+            key = base
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(key)
+    return out
+
+
+def _resolve_manifest_path(raw: Any, manifest_path: Path) -> Path | None:
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    path = Path(text).expanduser()
+    if path.is_absolute():
+        return path.resolve() if path.exists() else path
+    for base in _manifest_search_bases(manifest_path):
+        cand = base / path
+        if cand.exists():
+            return cand.resolve()
+    return (REPO_ROOT / path).resolve()
+
+
+def _resolve_case_asset_root(case: dict[str, Any], manifest_path: Path, data_roots: list[Path]) -> Path | None:
+    asset = str(case.get("asset_name") or "")
+    collection = str(case.get("asset_collection") or ("not_causal_data" if case.get("class") == "non_causal" else "causal_data"))
+    roots = [Path(p).expanduser() for p in data_roots]
+    roots.extend([REPO_ROOT / "data"])
+    roots.extend([base / "data" for base in _manifest_search_bases(manifest_path)])
+    seen: set[Path] = set()
+    for root in roots:
+        try:
+            key = root.resolve()
+        except Exception:
+            key = root
+        if key in seen:
+            continue
+        seen.add(key)
+        for cand in (root / collection / asset, root / asset):
+            if (cand / "mobility.urdf").exists():
+                return cand.resolve()
+    raw = _resolve_manifest_path(case.get("asset_root"), manifest_path)
+    if raw is not None and raw.exists():
+        return raw.resolve()
+    return raw
+
+
+def _resolve_release_case_paths(case: dict[str, Any], manifest_path: Path, data_roots: list[Path]) -> dict[str, Any]:
+    out = dict(case)
+    asset_root = _resolve_case_asset_root(out, manifest_path, data_roots)
+    if asset_root is not None:
+        out["asset_root"] = str(asset_root)
+    for key in ("annotation_path", "gt_trajectory", "gt_glb", "gt_plan_json"):
+        resolved = _resolve_manifest_path(out.get(key), manifest_path)
+        if resolved is not None:
+            out[key] = str(resolved)
+    return out
+
+
+def _manifest_cases(path: Path, data_roots: list[Path] | None = None) -> dict[tuple[str, str, str], dict[str, Any]]:
+    path = Path(path).expanduser().resolve()
     data = _read_json(path)
-    return {_case_key(case): case for case in data.get("cases") or []}
+    cases = [_resolve_release_case_paths(case, path, data_roots or []) for case in data.get("cases") or []]
+    return {_case_key(case): case for case in cases}
 
 
 def _matching_filename(cls: str, asset: str, action: str) -> str:
@@ -1366,12 +1507,21 @@ def _case_mesh_metrics(
     cls, asset, action = _case_key(case)
     raw_gt_anim = ex._load_mesh_sequence(Path(case["gt_glb"]))
     raw_pred = ex._load_mesh_sequence(Path(metric_row["prediction_file"]))
-    matching = _read_json(matching_dir / _matching_filename(cls, asset, action))
-    gt_matching = _read_json(gt_matching_dir / _matching_filename(cls, asset, action))
-    raw_pred = _aligned_raw_from_matching(raw_pred, matching, str(args.mesh_alignment))
+    matching = _load_matching_or_none(matching_dir / _matching_filename(cls, asset, action))
+    gt_matching = _load_matching_or_none(gt_matching_dir / _matching_filename(cls, asset, action))
+    if matching is not None:
+        raw_pred = _aligned_raw_from_matching(raw_pred, matching, str(args.mesh_alignment))
     pred_component_faces = p2d._component_face_groups(raw_pred, int(args.min_component_faces))
-    gt_link_components_anim = p2d._target_link_components_from_matching(gt_matching)
-    pred_link_components = p2d._link_components_from_matching(matching)
+    if matching is not None and gt_matching is not None:
+        gt_link_components_anim = p2d._target_link_components_from_matching(gt_matching)
+        pred_link_components = p2d._link_components_from_matching(matching)
+    else:
+        asset_root = _resolve_project_relative_path(case.get("asset_root"), case)
+        if asset_root is None or not asset_root.exists():
+            raise FileNotFoundError(f"Missing asset_root for fallback component mapping: {case.get('asset_root')}")
+        asset_geom = p2d.ev.load_asset_geometry(asset_root, 128, 0.01)
+        gt_link_components_anim = p2d._link_components_from_gt(Path(case["gt_glb"]), asset_geom, raw_gt_anim)
+        pred_link_components = p2d._link_components_from_gt(Path(metric_row["prediction_file"]), asset_geom, raw_pred)
     states = p2d._selected_states(matched, bool(args.include_terminal))
     if int(args.max_states) > 0:
         states = states[: int(args.max_states)]
@@ -1892,6 +2042,13 @@ def _run_worker(task: dict[str, Any], args: argparse.Namespace, worker_dir: Path
 def main() -> None:
     parser = argparse.ArgumentParser(description="Final selected-view 2D part evaluation for full agent, AAM, and PuppetMaster.")
     parser.add_argument("--manifest", type=Path, default=REPO_ROOT / "experiments/final_3d_evaluation/ablation_3d/diagnose/resolved_manifest.json")
+    parser.add_argument(
+        "--data_root",
+        type=Path,
+        action="append",
+        default=[],
+        help="Root containing causal_data/not_causal_data asset folders. Can be passed multiple times.",
+    )
     parser.add_argument("--own_3d_dir", type=Path, default=REPO_ROOT / "experiments/final_3d_evaluation/own_method_3d_matching")
     parser.add_argument("--aam_3d_dir", type=Path, default=REPO_ROOT / "experiments/final_3d_evaluation/animate_anymesh_3d")
     parser.add_argument("--animate3d_3d_dir", type=Path, default=None)
@@ -1960,23 +2117,20 @@ def main() -> None:
         return
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
-    cases_by_key = _manifest_cases(args.manifest)
-    own_rows = {_case_key(r): r for r in _read_csv_rows(args.own_3d_dir / "aam_metrics.csv")}
-    aam_rows = {_case_key(r): r for r in _read_csv_rows(args.aam_3d_dir / "aam_metrics.csv")}
-    animate3d_rows = (
-        {_case_key(r): r for r in _read_csv_rows(args.animate3d_3d_dir / "aam_metrics.csv")}
-        if args.animate3d_3d_dir is not None
-        else {}
-    )
-    particulate_rows = {_case_key(r): r for r in _read_csv_rows(args.particulate_3d_dir / "aam_metrics.csv")}
-    own_matched = _matched_by_key(args.own_3d_dir / "diagnose/matched_frames.json")
-    aam_matched = _matched_by_key(args.aam_3d_dir / "diagnose/matched_frames.json")
-    animate3d_matched = (
-        _matched_by_key(args.animate3d_3d_dir / "diagnose/matched_frames.json")
-        if args.animate3d_3d_dir is not None
-        else {}
-    )
-    particulate_matched = _matched_by_key(args.particulate_3d_dir / "diagnose/matched_frames.json")
+    cases_by_key = _manifest_cases(args.manifest, list(args.data_root or []))
+    active_variants = set(args.variants or [])
+    own_required = bool({"full_agent", "puppet_master"} & active_variants)
+    aam_required = "animate_anymesh" in active_variants
+    animate3d_required = "animate3d" in active_variants
+    particulate_required = "particulate_urdf" in active_variants
+    own_rows = {_case_key(r): r for r in _read_3d_metric_rows(args.own_3d_dir, required=own_required)}
+    aam_rows = {_case_key(r): r for r in _read_3d_metric_rows(args.aam_3d_dir, required=aam_required)}
+    animate3d_rows = {_case_key(r): r for r in _read_3d_metric_rows(args.animate3d_3d_dir, required=animate3d_required)}
+    particulate_rows = {_case_key(r): r for r in _read_3d_metric_rows(args.particulate_3d_dir, required=particulate_required)}
+    own_matched = _read_matched_rows(args.own_3d_dir, required=own_required)
+    aam_matched = _read_matched_rows(args.aam_3d_dir, required=aam_required)
+    animate3d_matched = _read_matched_rows(args.animate3d_3d_dir, required=animate3d_required)
+    particulate_matched = _read_matched_rows(args.particulate_3d_dir, required=particulate_required)
     noncausal_views = _load_noncausal_views(args.noncausal_views_json)
 
     all_cases = list(cases_by_key.values())

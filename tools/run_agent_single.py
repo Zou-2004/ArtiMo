@@ -55,7 +55,6 @@ def main():
         help='GLB scene for rendering: "auto" | "none" | explicit path',
     )
     parser.add_argument("--debug_motion", action="store_true")
-    parser.add_argument("--skip_plan_frames", action="store_true", help="Skip PNG/MP4 frame rendering in run_plan.py")
     parser.add_argument("--enable_loop", action="store_true", help="Run coverage+motion plan loop after plan generation")
     parser.add_argument("--enable_coverage_loop", action="store_true", help="Enable coverage loop (used with --enable_loop)")
     parser.add_argument("--enable_motion_loop", action="store_true", help="Enable motion loop (used with --enable_loop)")
@@ -63,6 +62,16 @@ def main():
     parser.add_argument("--coverage_max_iters", type=int, default=1)
     parser.add_argument("--motion_max_iters", type=int, default=3)
     parser.add_argument("--disable_loop_vlm_api", action="store_true", help="Disable GPT-based VLM in coverage/motion loops and use heuristic fallback")
+    parser.add_argument(
+        "--disable_numeric_verify",
+        action="store_true",
+        help="Compatibility no-op: ArtiMo's current motion loop uses VLM/trajectory diagnosis without the legacy numeric verifier.",
+    )
+    parser.add_argument(
+        "--skip_plan_frames",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--skip_vlm", action="store_true")
     parser.add_argument("--skip_llm", action="store_true")
     parser.add_argument("--skip_plan_exec", action="store_true")
@@ -240,8 +249,6 @@ def main():
             loop_cmd.append("--skip_coverage_loop")
         if args.debug_motion:
             loop_cmd.append("--debug_motion")
-        if args.skip_plan_frames:
-            loop_cmd.append("--skip_plan_frames")
         if args.disable_loop_vlm_api:
             loop_cmd.append("--disable_loop_vlm_api")
         if effective_input_images:
@@ -309,8 +316,6 @@ def main():
             cmd.extend(["--use_glb_scene", str(glb_arg)])
         if args.debug_motion:
             cmd.append("--debug_motion")
-        if args.skip_plan_frames:
-            cmd.append("--skip_frame_render")
         run(cmd)
 
     print("")

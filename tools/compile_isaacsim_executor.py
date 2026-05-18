@@ -336,7 +336,6 @@ def _prepare_baked_render_visual(asset_root: Path, plan_json: Path, bundle_dir: 
         "--export_animated_glb",
         "--use_glb_scene",
         "auto",
-        "--skip_frame_render",
     ]
     result = subprocess.run(cmd, check=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     log_path = render_dir / "bake_render_visual.log"

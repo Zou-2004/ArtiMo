@@ -9,14 +9,11 @@ from pathlib import Path
 import struct
 import subprocess
 import tempfile
-import shutil
-import zlib
 import copy
 import re
 
 import numpy as np
 
-import blender_render as br
 import torch_accel as tacc
 
 try:
@@ -31,52 +28,10 @@ except Exception:
     _HAS_PYRENDER = False
 
 try:
-    import imageio.v2 as imageio  # type: ignore
-    _HAS_IMAGEIO = True
-except Exception:
-    _HAS_IMAGEIO = False
-
-try:
-    import imageio_ffmpeg  # type: ignore
-    _HAS_IMAGEIO_FFMPEG = True
-except Exception:
-    _HAS_IMAGEIO_FFMPEG = False
-
-try:
     from PIL import Image
     _HAS_PIL = True
 except Exception:
     _HAS_PIL = False
-
-
-def setup_pyrender_headless():
-    if os.environ.get("PYOPENGL_PLATFORM") is None:
-        os.environ["PYOPENGL_PLATFORM"] = "egl"
-    try:
-        import pyglet  # type: ignore
-        pyglet.options["headless"] = True
-    except Exception:
-        pass
-
-
-def _write_png(path, array):
-    if array.dtype != np.uint8:
-        array = array.astype(np.uint8)
-    height, width, _ = array.shape
-    raw = b"".join(b"\x00" + array[i].tobytes() for i in range(height))
-    compressed = zlib.compress(raw, level=9)
-
-    def chunk(tag, data):
-        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
-
-    signature = b"\x89PNG\r\n\x1a\n"
-    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
-
-    with open(path, "wb") as f:
-        f.write(signature)
-        f.write(chunk(b"IHDR", ihdr))
-        f.write(chunk(b"IDAT", compressed))
-        f.write(chunk(b"IEND", b""))
 
 
 def _parse_floats(text, default=None):
@@ -771,18 +726,6 @@ def export_mesh_sequence(out_dir, frames, link_meshes, links, joints):
         scene.export(out_path)
 
 
-def get_ffmpeg_path():
-    ffmpeg = shutil.which("ffmpeg")
-    if ffmpeg:
-        return ffmpeg
-    if _HAS_IMAGEIO_FFMPEG:
-        try:
-            return imageio_ffmpeg.get_ffmpeg_exe()
-        except Exception:
-            return None
-    return None
-
-
 def matrix_to_trs(mat):
     translation, rotation, _scale = matrix_to_trs_scale(mat)
     return translation, rotation
@@ -1205,7 +1148,7 @@ def _wrap_to_joint_limit_span(q, limits):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Execute LLM plan JSON and render with pyrender")
+    parser = argparse.ArgumentParser(description="Execute plan JSON and export trajectory/animated GLB")
     parser.add_argument("--asset_root", required=True)
     parser.add_argument("--plan_json", required=True)
     parser.add_argument("--out", required=True)
@@ -1220,11 +1163,6 @@ def main():
     parser.add_argument("--debug_motion", action="store_true", help="Print per-second wheel/base motion stats")
     parser.add_argument("--trajectory_npz", default=None, help="Output trajectory npz path (default: <out>/trajectory.npz)")
     parser.add_argument("--trajectory_jsonl", default=None, help="Output trajectory jsonl path (default: <out>/trajectory.jsonl)")
-    parser.add_argument(
-        "--skip_frame_render",
-        action="store_true",
-        help="Do not render PNG frames or MP4 (still exports trajectory and animated GLB).",
-    )
     parser.add_argument("--skip_glb_alignment_check", action="store_true", help="Disable preflight URDF<->GLB alignment check")
     parser.add_argument("--glb_center_tol", type=float, default=1e-3, help="Max allowed center offset (meters) for URDF<->GLB mapping")
     parser.add_argument("--glb_scale_tol", type=float, default=1e-2, help="Max allowed extents ratio error for URDF<->GLB mapping")
@@ -1539,17 +1477,8 @@ def main():
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
     glb_scene_path = _resolve_canonical_glb_scene(asset_root, args.use_glb_scene)
-    frame_dir = out_root / "plan_frames"
-    render_glb_path = None
-    temp_render_glb_path = None
-    need_render_glb = bool(args.export_animated_glb or (not args.skip_frame_render))
-    if need_render_glb:
-        if args.export_animated_glb:
-            glb_path = out_root / "plan_animated.glb"
-        else:
-            with tempfile.NamedTemporaryFile(prefix="plan_render_", suffix=".glb", delete=False) as tmp:
-                glb_path = Path(tmp.name)
-            temp_render_glb_path = glb_path
+    if args.export_animated_glb:
+        glb_path = out_root / "plan_animated.glb"
         if glb_scene_path is not None:
             scene = trimesh.load(glb_scene_path, force="scene", process=False)
             rest_joint_pos = {j.get("name"): 0.0 for j in joints if j.get("name")}
@@ -1601,91 +1530,14 @@ def main():
         else:
             textured_meshes = load_link_meshes(links, urdf_path.parent, textured=True)
             export_animated_glb(glb_path, textured_meshes, frames, links, joints, fps)
-        render_glb_path = glb_path
-        if args.export_animated_glb:
-            print(f"Wrote animated GLB to {glb_path}")
+        print(f"Wrote animated GLB to {glb_path}")
 
     if args.export_mesh_sequence:
         textured_meshes = load_link_meshes(links, urdf_path.parent, textured=True)
         export_mesh_sequence(out_root, frames, textured_meshes, links, joints)
 
-    if args.skip_frame_render:
-        print("[INFO] Skipping PNG/MP4 rendering (--skip_frame_render).")
-    else:
-        center, radius = compute_scene_bounds(link_meshes)
-        camera = compute_camera(center, radius, azim_deg=45.0, elev_deg=25.0)
-        frame_dir.mkdir(parents=True, exist_ok=True)
-        if render_glb_path is None:
-            raise SystemExit("Blender frame rendering requires an animated GLB, but export did not produce one.")
-        br.render_animation_sequence_from_glb(
-            render_glb_path,
-            frame_dir,
-            tuple(int(x) for x in args.resolution),
-            camera,
-            frame_count=len(frames),
-            fps=fps,
-            fov_deg=45.0,
-        )
-
-        mp4_path = out_root / "plan.mp4"
-        if _HAS_IMAGEIO:
-            try:
-                writer = imageio.get_writer(mp4_path, format="FFMPEG", fps=fps)
-                for idx in range(len(frames)):
-                    frame_path = frame_dir / f"frame_{idx:04d}.png"
-                    writer.append_data(imageio.imread(frame_path))
-                writer.close()
-            except Exception:
-                ffmpeg = get_ffmpeg_path()
-                if ffmpeg:
-                    pattern = str(frame_dir / "frame_%04d.png")
-                    subprocess.run(
-                        [
-                            ffmpeg,
-                            "-y",
-                            "-framerate",
-                            str(fps),
-                            "-i",
-                            pattern,
-                            "-pix_fmt",
-                            "yuv420p",
-                            str(mp4_path),
-                        ],
-                        check=False,
-                    )
-                else:
-                    print("[WARN] No ffmpeg available; skipping MP4 export.")
-        else:
-            ffmpeg = get_ffmpeg_path()
-            if ffmpeg:
-                pattern = str(frame_dir / "frame_%04d.png")
-                subprocess.run(
-                    [
-                        ffmpeg,
-                        "-y",
-                        "-framerate",
-                        str(fps),
-                        "-i",
-                        pattern,
-                        "-pix_fmt",
-                        "yuv420p",
-                        str(mp4_path),
-                    ],
-                    check=False,
-                )
-            else:
-                print("[WARN] No ffmpeg available; skipping MP4 export.")
-
-    if temp_render_glb_path is not None:
-        try:
-            Path(temp_render_glb_path).unlink()
-        except Exception:
-            pass
-
     print(f"Wrote trajectory NPZ to {traj_npz_path}")
     print(f"Wrote trajectory JSONL to {traj_jsonl_path}")
-    if not args.skip_frame_render:
-        print(f"Wrote frames to {frame_dir}")
 
 
 if __name__ == "__main__":

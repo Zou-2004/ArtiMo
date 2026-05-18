@@ -1054,7 +1054,6 @@ def _prepare_pipeline_if_needed(args, py: str, asset_out: Path):
         "--api_provider",
         args.api_provider,
         "--skip_plan_exec",
-        "--skip_plan_frames",
     ]
     if args.use_glb_scene is not None:
         cmd.extend(["--use_glb_scene", args.use_glb_scene])
@@ -2320,7 +2319,7 @@ def _build_timeline_trajectory_detail(traj_npz_data, plan_obj: dict, timeline_sa
     return {"timeline_segment_motion": timeline_detail}
 
 
-def execute_plan_once(py: str, asset_root: Path, plan_path: Path, out_dir: Path, resolution, use_glb_scene: str | None, skip_plan_frames=True, debug_motion=False):
+def execute_plan_once(py: str, asset_root: Path, plan_path: Path, out_dir: Path, resolution, use_glb_scene: str | None, debug_motion=False):
     out_dir.mkdir(parents=True, exist_ok=True)
     traj_npz = out_dir / "trajectory.npz"
     traj_jsonl = out_dir / "trajectory.jsonl"
@@ -2350,8 +2349,6 @@ def execute_plan_once(py: str, asset_root: Path, plan_path: Path, out_dir: Path,
                 f"{asset_root / f'animated_textured_{asset_root.name}.glb'}"
             )
         cmd.extend(["--use_glb_scene", str(glb)])
-    if skip_plan_frames:
-        cmd.append("--skip_frame_render")
     if debug_motion:
         cmd.append("--debug_motion")
     try:
@@ -2400,7 +2397,6 @@ def main():
     parser.add_argument("--resolution", type=int, nargs=2, default=[800, 600])
     parser.add_argument("--use_glb_scene", default="auto")
     parser.add_argument("--debug_motion", action="store_true")
-    parser.add_argument("--skip_plan_frames", action="store_true")
     parser.add_argument("--skip_preprocess", action="store_true")
     parser.add_argument("--skip_vlm", action="store_true")
     parser.add_argument("--skip_llm", action="store_true")
@@ -2418,6 +2414,12 @@ def main():
     )
     parser.add_argument("--coverage_max_iters", type=int, default=2)
     parser.add_argument("--motion_max_iters", type=int, default=3)
+    parser.add_argument(
+        "--disable_numeric_verify",
+        action="store_true",
+        help="Compatibility no-op: ArtiMo's current motion loop uses VLM/trajectory diagnosis without the legacy numeric verifier.",
+    )
+    parser.add_argument("--skip_plan_frames", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
 
     if args.skip_coverage_loop:
@@ -2561,7 +2563,6 @@ def main():
                 preview_exec_dir,
                 args.resolution,
                 args.use_glb_scene,
-                skip_plan_frames=True,
                 debug_motion=False,
             )
             best_fi, best_link_tf, ghost_info = _select_peak_motion_frame(
@@ -2811,7 +2812,6 @@ def main():
             exec_dir,
             args.resolution,
             args.use_glb_scene,
-            skip_plan_frames=args.skip_plan_frames,
             debug_motion=args.debug_motion,
         )
         final_plan_iter = plan_iter0
@@ -2830,7 +2830,6 @@ def main():
                 next_exec_dir,
                 args.resolution,
                 args.use_glb_scene,
-                skip_plan_frames=args.skip_plan_frames,
                 debug_motion=args.debug_motion,
             )
             iter_traj_npz_next = iterations_root / f"trajectory_iter{iter_idx:02d}.npz"
@@ -2860,7 +2859,6 @@ def main():
                 exec_dir,
                 args.resolution,
                 args.use_glb_scene,
-                skip_plan_frames=args.skip_plan_frames,
                 debug_motion=args.debug_motion,
             )
             # copy trajectories/glb into iterations namespace

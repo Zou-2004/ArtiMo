@@ -206,6 +206,131 @@ def _resolve_existing_path(raw: Any, base: Path = REPO_ROOT) -> Path | None:
     return path if path.exists() else None
 
 
+def _manifest_search_bases(manifest_path: Path | None) -> list[Path]:
+    bases: list[Path] = []
+    if manifest_path is not None:
+        p = manifest_path.resolve()
+        bases.extend([p.parent, *p.parents])
+    bases.append(REPO_ROOT)
+    out: list[Path] = []
+    seen: set[Path] = set()
+    for base in bases:
+        try:
+            key = base.resolve()
+        except Exception:
+            key = base
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(key)
+    return out
+
+
+def _resolve_manifest_path(raw: Any, manifest_path: Path | None) -> Path | None:
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    path = Path(text).expanduser()
+    if path.is_absolute():
+        return path.resolve() if path.exists() else path
+    for base in _manifest_search_bases(manifest_path):
+        cand = base / path
+        if cand.exists():
+            return cand.resolve()
+    return (REPO_ROOT / path).resolve()
+
+
+def _data_root_candidates(args: argparse.Namespace, manifest_path: Path | None) -> list[Path]:
+    roots = [Path(p).expanduser() for p in (getattr(args, "data_root", None) or [])]
+    roots.extend([REPO_ROOT / "data"])
+    roots.extend([base / "data" for base in _manifest_search_bases(manifest_path)])
+    out: list[Path] = []
+    seen: set[Path] = set()
+    for root in roots:
+        try:
+            key = root.resolve()
+        except Exception:
+            key = root
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(root)
+    return out
+
+
+def _resolve_case_asset_root(case: dict[str, Any], args: argparse.Namespace, manifest_path: Path | None) -> Path | None:
+    asset = str(case.get("asset_name") or "")
+    collection = str(case.get("asset_collection") or ("not_causal_data" if case.get("class") == "non_causal" else "causal_data"))
+    for root in _data_root_candidates(args, manifest_path):
+        for cand in (root / collection / asset, root / asset):
+            if (cand / "mobility.urdf").exists():
+                return cand.resolve()
+    raw = _resolve_manifest_path(case.get("asset_root"), manifest_path)
+    if raw is not None and raw.exists():
+        return raw.resolve()
+    return raw
+
+
+def _resolve_release_case_paths(case: dict[str, Any], args: argparse.Namespace, manifest_path: Path | None) -> dict[str, Any]:
+    out = dict(case)
+    asset_root = _resolve_case_asset_root(out, args, manifest_path)
+    if asset_root is not None:
+        out["asset_root"] = str(asset_root)
+    for key in ("annotation_path", "gt_trajectory", "gt_glb", "gt_plan_json"):
+        path = _resolve_manifest_path(out.get(key), manifest_path)
+        if path is not None:
+            out[key] = str(path)
+    return out
+
+
+def _prediction_dir_candidates(prediction_roots: list[Path], variant: str, cls: str, asset: str, action: str) -> list[Path]:
+    out: list[Path] = []
+    for root in prediction_roots:
+        out.extend(
+            [
+                root / variant / cls / asset / action / asset,
+                root / variant / cls / asset / action,
+                root / variant / asset / action / asset,
+                root / variant / asset / action,
+                root / cls / asset / action / asset,
+                root / cls / asset / action,
+                root / asset / action / asset,
+                root / asset / action,
+            ]
+        )
+    return out
+
+
+def _attach_prediction_roots(cases: list[dict[str, Any]], args: argparse.Namespace) -> list[dict[str, Any]]:
+    roots = [Path(p).expanduser().resolve() for p in (getattr(args, "prediction_root", None) or []) if Path(p).expanduser().exists()]
+    if not roots:
+        return cases
+    variant = str(getattr(args, "prediction_variant", None) or "full_agent")
+    out: list[dict[str, Any]] = []
+    for case in cases:
+        row = dict(case)
+        cls = str(row.get("class") or "")
+        asset = str(row.get("asset_name") or "")
+        action = str(row.get("action_name") or "")
+        for cand in _prediction_dir_candidates(roots, variant, cls, asset, action):
+            traj = cand / "trajectory.jsonl"
+            plan = cand / "plan.json"
+            glb = cand / "plan_animated.glb"
+            if not (traj.exists() or plan.exists() or glb.exists()):
+                continue
+            if traj.exists():
+                row.setdefault("variants", {})[variant] = str(traj.resolve())
+            if plan.exists():
+                row.setdefault("variant_plans", {})[variant] = str(plan.resolve())
+            if glb.exists():
+                row.setdefault("variant_glbs", {})[variant] = str(glb.resolve())
+            break
+        out.append(row)
+    return out
+
+
 def _plan_duration_s(plan_path: Path | None) -> float | None:
     if plan_path is None or not plan_path.exists():
         return None
@@ -1637,23 +1762,37 @@ def _excluded_assets(args: argparse.Namespace) -> set[str]:
 
 def _filter_excluded_cases(cases: list[dict[str, Any]], args: argparse.Namespace) -> list[dict[str, Any]]:
     excluded_assets = _excluded_assets(args)
-    if not excluded_assets:
-        return cases
-    return [case for case in cases if str(case.get("asset_name") or "") not in excluded_assets]
+    out: list[dict[str, Any]] = []
+    for case in cases:
+        asset = str(case.get("asset_name") or "")
+        action = str(case.get("action_name") or "")
+        cls = str(case.get("class") or "")
+        if asset in excluded_assets:
+            continue
+        if args.asset and asset != args.asset:
+            continue
+        if args.action and action != args.action:
+            continue
+        if args.class_name and cls != args.class_name:
+            continue
+        out.append(case)
+    return out
 
 
 def load_cases(args: argparse.Namespace) -> list[dict[str, Any]]:
     if args.cases_manifest:
-        manifest = _read_json(Path(args.cases_manifest).resolve())
+        manifest_path = Path(args.cases_manifest).expanduser().resolve()
+        manifest = _read_json(manifest_path)
         if isinstance(manifest, dict):
             cases = manifest.get("cases") or manifest.get("items") or []
         else:
             cases = manifest
-        cases = _filter_excluded_cases(list(cases), args)
+        cases = [_resolve_release_case_paths(dict(case), args, manifest_path) for case in list(cases)]
+        cases = _attach_prediction_roots(_filter_excluded_cases(cases, args), args)
         if args.limit is not None:
             cases = cases[: max(0, int(args.limit))]
         return cases
-    return build_manifest_from_roots(args)
+    return _attach_prediction_roots(build_manifest_from_roots(args), args)
 
 
 def _case_meta(case: dict[str, Any], row: dict[str, Any]) -> dict[str, Any]:
@@ -1916,6 +2055,26 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Part-normalized 3D ablation evaluator for articulated animation outputs.")
     parser.add_argument("--cases_manifest", type=Path, default=None)
     parser.add_argument("--out_dir", type=Path, required=True)
+    parser.add_argument(
+        "--data_root",
+        type=Path,
+        action="append",
+        default=[],
+        help="Root containing causal_data/not_causal_data asset folders. Can be passed multiple times.",
+    )
+    parser.add_argument(
+        "--prediction_root",
+        type=Path,
+        action="append",
+        default=[],
+        help="Root containing predictions to attach to the release manifest.",
+    )
+    parser.add_argument(
+        "--prediction_variant",
+        choices=VARIANTS,
+        default="full_agent",
+        help="Variant name assigned to --prediction_root predictions.",
+    )
     parser.add_argument(
         "--variants",
         nargs="+",

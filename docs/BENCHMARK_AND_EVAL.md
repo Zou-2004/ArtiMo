@@ -1,45 +1,231 @@
 # Benchmark and Evaluation Usage
 
-This document describes how to use existing benchmark annotations/manifests with
-ArtiMo. It does not describe the benchmark authoring process.
+This document starts from the common release use case: you already have a
+method prediction and want to compare it against the benchmark.
 
-## Expected Benchmark Case Manifest
+## Evaluate A Prediction
 
-Most evaluation scripts expect a JSON manifest:
+If the benchmark package was downloaded from HuggingFace, keep it anywhere and
+set `BENCH` to that folder:
+
+```bash
+export BENCH=/path/to/benchmark_release
+export DATA=/path/to/data
+```
+
+`DATA` is the root of the prepared ArtiMo asset folders used by evaluation.
+Users do not decide whether an asset is causal or non-causal. That split is
+stored in `$BENCH/manifests/asset_source_manifest.csv` as `asset_collection`,
+and the preparation script below writes each asset to the right subfolder:
+
+```text
+$DATA/
+  causal_data/
+    bin1/
+      mobility.urdf
+      animated_textured_bin1.glb        # needed when running ArtiMo on this asset
+    microwave1/
+      mobility.urdf
+  not_causal_data/
+    <asset_name>/
+      mobility.urdf
+```
+
+The benchmark package already ships the evaluation manifests under
+`$BENCH/manifests/`; normal users do not need to generate them.
+
+The asset folders are named with ArtiMo benchmark names, not raw dataset ids.
+The manifest maps each raw dataset asset to the benchmark folder name and split:
+
+```text
+asset_name,asset_collection,source_dataset,source_asset,source_asset_dir,source_file
+bin1,causal_data,PartNet-Mobility,102186,102186_trashcan,PartNet-Mobility/102186
+microwave1,causal_data,ArtVIP,microwave_door_13,,ArtVIP/Articulated_objects/small_appliances/microwave/microwave_1/model_microwave_1.usd
+```
+
+For evaluation, the final prepared asset path is:
+
+```text
+$DATA/<asset_collection>/<asset_name>/mobility.urdf
+```
+
+For example, the original PartNet asset
+`102186` must be prepared as `$DATA/causal_data/bin1/`. If your local PartNet
+copy was renamed to include the category, `102186_trashcan` is also accepted.
+
+To copy or symlink benchmark assets from source roots into the expected layout,
+provide one source root per downloaded/converted dataset. The script reads
+`asset_collection` from the manifest and automatically writes to
+`$DATA/causal_data/...` or `$DATA/not_causal_data/...`:
+
+```bash
+python tools/prepare_benchmark_assets_from_manifest.py \
+  --asset_manifest "$BENCH/manifests/asset_source_manifest.csv" \
+  --out_data_root "$DATA" \
+  --source_root PartNet-Mobility=/path/to/partnet-mobility \
+  --source_root ArtVIP=/path/to/data_artvip_converted \
+  --source_root Lightwheel=/path/to/data_lightwheel_converted \
+  --copy_mode symlink
+```
+
+Before running ArtiMo's `run_agent` on one of these prepared assets, build its
+textured animated GLB from the URDF and meshes:
+
+```bash
+bash scripts/textured.sh --root "$DATA/causal_data" bin1
+```
+
+This writes `animated_textured_<asset_name>.glb` and
+`animated_textured_<asset_name>.report.json` into the asset folder. For pure
+benchmark evaluation of existing prediction GLBs/trajectories, this file is not
+normally required unless the evaluator needs to fall back to asset rendering.
+
+For a 3D prediction method, place each prediction as `plan_animated.glb` and/or
+`trajectory.jsonl` under one of these common layouts:
+
+```text
+<pred_root>/<class>/<asset>/<action>/plan_animated.glb
+<pred_root>/<class>/<asset>/<action>/trajectory.jsonl
+<pred_root>/<asset>/<action>/<asset>/plan_animated.glb
+<pred_root>/<asset>/<action>/<asset>/trajectory.jsonl
+```
+
+Run 3D evaluation:
+
+```bash
+scripts/run_3d_eval.sh \
+  --cases_manifest "$BENCH/manifests/eval_manifest_225.json" \
+  --gt_phase_static_manifest "$BENCH/manifests/phase_static_manifest.csv" \
+  --data_root "$DATA" \
+  --prediction_root /path/to/pred_root \
+  --prediction_variant full_agent \
+  --out_dir outputs/eval_3d_full_agent \
+  --variants full_agent \
+  --sequence_source auto
+```
+
+Main 3D metrics:
+
+- `PN_gIoU`: part-normalized 3D AABB generalized IoU.
+- `PN_PC`: Chamfer-distance-based point consistency similarity.
+- `PN_OC`: voxel occupancy F1.
+
+PyTorch3D is optional but useful in two places: the ArtiMo pipeline can use it
+for GPU rasterization when preparing visual prompts/diagnostic renders, and 3D
+evaluation can use it to accelerate `PN_PC`. For final runs, install PyTorch3D
+from the official instructions:
+https://github.com/facebookresearch/pytorch3d/blob/main/INSTALL.md. Then use:
+
+```bash
+scripts/run_3d_eval.sh ... \
+  --pc_backend pytorch3d \
+  --gpu_devices 0
+```
+
+`--pc_backend auto --gpu_devices 0` also uses PyTorch3D when available. If
+PyTorch3D is not installed, use `--pc_backend torch --gpu_devices 0` for the
+Torch CUDA backend or `--pc_backend numpy` for CPU-only evaluation.
+
+For the agent pipeline, enable the GPU raster paths with:
+
+```bash
+export CODEX_TORCH_RASTER=1
+export CODEX_PYTORCH3D_VIS_RASTER=1
+export CODEX_TORCH_RASTER_ALLOW_CPU=1
+```
+
+For 2D evaluation of mesh/GLB predictions, run 3D evaluation first. The 2D
+evaluator reuses the 3D matching output:
+
+```bash
+scripts/run_2d_eval.sh \
+  --manifest "$BENCH/manifests/eval_manifest_225.json" \
+  --own_3d_dir outputs/eval_3d_full_agent \
+  --out_dir outputs/eval_2d_full_agent \
+  --data_root "$DATA" \
+  --variants full_agent \
+  --project_root "$BENCH"
+```
+
+For a 2D GIF baseline, place GIFs under
+`<puppet_root>/<asset>/<action>/reference_view_*.gif` or
+`<puppet_root>/causal/<asset>/<action>/reference_view_*.gif`, then include
+`--variants puppet_master --puppet_root /path/to/puppet_root`. It still needs
+`--own_3d_dir` from a 3D eval run because GT endpoint frames and selected views
+come from the benchmark matching step.
+
+Main 2D metrics:
+
+- `P_MaskIoU`: per-part visible mask IoU.
+- `P_BoundaryF1`: per-part silhouette boundary F1.
+- `P_ContourCD`: normalized per-part contour Chamfer distance.
+
+## Manifest Fields
+
+The release manifest is prebuilt and intentionally small. Each case records where the case
+came from and where to find the GT artifacts:
 
 ```json
 {
-  "cases": [
-    {
-      "case_id": "casual_output:bin1:fully_open",
-      "class": "bin",
-      "asset_name": "bin1",
-      "action_name": "fully_open",
-      "annotation_path": "/path/to/annotation.json",
-      "asset_root": "/path/to/data/causal_data/bin1",
-      "gt_trajectory": "/path/to/compiled_gt/trajectory.jsonl",
-      "gt_glb": "/path/to/compiled_gt/plan_animated.glb",
-      "gt_plan_json": "/path/to/compiled_gt/plan.json",
-      "variants": {
-        "full_agent": "/path/to/pred/trajectory.jsonl"
-      },
-      "variant_plans": {
-        "full_agent": "/path/to/pred/plan.json"
-      },
-      "variant_glbs": {
-        "full_agent": "/path/to/pred/plan_animated.glb"
-      }
-    }
-  ]
+  "case_id": "casual_output:bin1:fully_open",
+  "class": "bin",
+  "asset_name": "bin1",
+  "action_name": "fully_open",
+  "action_prompt": "Fully open the trash bin",
+  "source_dataset": "PartNet-Mobility",
+  "source_asset": "102186",
+  "source_asset_dir": "102186_trashcan",
+  "source_file": "PartNet-Mobility/102186",
+  "asset_collection": "causal_data",
+  "annotation_path": "benchmark_release/annotations/bin_constraint_templates/cases/casual_output__bin1__fully_open.json",
+  "gt_plan_json": "benchmark_release/gt_animations/bin/bin1/fully_open/plan.json",
+  "gt_trajectory": "benchmark_release/gt_animations/bin/bin1/fully_open/animation/trajectory.jsonl",
+  "gt_glb": "benchmark_release/gt_animations/bin/bin1/fully_open/animation/plan_animated.glb"
 }
 ```
 
-Paths may be absolute or relative to the working directory.
+At eval time, `--data_root` resolves the local asset folder and
+`--prediction_root` resolves method outputs. The evaluator writes the fully
+resolved manifest to `outputs/eval_3d_full_agent/diagnose/resolved_manifest.json`.
 
-## Compile Annotation to GT Plan
+## Batch Reproduction
 
-Use this when you have a benchmark annotation JSON and want an executable
-`plan.json`:
+To reproduce ArtiMo benchmark numbers, generate method outputs for all benchmark
+cases first. Use a larger point/sample configuration for final 3D runs:
+
+```bash
+scripts/run_3d_eval.sh \
+  --cases_manifest "$BENCH/manifests/eval_manifest_225.json" \
+  --gt_phase_static_manifest "$BENCH/manifests/phase_static_manifest.csv" \
+  --data_root "$DATA" \
+  --prediction_root /path/to/pred_root \
+  --prediction_variant full_agent \
+  --out_dir outputs/eval_3d_full_agent \
+  --variants full_agent \
+  --sequence_source auto \
+  --num_points_per_link 2048 \
+  --voxel_resolution 64 \
+  --pc_backend auto \
+  --gpu_devices 0
+```
+
+Then run selected-view 2D evaluation:
+
+```bash
+scripts/run_2d_eval.sh \
+  --manifest "$BENCH/manifests/eval_manifest_225.json" \
+  --own_3d_dir outputs/eval_3d_full_agent \
+  --out_dir outputs/eval_2d_full_agent \
+  --data_root "$DATA" \
+  --variants full_agent \
+  --project_root "$BENCH" \
+  --workers 4
+```
+
+## Optional GT Regeneration
+
+The release package already includes GT plans, trajectories, animated GLBs, and
+phase-static GLBs. If you need to regenerate them from annotations, use:
 
 ```bash
 scripts/benchmark_annotation_to_plan.sh \
@@ -48,17 +234,7 @@ scripts/benchmark_annotation_to_plan.sh \
   --fps 30
 ```
 
-If the annotation sidecar already points to a source plan and you want exact
-source dynamics:
-
-```bash
-scripts/benchmark_annotation_to_plan.sh \
-  --annotation_json /path/to/benchmark_case.json \
-  --out_plan_json /path/to/compiled/plan.json \
-  --preserve_source_dynamics
-```
-
-Then execute the compiled plan:
+Then execute the plan:
 
 ```bash
 python tools/run_plan.py \
@@ -68,14 +244,10 @@ python tools/run_plan.py \
   --trajectory_npz /path/to/compiled/animation/trajectory.npz \
   --trajectory_jsonl /path/to/compiled/animation/trajectory.jsonl \
   --export_animated_glb \
-  --use_glb_scene auto \
-  --skip_frame_render
+  --use_glb_scene auto
 ```
 
-## Export Phase Endpoint Static GLBs
-
-The 3D/2D evaluation can use per-phase static endpoint GLBs for cleaner GT
-states:
+To regenerate phase endpoint GLBs:
 
 ```bash
 scripts/export_benchmark_phase_static_meshes.sh \
@@ -84,57 +256,3 @@ scripts/export_benchmark_phase_static_meshes.sh \
   --phase_source plan \
   --overwrite
 ```
-
-This writes:
-
-- `phase_static_manifest.csv`
-- `phase_static_manifest.json`
-- per-case `phase_static_manifest.json`
-- one GLB per phase endpoint.
-
-## 3D Evaluation
-
-Run:
-
-```bash
-scripts/run_3d_eval.sh \
-  --cases_manifest /path/to/cases_manifest.json \
-  --out_dir evaluation/3d_full_agent \
-  --variants full_agent \
-  --num_points_per_link 2048 \
-  --voxel_resolution 64 \
-  --dynamic_weight 0.8 \
-  --static_weight 0.2
-```
-
-Main metrics:
-
-- `PN_gIoU`: part-normalized 3D AABB generalized IoU.
-- `PN_PC`: Chamfer-distance-based point consistency similarity.
-- `PN_OC`: voxel occupancy F1.
-
-Frame matching is ordered by benchmark phase. The matching score uses weighted
-3D AABB gIoU, with default dynamic/static weights `0.8/0.2`.
-
-## 2D Evaluation
-
-Run after 3D matching directories exist:
-
-```bash
-scripts/run_2d_eval.sh \
-  --manifest /path/to/cases_manifest.json \
-  --own_3d_dir /path/to/full_agent_3d_dir \
-  --aam_3d_dir /path/to/animate_anymesh_3d_dir \
-  --animate3d_3d_dir /path/to/animate3d_3d_dir \
-  --puppet_root /path/to/final_puppet_results \
-  --out_dir evaluation/2d_selected_view
-```
-
-Main metrics:
-
-- `P_MaskIoU`: per-part visible mask IoU.
-- `P_BoundaryF1`: per-part silhouette boundary F1 with pixel tolerance.
-- `P_ContourCD`: normalized per-part contour Chamfer distance.
-
-PuppetMaster is evaluated in its selected input view. Mesh baselines are
-rendered into the same selected view and crop before part-mask scoring.
