@@ -8,3 +8,4 @@ logs/
 *.blend
 benchmark/
 benchmark_release/
+data/

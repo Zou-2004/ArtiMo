@@ -42,9 +42,13 @@ def _compact_source_file(path: Any, dataset: str | None = None) -> str | None:
     text = str(path or "").strip()
     if not text:
         return None
+    if "Lightwheel_OpenSource/" in text:
+        return "Lightwheel/Lightwheel_OpenSource/" + text.split("Lightwheel_OpenSource/", 1)[1]
     marker = str(dataset or "").strip()
     if marker and f"/{marker}/" in text:
         return f"{marker}/" + text.split(f"/{marker}/", 1)[1]
+    if marker and text.startswith(f"{marker}/"):
+        return text
     for marker in ("ArtVIP", "PartNet-Mobility", "partnet-mobility", "Lightwheel", "ACD"):
         if f"/{marker}/" in text:
             return f"{marker}/" + text.split(f"/{marker}/", 1)[1]
@@ -102,10 +106,10 @@ def _partnet_release_source(source_asset: Any, partnet_index: dict[str, dict[str
         raw_id = _partnet_raw_id_from_name(text)
         if raw_id is not None:
             dir_name = text if "_" in text else raw_id
-            return raw_id, dir_name, f"PartNet-Mobility/{raw_id}"
-        return text, None, f"PartNet-Mobility/{text}"
+            return raw_id, dir_name, f"PartNet-Mobility/dataset/{raw_id}"
+        return text, None, f"PartNet-Mobility/dataset/{text}"
     raw_id = row.get("raw_id") or text
-    return raw_id, row.get("dir_name"), f"PartNet-Mobility/{raw_id}"
+    return raw_id, row.get("dir_name"), f"PartNet-Mobility/dataset/{raw_id}"
 
 
 def _release_source_fields(dataset: Any, source_file: Any, source_asset: Any, partnet_index: dict[str, dict[str, str]]) -> tuple[Any, Any, Any]:

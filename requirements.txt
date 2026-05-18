@@ -1,6 +1,7 @@
 numpy
 scipy
 trimesh
+usd-core
 Pillow
 opencv-python
 imageio
@@ -16,4 +17,3 @@ torch
 torchvision
 tqdm
 lpips
-

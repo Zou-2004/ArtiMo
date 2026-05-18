@@ -18,6 +18,17 @@ Users do not decide whether an asset is causal or non-causal. That split is
 stored in `$BENCH/manifests/asset_source_manifest.csv` as `asset_collection`,
 and the preparation script below writes each asset to the right subfolder:
 
+Download the source datasets from:
+
+- PartNet-Mobility: https://sapien.ucsd.edu/browse
+- ArtVIP: https://huggingface.co/datasets/X-Humanoid/ArtVIP/tree/main
+- Lightwheel sim-ready assets: https://github.com/LightwheelAI/Lightwheel-simready-asset?tab=readme-ov-file
+
+Then point the preparation script at those downloaded source roots. PartNet can
+be passed either as the extracted dataset directory or as the downloaded zip.
+ArtVIP and Lightwheel can be passed as raw USD datasets; the script converts
+only the benchmark assets it needs into ArtiMo's URDF format.
+
 ```text
 $DATA/
   causal_data/
@@ -39,8 +50,9 @@ The manifest maps each raw dataset asset to the benchmark folder name and split:
 
 ```text
 asset_name,asset_collection,source_dataset,source_asset,source_asset_dir,source_file
-bin1,causal_data,PartNet-Mobility,102186,102186_trashcan,PartNet-Mobility/102186
+bin1,causal_data,PartNet-Mobility,102186,102186_trashcan,PartNet-Mobility/dataset/102186
 microwave1,causal_data,ArtVIP,microwave_door_13,,ArtVIP/Articulated_objects/small_appliances/microwave/microwave_1/model_microwave_1.usd
+electric_kettle1,causal_data,Lightwheel,electric_kettle1,,Lightwheel/Lightwheel_OpenSource/Manipulation/ElectricKettle001/ElectricKettle001.usd
 ```
 
 For evaluation, the final prepared asset path is:
@@ -54,7 +66,7 @@ For example, the original PartNet asset
 copy was renamed to include the category, `102186_trashcan` is also accepted.
 
 To copy or symlink benchmark assets from source roots into the expected layout,
-provide one source root per downloaded/converted dataset. The script reads
+provide one source root per downloaded dataset. The script reads
 `asset_collection` from the manifest and automatically writes to
 `$DATA/causal_data/...` or `$DATA/not_causal_data/...`:
 
@@ -62,11 +74,16 @@ provide one source root per downloaded/converted dataset. The script reads
 python tools/prepare_benchmark_assets_from_manifest.py \
   --asset_manifest "$BENCH/manifests/asset_source_manifest.csv" \
   --out_data_root "$DATA" \
-  --source_root PartNet-Mobility=/path/to/partnet-mobility \
-  --source_root ArtVIP=/path/to/data_artvip_converted \
-  --source_root Lightwheel=/path/to/data_lightwheel_converted \
+  --source_root PartNet-Mobility=/path/to/partnet-mobility-v0.zip \
+  --source_root ArtVIP=/path/to/artvip \
+  --source_root Lightwheel=/path/to/Lightwheel_OpenSource.zip \
   --copy_mode symlink
 ```
+
+Raw ArtVIP/Lightwheel USD conversion uses the current Python environment. Make
+sure the repository requirements are installed first. If you already converted
+those datasets into folders containing `mobility.urdf`, pass those converted
+roots instead.
 
 Before running ArtiMo's `run_agent` on one of these prepared assets, build its
 textured animated GLB from the URDF and meshes:

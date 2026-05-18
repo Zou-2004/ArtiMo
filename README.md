@@ -429,28 +429,9 @@ scripts/compile_isaacsim_bundle.sh \
 ## Benchmark and Evaluation
 
 Use [docs/BENCHMARK_AND_EVAL.md](docs/BENCHMARK_AND_EVAL.md) for benchmark
-evaluation. The shortest path is:
-
-1. Download or place the benchmark package as `benchmark_release/`.
-2. Use `benchmark_release/manifests/asset_source_manifest.csv` to prepare raw
-   dataset assets under `data/<asset_collection>/<asset_name>/`. The
-   `asset_collection` field decides `causal_data` vs. `not_causal_data`; users
-   do not classify assets manually.
-3. Run 3D eval with [scripts/run_3d_eval.sh](scripts/run_3d_eval.sh).
-4. Run 2D eval with [scripts/run_2d_eval.sh](scripts/run_2d_eval.sh).
-
-[tools/prepare_benchmark_assets_from_manifest.py](tools/prepare_benchmark_assets_from_manifest.py)
-can copy or symlink source assets into the expected benchmark layout. For
-PartNet-Mobility, the manifest uses the raw numeric id, with an optional
-`source_asset_dir` for local copies renamed as `<id>_<category>`. Pass one
-source root per downloaded/converted dataset, for example
-`PartNet-Mobility=/path/to/partnet-mobility`,
-`ArtVIP=/path/to/data_artvip_converted`, and
-`Lightwheel=/path/to/data_lightwheel_converted`.
-
-If the benchmark is downloaded from HuggingFace and lives outside this repo,
-use its shipped `manifests/eval_manifest_225.json` directly. The manifest
-builder in `tools/` is only for maintainers who change the release contents.
+evaluation, source dataset preparation, and 2D/3D metric commands. The
+benchmark package is intended to be distributed separately, for example from
+HuggingFace, and its shipped manifests should be used directly.
 
 For source-tree ownership, see [docs/CODE_LAYOUT.md](docs/CODE_LAYOUT.md).
 
