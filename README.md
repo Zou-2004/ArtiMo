@@ -8,8 +8,13 @@
 </p>
 
 <p align="center">
-  <video src="assets/videos/hero/artimo.mp4" autoplay loop muted playsinline controls width="90%"></video>
+  <img src="assets/images/new_teaser.png" alt="ArtiMo teaser" width="90%">
 </p>
+
+<!-- <p align="center">
+  <a href="https://zou-2004.github.io/ArtiMo/"><img src="https://img.shields.io/badge/Watch_Demo-Project_Page-green" alt="Watch Demo"></a>
+  <a href="assets/videos/hero/artimo.mp4"><img src="https://img.shields.io/badge/Download-Demo_MP4-blue" alt="Demo MP4"></a>
+</p> -->
 
 ArtiMo is an agentic pipeline for action-conditioned articulated-object
 animation. Given an articulated asset and a user action, it generates causal

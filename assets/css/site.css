@@ -224,6 +224,16 @@ h3 {
   color: var(--accent-dark);
 }
 
+.disabled-link {
+  cursor: default;
+  opacity: 0.72;
+}
+
+.disabled-link:hover {
+  border-color: var(--line);
+  color: var(--ink);
+}
+
 .hero-media,
 .figure-frame,
 .video-card {
