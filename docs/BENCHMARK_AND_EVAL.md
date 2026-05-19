@@ -50,12 +50,15 @@ python tools/prepare_benchmark_assets_from_manifest.py \
   --source_root ArtVIP=/path/to/artvip \
   --source_root Lightwheel=/path/to/Lightwheel_OpenSource.zip \
   --copy_mode symlink
+
+export DATA=/path/to/prepared_artimo_data
 ```
 
 Raw ArtVIP/Lightwheel USD conversion uses the current Python environment. Make
-sure the repository requirements are installed first. If you already converted
-those datasets into folders containing `mobility.urdf`, pass those converted
-roots instead.
+sure the repository requirements are installed first; the conversion path needs
+`usd-core`/`pxr`, and 2D evaluation needs `opencv-python`. If you already
+converted those datasets into folders containing `mobility.urdf`, pass those
+converted roots instead.
 
 After preparation, data has this layout:
 
@@ -196,7 +199,7 @@ came from and where to find the GT artifacts:
   "source_dataset": "PartNet-Mobility",
   "source_asset": "102186",
   "source_asset_dir": "102186_trashcan",
-  "source_file": "PartNet-Mobility/102186",
+  "source_file": "PartNet-Mobility/dataset/102186",
   "asset_collection": "causal_data",
   "annotation_path": "benchmark_release/annotations/bin_constraint_templates/cases/casual_output__bin1__fully_open.json",
   "gt_plan_json": "benchmark_release/gt_animations/bin/bin1/fully_open/plan.json",

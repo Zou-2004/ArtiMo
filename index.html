@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ArtiMo: Agent-Driven Articulated Mesh Animation</title>
+    <meta
+      name="description"
+      content="Project page for ArtiMo, an agent-driven framework for text-guided articulated mesh animation."
+    />
+    <link rel="stylesheet" href="assets/css/site.css?v=20260519-10" />
+  </head>
+  <body>
+    <header class="site-header">
+      <nav class="nav">
+        <a href="#top" class="brand">ArtiMo</a>
+        <div class="nav-links">
+          <a href="#abstract">Abstract</a>
+          <a href="#method">Method</a>
+          <a href="#demo">Demo</a>
+          <a href="#gallery">Gallery</a>
+          <button class="theme-toggle" type="button" data-theme-toggle aria-label="Switch to night mode">
+            Night
+          </button>
+        </div>
+      </nav>
+    </header>
+
+    <main id="top">
+      <section class="hero">
+        <div class="hero-copy">
+          <p class="venue">Project Page</p>
+          <h1>ArtiMo: Agent-Driven Articulated Mesh Animation</h1>
+          <p class="subtitle">
+            A zero-shot agent framework for text-guided articulated mesh
+            animation with kinematic constraints, causal part reasoning, and
+            visual self-improvement.
+          </p>
+          <div class="link-row" aria-label="Project links">
+            <span class="badge-link badge-disabled">
+              <img src="https://img.shields.io/badge/arXiv-coming_soon-b31b1b" alt="arXiv coming soon" />
+            </span>
+            <!-- <a
+              class="badge-link"
+              href="https://zou-2004.github.io/ArtiMo/"
+              target="_blank"
+              rel="noreferrer"
+            >
+              <img src="https://img.shields.io/badge/Project_Page-green" alt="Project Page" />
+            </a> -->
+            <a
+              class="badge-link"
+              href="https://huggingface.co/datasets/zcy666/ArtiMo"
+              target="_blank"
+              rel="noreferrer"
+            >
+              <img src="https://img.shields.io/badge/%F0%9F%A4%97%20HuggingFace-Dataset-blue" alt="HuggingFace Dataset" />
+            </a>
+            <a
+              class="badge-link"
+              href="https://github.com/Zou-2004/ArtiMo"
+              target="_blank"
+              rel="noreferrer"
+            >
+              <img src="https://img.shields.io/badge/Code-GitHub-black" alt="Code" />
+            </a>
+          </div>
+        </div>
+        <figure class="hero-media">
+          <video
+            src="assets/videos/hero/artimo.mp4"
+            autoplay
+            loop
+            muted
+            playsinline
+            controls
+          ></video>
+        </figure>
+      </section>
+
+      <section id="abstract" class="section">
+        <h2>Abstract</h2>
+        <p>
+          Animating articulated 3D meshes via text requires satisfying strict
+          kinematic constraints, modeling causal interactions between parts,
+          and achieving instruction fidelity. Due to a scarcity of training
+          data, existing data-driven mesh animation methods are largely
+          inapplicable. To address this, we propose ArtiMo, a novel
+          agent-driven framework for text-guided articulated mesh animation.
+          Operating in a zero-shot manner, ArtiMo employs an autonomous agent
+          powered by Large Language and Vision-Language Models to orchestrate
+          motion generation. By synergizing the explicit kinematic constraints
+          of URDF with the agent's reasoning and planning capabilities, it
+          effectively produces causally coherent part motions and interactions
+          without requiring model fine-tuning. To ensure high-fidelity results,
+          the agent additionally utilizes a visual self-improvement mechanism:
+          generated animations are rendered into compact keyframes and motion
+          cues, enabling the VLM to iteratively diagnose and correct errors.
+          Furthermore, we contribute a new benchmark dataset spanning 21 object
+          categories with high-quality motion annotations. Extensive
+          experiments demonstrate that ArtiMo significantly outperforms
+          existing baselines, particularly on complex, causally-driven motions.
+        </p>
+      </section>
+
+      <section id="method" class="section">
+        <div class="section-heading">
+          <h2>Method</h2>
+          <p>
+            ArtiMo combines structured articulated assets, visual-language
+            diagnosis, and executable motion planning in a closed loop.
+          </p>
+        </div>
+        <figure class="figure-frame">
+          <img src="assets/images/method.png" alt="ArtiMo method overview" />
+          <figcaption>
+            Overview of our agent-driven articulated mesh animation framework.
+            Given a URDF asset and an action prompt, our system performs link
+            analysis, causal motion planning, and critic--actor refinement to
+            generate a causally correct 4D articulated animation.
+          </figcaption>
+        </figure>
+      </section>
+
+      <section id="demo" class="section">
+        <div class="section-heading">
+          <h2>Full Demo</h2>
+          <p>
+            A concise end-to-end video covering qualitative results,
+            evaluation, and ablation study.
+          </p>
+        </div>
+        <article class="video-card full-demo">
+          <video
+            class="lazy-video"
+            data-src="assets/videos/demo/demo.mp4"
+            preload="none"
+            loop
+            muted
+            playsinline
+            controls
+          ></video>
+        </article>
+      </section>
+
+      <section id="gallery" class="section">
+        <div class="section-heading">
+          <h2>Interactive 4D Mesh Gallery</h2>
+          <p>
+            Swipe through cases and switch between the aligned first-frame mesh,
+            the action condition, and the exported animated GLB. The initial
+            camera follows the coverage-loop selected view.
+          </p>
+        </div>
+        <div id="asset-gallery" class="model-grid" aria-live="polite"></div>
+      </section>
+    </main>
+
+    <footer class="footer">
+      <p>
+        ArtiMo: Agent-Driven Articulated Mesh Animation.
+      </p>
+    </footer>
+
+    <script
+      type="module"
+      src="assets/js/model-viewer.min.js"
+    ></script>
+    <script src="assets/js/gallery.js?v=20260519-9"></script>
+  </body>
+</html>

@@ -1,4 +1,15 @@
-# ArtiMo
+<h1 align="center">ArtiMo: Agent-Driven Articulated Mesh Animation</h1>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/arXiv-coming_soon-b31b1b" alt="arXiv">
+  <a href="https://zou-2004.github.io/ArtiMo/"><img src="https://img.shields.io/badge/Project_Page-green" alt="Project Page"></a>
+  <a href="https://huggingface.co/datasets/zcy666/ArtiMo"><img src="https://img.shields.io/badge/%F0%9F%A4%97%20HuggingFace-Dataset-blue" alt="HuggingFace Dataset"></a>
+  <a href="https://github.com/Zou-2004/ArtiMo"><img src="https://img.shields.io/badge/Code-GitHub-black" alt="Code"></a>
+</p>
+
+<p align="center">
+  <video src="assets/videos/hero/artimo.mp4" autoplay loop muted playsinline controls width="90%"></video>
+</p>
 
 ArtiMo is an agentic pipeline for action-conditioned articulated-object
 animation. Given an articulated asset and a user action, it generates causal
@@ -202,13 +213,13 @@ For example:
 ```bash
 bash scripts/textured.sh --root /path/to/data/causal_data trolley2
 ```
-
+<!-- 
 For benchmark assets prepared under both splits, process each dataset root:
 
 ```bash
 JOBS=6 bash scripts/textured.sh --root /path/to/data/causal_data --all
 JOBS=6 bash scripts/textured.sh --root /path/to/data/not_causal_data --all
-```
+``` -->
 
 By default this first canonicalizes URDF names, then calls
 `tools/build_textured_animated_glb.py` in `urdf_preview` mode. Link names are
