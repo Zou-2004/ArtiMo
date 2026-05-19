@@ -4,7 +4,7 @@
   <img src="https://img.shields.io/badge/arXiv-coming_soon-b31b1b" alt="arXiv">
   <a href="https://zou-2004.github.io/ArtiMo/"><img src="https://img.shields.io/badge/Project_Page-green" alt="Project Page"></a>
   <a href="https://huggingface.co/datasets/zcy666/ArtiMo"><img src="https://img.shields.io/badge/%F0%9F%A4%97%20HuggingFace-Dataset-blue" alt="HuggingFace Dataset"></a>
-  <a href="https://github.com/Zou-2004/ArtiMo"><img src="https://img.shields.io/badge/Code-GitHub-black" alt="Code"></a>
+  <!-- <a href="https://github.com/Zou-2004/ArtiMo"><img src="https://img.shields.io/badge/Code-GitHub-black" alt="Code"></a> -->
 </p>
 
 <p align="center">

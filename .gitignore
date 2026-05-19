@@ -5,6 +5,7 @@ outputs/
 validation_outputs/
 logs/
 *.mp4
+!assets/videos/**/*.mp4
 *.blend
 benchmark/
 benchmark_release/
