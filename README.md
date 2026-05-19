@@ -155,35 +155,6 @@ export ISAAC_PYTHON=/path/to/isaacsim/python.sh
 
 Then compile and run the bundle as described in [Isaac Sim Export](#isaac-sim-export).
 
-## Before Running `run_agent`
-
-`run_agent` does not start from a loose mesh file. For each asset, prepare one
-asset folder with:
-
-```text
-asset_name/
-  mobility.urdf                         # required: joints, links, limits, mesh references
-  meshes_or_textured_objs/...           # required: mesh/material files referenced by the URDF
-  images_or_textures/...                # required if the materials reference texture images
-  animated_textured_<asset_name>.glb    # required before running the agent
-  animated_textured_<asset_name>.report.json
-```
-
-The first three items come from the dataset conversion step. The textured
-animated GLB is generated from `mobility.urdf` plus its referenced meshes:
-
-```bash
-bash scripts/textured.sh --root /path/to/data/causal_data asset_name
-```
-
-After this preprocessing, run:
-
-```bash
-scripts/run_agent.sh \
-  --asset_root /path/to/data/causal_data/asset_name \
-  --action_text "your action"
-```
-
 ## Input Asset Format
 
 ArtiMo expects one directory per articulated object. Raw dataset assets should
@@ -204,7 +175,23 @@ and joint limits. Mesh paths are resolved relative to the URDF location, so the
 folder names do not have to be exactly `textured_objs/` and `images/`; they only
 need to match the paths written in `mobility.urdf` and the OBJ/MTL files.
 
-Before running the agent, build the canonical textured GLB used by rendering:
+## Before Running `run_agent`
+
+`run_agent` does not start from a loose mesh file. For each asset, prepare one
+asset folder with the URDF, referenced meshes/materials/textures, and the
+canonical textured GLB:
+
+```text
+asset_name/
+  mobility.urdf
+  meshes_or_textured_objs/...
+  images_or_textures/...
+  animated_textured_<asset_name>.glb
+  animated_textured_<asset_name>.report.json
+```
+
+The first three items come from the dataset conversion step. The textured
+animated GLB is generated from `mobility.urdf` plus its referenced meshes:
 
 ```bash
 bash scripts/textured.sh --root /path/to/data/causal_data asset_name
@@ -214,6 +201,13 @@ For example:
 
 ```bash
 bash scripts/textured.sh --root /path/to/data/causal_data trolley2
+```
+
+For benchmark assets prepared under both splits, process each dataset root:
+
+```bash
+JOBS=6 bash scripts/textured.sh --root /path/to/data/causal_data --all
+JOBS=6 bash scripts/textured.sh --root /path/to/data/not_causal_data --all
 ```
 
 By default this first canonicalizes URDF names, then calls
@@ -236,12 +230,6 @@ asset_name/
 The agent then uses `mobility.urdf` for kinematics and
 `animated_textured_<asset_name>.glb` for textured reference rendering and
 animated GLB export.
-
-To process every asset directory under a dataset root:
-
-```bash
-JOBS=6 bash scripts/textured.sh --root /path/to/data/causal_data --all
-```
 
 Useful build controls:
 
@@ -270,7 +258,12 @@ scripts/run_agent.sh \
   --vlm_model gemini-3.1-pro-preview \
   --llm_model gpt-5.4 \
   --api_provider openai \
-  --use_glb_scene auto
+  --use_glb_scene auto \
+  --enable_loop \
+  --enable_coverage_loop \
+  --enable_motion_loop \
+  --coverage_max_iters 1 \
+  --motion_max_iters 3
 ```
 
 Outputs:
@@ -286,23 +279,11 @@ outputs/bin1_fully_open/bin1/
   plan_animated.glb
 ```
 
-Enable coverage and motion-diagnosis refinement:
-
-```bash
-scripts/run_agent.sh \
-  --asset_root /path/to/data/causal_data/bin1 \
-  --action_text "fully open the trash bin" \
-  --out_root outputs/bin1_fully_open_loop \
-  --enable_loop \
-  --enable_coverage_loop \
-  --enable_motion_loop \
-  --coverage_max_iters 1 \
-  --motion_max_iters 3 \
-  --use_glb_scene auto
-```
-
-The final selected outputs are copied back to the asset output root. Loop audit
-artifacts are stored under `outputs/.../<asset>/loop/`.
+<!-- Coverage and motion-diagnosis refinement are not enabled unless the loop flags
+are passed. `--enable_loop` runs the loop driver; `--enable_coverage_loop` and
+`--enable_motion_loop` select the two refinement stages. The final selected
+outputs are copied back to the asset output root, and loop audit artifacts are
+stored under `outputs/.../<asset>/loop/`. -->
 
 ### Mask-Conditioned Input
 

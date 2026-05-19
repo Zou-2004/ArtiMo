@@ -10,13 +10,7 @@ set `BENCH` to that folder:
 
 ```bash
 export BENCH=/path/to/benchmark_release
-export DATA=/path/to/data
 ```
-
-`DATA` is the root of the prepared ArtiMo asset folders used by evaluation.
-Users do not decide whether an asset is causal or non-causal. That split is
-stored in `$BENCH/manifests/asset_source_manifest.csv` as `asset_collection`,
-and the preparation script below writes each asset to the right subfolder:
 
 Download the source datasets from:
 
@@ -28,19 +22,6 @@ Then point the preparation script at those downloaded source roots. PartNet can
 be passed either as the extracted dataset directory or as the downloaded zip.
 ArtVIP and Lightwheel can be passed as raw USD datasets; the script converts
 only the benchmark assets it needs into ArtiMo's URDF format.
-
-```text
-$DATA/
-  causal_data/
-    bin1/
-      mobility.urdf
-      animated_textured_bin1.glb        # needed when running ArtiMo on this asset
-    microwave1/
-      mobility.urdf
-  not_causal_data/
-    <asset_name>/
-      mobility.urdf
-```
 
 The benchmark package already ships the evaluation manifests under
 `$BENCH/manifests/`; normal users do not need to generate them.
@@ -55,25 +36,16 @@ microwave1,causal_data,ArtVIP,microwave_door_13,,ArtVIP/Articulated_objects/smal
 electric_kettle1,causal_data,Lightwheel,electric_kettle1,,Lightwheel/Lightwheel_OpenSource/Manipulation/ElectricKettle001/ElectricKettle001.usd
 ```
 
-For evaluation, the final prepared asset path is:
-
-```text
-$DATA/<asset_collection>/<asset_name>/mobility.urdf
-```
-
-For example, the original PartNet asset
-`102186` must be prepared as `$DATA/causal_data/bin1/`. If your local PartNet
-copy was renamed to include the category, `102186_trashcan` is also accepted.
-
-To copy or symlink benchmark assets from source roots into the expected layout,
-provide one source root per downloaded dataset. The script reads
+Choose an output directory for the prepared ArtiMo data, then generate it by
+providing one source root per downloaded dataset. The script reads
 `asset_collection` from the manifest and automatically writes to
-`$DATA/causal_data/...` or `$DATA/not_causal_data/...`:
+`causal_data/...` or `not_causal_data/...` under that output directory; users
+do not decide whether an asset is causal or non-causal:
 
 ```bash
 python tools/prepare_benchmark_assets_from_manifest.py \
   --asset_manifest "$BENCH/manifests/asset_source_manifest.csv" \
-  --out_data_root "$DATA" \
+  --out_data_root /path/to/prepared_artimo_data \
   --source_root PartNet-Mobility=/path/to/partnet-mobility-v0.zip \
   --source_root ArtVIP=/path/to/artvip \
   --source_root Lightwheel=/path/to/Lightwheel_OpenSource.zip \
@@ -85,6 +57,30 @@ sure the repository requirements are installed first. If you already converted
 those datasets into folders containing `mobility.urdf`, pass those converted
 roots instead.
 
+After preparation, data has this layout:
+
+```text
+$DATA/
+  causal_data/
+    bin1/
+      mobility.urdf
+    microwave1/
+      mobility.urdf
+  not_causal_data/
+    <asset_name>/
+      mobility.urdf
+```
+
+Each prepared asset path is:
+
+```text
+$DATA/<asset_collection>/<asset_name>/mobility.urdf
+```
+
+For example, the original PartNet asset `102186` becomes
+`$DATA/causal_data/bin1/`. If your local PartNet copy was renamed to include
+the category, `102186_trashcan` is also accepted.
+
 Before running ArtiMo's `run_agent` on one of these prepared assets, build its
 textured animated GLB from the URDF and meshes:
 
@@ -92,8 +88,16 @@ textured animated GLB from the URDF and meshes:
 bash scripts/textured.sh --root "$DATA/causal_data" bin1
 ```
 
+To build textured meshes for every prepared benchmark asset, run the batch
+command on both asset collections:
+
+```bash
+JOBS=6 bash scripts/textured.sh --root "$DATA/causal_data" --all
+JOBS=6 bash scripts/textured.sh --root "$DATA/not_causal_data" --all
+```
+
 This writes `animated_textured_<asset_name>.glb` and
-`animated_textured_<asset_name>.report.json` into the asset folder. For pure
+`animated_textured_<asset_name>.report.json` into each asset folder. For pure
 benchmark evaluation of existing prediction GLBs/trajectories, this file is not
 normally required unless the evaluator needs to fall back to asset rendering.
 
