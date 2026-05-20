@@ -1,0 +1,34 @@
+{
+  "urdf": "/home/chunyu/ArtiMo/record_materialization/rec_an-usual-microwave-oven-with-a-door-release-butt_20260518_082915_321850_e74f91d1/mobility.urdf",
+  "changed": true,
+  "rename_joints": true,
+  "link_name_map_old_to_new": {
+    "cabinet": "link_0",
+    "door": "link_1",
+    "turntable": "link_2",
+    "release_button": "link_3",
+    "timer_dial": "link_4"
+  },
+  "link_name_map_new_to_old": {
+    "link_0": "cabinet",
+    "link_1": "door",
+    "link_2": "turntable",
+    "link_3": "release_button",
+    "link_4": "timer_dial"
+  },
+  "joint_name_map_old_to_new": {
+    "door_hinge": "joint_0",
+    "turntable_axis": "joint_1",
+    "release_button_slide": "joint_2",
+    "timer_dial_axis": "joint_3"
+  },
+  "joint_name_map_new_to_old": {
+    "joint_0": "door_hinge",
+    "joint_1": "turntable_axis",
+    "joint_2": "release_button_slide",
+    "joint_3": "timer_dial_axis"
+  },
+  "num_links": 5,
+  "num_joints": 4,
+  "backup": "/home/chunyu/ArtiMo/record_materialization/rec_an-usual-microwave-oven-with-a-door-release-butt_20260518_082915_321850_e74f91d1/mobility.urdf.original_names.bak"
+}

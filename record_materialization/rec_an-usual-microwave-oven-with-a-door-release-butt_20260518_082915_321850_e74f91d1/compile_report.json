@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "record_id": "rec_an-usual-microwave-oven-with-a-door-release-butt_20260518_082915_321850_e74f91d1",
+  "status": "success",
+  "urdf_path": "model.urdf",
+  "warnings": [],
+  "checks_run": [
+    "compile_urdf"
+  ],
+  "overlap_allowances": [],
+  "metrics": {
+    "compile_level": "full",
+    "validation_level": "full",
+    "fingerprint_inputs": {
+      "model_py_sha256": "26ea5903bc002643aac62e37aed6497066e5a6ab3068107e87ac163e70437d04",
+      "sdk_fingerprint": null
+    },
+    "materialization_fingerprint": "9d61682ff10e6ae56d45c2fa27dc15f0e64241e8cee38f4558daafecf0c4c30f",
+    "model_py_mtime_ns": 1779093480896764279,
+    "model_py_size_bytes": 20029,
+    "materialization_status": "available",
+    "visual_mesh_bytes": 940645,
+    "visual_mesh_file_count": 5,
+    "compile_elapsed_seconds": 13.051223995164037
+  },
+  "signal_bundle": {
+    "status": "success",
+    "summary": "status=success failures=0 warnings=0 notes=0\nCompile passed cleanly.",
+    "signals": []
+  }
+}

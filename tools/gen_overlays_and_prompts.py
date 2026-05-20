@@ -298,6 +298,45 @@ def _resolve_mesh_path(mesh_filename, urdf_dir):
     return candidate
 
 
+def _material_rgba(material_tag, material_colors):
+    if material_tag is None:
+        return None
+    color = material_tag.find("color")
+    if color is not None:
+        return _parse_floats(color.get("rgba"), default=None)
+    name = material_tag.get("name")
+    if name:
+        return material_colors.get(name)
+    return None
+
+
+def _primitive_mesh_from_visual(visual: dict):
+    gtype = str(visual.get("geometry_type") or "mesh").lower()
+    if gtype == "box":
+        size = visual.get("size") or [1.0, 1.0, 1.0]
+        return trimesh.creation.box(extents=np.asarray(size, dtype=float))
+    if gtype == "cylinder":
+        radius = float(visual.get("radius") or 0.5)
+        length = float(visual.get("length") or 1.0)
+        return trimesh.creation.cylinder(radius=radius, height=length, sections=48)
+    if gtype == "sphere":
+        radius = float(visual.get("radius") or 0.5)
+        return trimesh.creation.icosphere(radius=radius, subdivisions=3)
+    return None
+
+
+def _apply_visual_rgba(mesh, rgba):
+    if rgba is None or not isinstance(mesh, trimesh.Trimesh):
+        return
+    vals = list(rgba)[:4]
+    if len(vals) == 3:
+        vals.append(1.0)
+    if len(vals) != 4:
+        return
+    color = np.clip(np.asarray(vals, dtype=float), 0.0, 1.0)
+    mesh.visual.vertex_colors = np.tile((color * 255.0).astype(np.uint8), (len(mesh.vertices), 1))
+
+
 def _deterministic_color(name):
     digest = hashlib.md5(name.encode("utf-8")).hexdigest()
     h = int(digest[:8], 16) / float(0xFFFFFFFF)
@@ -427,6 +466,14 @@ def find_urdf(asset_dir):
 def parse_urdf(urdf_path):
     tree = ET.parse(urdf_path)
     root = tree.getroot()
+    material_colors = {}
+    for material in root.findall("material"):
+        name = material.get("name")
+        color = material.find("color")
+        if name and color is not None:
+            rgba = _parse_floats(color.get("rgba"), default=None)
+            if rgba is not None:
+                material_colors[name] = rgba
 
     links = {}
     for link in root.findall("link"):
@@ -438,24 +485,70 @@ def parse_urdf(urdf_path):
             geom = visual.find("geometry")
             if geom is None:
                 continue
-            mesh_tag = geom.find("mesh")
-            if mesh_tag is None:
-                continue
-            filename = mesh_tag.get("filename") or mesh_tag.get("file")
-            scale = _parse_floats(mesh_tag.get("scale"), default=[1.0, 1.0, 1.0])
             origin = visual.find("origin")
             origin_xyz = _parse_floats(origin.get("xyz")) if origin is not None else None
             origin_rpy = _parse_floats(origin.get("rpy")) if origin is not None else None
             origin_quat = _parse_floats(origin.get("quat")) if origin is not None else None
-            visuals.append(
-                {
-                    "filename": filename,
-                    "scale": scale,
-                    "origin_xyz": origin_xyz,
-                    "origin_rpy": origin_rpy,
-                    "origin_quat": origin_quat,
-                }
-            )
+            material_rgba = _material_rgba(visual.find("material"), material_colors)
+            mesh_tag = geom.find("mesh")
+            if mesh_tag is not None:
+                visuals.append(
+                    {
+                        "geometry_type": "mesh",
+                        "filename": mesh_tag.get("filename") or mesh_tag.get("file"),
+                        "scale": _parse_floats(mesh_tag.get("scale"), default=[1.0, 1.0, 1.0]),
+                        "origin_xyz": origin_xyz,
+                        "origin_rpy": origin_rpy,
+                        "origin_quat": origin_quat,
+                        "material_rgba": material_rgba,
+                    }
+                )
+                continue
+            box_tag = geom.find("box")
+            if box_tag is not None:
+                visuals.append(
+                    {
+                        "geometry_type": "box",
+                        "filename": None,
+                        "scale": [1.0, 1.0, 1.0],
+                        "size": _parse_floats(box_tag.get("size"), default=[1.0, 1.0, 1.0]),
+                        "origin_xyz": origin_xyz,
+                        "origin_rpy": origin_rpy,
+                        "origin_quat": origin_quat,
+                        "material_rgba": material_rgba,
+                    }
+                )
+                continue
+            cylinder_tag = geom.find("cylinder")
+            if cylinder_tag is not None:
+                visuals.append(
+                    {
+                        "geometry_type": "cylinder",
+                        "filename": None,
+                        "scale": [1.0, 1.0, 1.0],
+                        "radius": float(cylinder_tag.get("radius") or 0.5),
+                        "length": float(cylinder_tag.get("length") or 1.0),
+                        "origin_xyz": origin_xyz,
+                        "origin_rpy": origin_rpy,
+                        "origin_quat": origin_quat,
+                        "material_rgba": material_rgba,
+                    }
+                )
+                continue
+            sphere_tag = geom.find("sphere")
+            if sphere_tag is not None:
+                visuals.append(
+                    {
+                        "geometry_type": "sphere",
+                        "filename": None,
+                        "scale": [1.0, 1.0, 1.0],
+                        "radius": float(sphere_tag.get("radius") or 0.5),
+                        "origin_xyz": origin_xyz,
+                        "origin_rpy": origin_rpy,
+                        "origin_quat": origin_quat,
+                        "material_rgba": material_rgba,
+                    }
+                )
         links[name] = visuals
 
     joints = []
@@ -537,17 +630,22 @@ def load_link_meshes(links, urdf_dir, link_transforms):
     for link_name, visuals in links.items():
         meshes = []
         for visual in visuals:
-            mesh_path = _resolve_mesh_path(visual["filename"], urdf_dir)
-            if mesh_path is None:
-                continue
-            if not mesh_path.exists():
-                print(f"[WARN] Mesh not found: {mesh_path}")
-                continue
-            try:
-                mesh = _load_mesh(mesh_path)
-            except Exception as exc:
-                print(f"[WARN] Failed to load mesh {mesh_path}: {exc}")
-                continue
+            if str(visual.get("geometry_type") or "mesh").lower() == "mesh":
+                mesh_path = _resolve_mesh_path(visual.get("filename"), urdf_dir)
+                if mesh_path is None:
+                    continue
+                if not mesh_path.exists():
+                    print(f"[WARN] Mesh not found: {mesh_path}")
+                    continue
+                try:
+                    mesh = _load_mesh(mesh_path)
+                except Exception as exc:
+                    print(f"[WARN] Failed to load mesh {mesh_path}: {exc}")
+                    continue
+            else:
+                mesh = _primitive_mesh_from_visual(visual)
+                if mesh is None:
+                    continue
             if isinstance(mesh, trimesh.Scene):
                 meshes_list = []
                 for geom in mesh.geometry.values():
@@ -558,6 +656,7 @@ def load_link_meshes(links, urdf_dir, link_transforms):
                     continue
             else:
                 mesh = mesh.copy()
+            _apply_visual_rgba(mesh, visual.get("material_rgba"))
 
             scale = visual["scale"] or [1.0, 1.0, 1.0]
             scale_mat = np.eye(4)
@@ -2546,13 +2645,18 @@ def _build_reference_scene_from_urdf(links, urdf_dir, link_transforms):
     for link_name, visuals in links.items():
         link_tf = link_transforms.get(link_name, np.eye(4))
         for visual in visuals:
-            mesh_path = _resolve_mesh_path(visual["filename"], urdf_dir)
-            if mesh_path is None or not mesh_path.exists():
-                continue
-            try:
-                mesh_obj = _load_mesh_textured(mesh_path)
-            except Exception:
-                continue
+            if str(visual.get("geometry_type") or "mesh").lower() == "mesh":
+                mesh_path = _resolve_mesh_path(visual.get("filename"), urdf_dir)
+                if mesh_path is None or not mesh_path.exists():
+                    continue
+                try:
+                    mesh_obj = _load_mesh_textured(mesh_path)
+                except Exception:
+                    continue
+            else:
+                mesh_obj = _primitive_mesh_from_visual(visual)
+                if mesh_obj is None:
+                    continue
 
             scale = visual["scale"] or [1.0, 1.0, 1.0]
             scale_mat = np.eye(4)
@@ -2573,6 +2677,7 @@ def _build_reference_scene_from_urdf(links, urdf_dir, link_transforms):
                     scene.add_geometry(geom)
             elif isinstance(mesh_obj, trimesh.Trimesh):
                 geom = mesh_obj.copy()
+                _apply_visual_rgba(geom, visual.get("material_rgba"))
                 geom.apply_transform(scale_mat)
                 geom.apply_transform(visual_mat)
                 geom.apply_transform(link_tf)
