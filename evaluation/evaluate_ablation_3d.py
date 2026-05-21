@@ -1014,6 +1014,31 @@ def normalize_prediction_geometry_to_gt(
     }
 
 
+def geometry_scale_diagnostic(asset: AssetGeometry, pred_seq: SequenceData, gt_seq: SequenceData) -> dict[str, Any]:
+    if not pred_seq.frames or not gt_seq.frames:
+        return {"available": False, "reason": "empty_sequence"}
+    gt_diag = _diag_from_bounds(_frame_object_bounds(asset, gt_seq.frames[0]))
+    pred_diag = _diag_from_bounds(_frame_object_bounds(asset, pred_seq.frames[0]))
+    if gt_diag is None or pred_diag is None or gt_diag <= 1.0e-9:
+        return {
+            "available": False,
+            "reason": "invalid_initial_bounds",
+            "gt_initial_diag": gt_diag,
+            "pred_initial_diag": pred_diag,
+        }
+    ratio = float(pred_diag) / float(gt_diag)
+    warning = None
+    if math.isfinite(ratio) and (ratio < 0.95 or ratio > 1.05):
+        warning = "initial_object_scale_mismatch"
+    return {
+        "available": True,
+        "gt_initial_diag": gt_diag,
+        "pred_initial_diag": pred_diag,
+        "pred_to_gt_diag_ratio": ratio,
+        "warning": warning,
+    }
+
+
 def _bbox(points: np.ndarray) -> tuple[np.ndarray, np.ndarray] | None:
     pts = np.asarray(points, dtype=float)
     if pts.ndim != 2 or pts.shape[0] == 0:
@@ -1457,7 +1482,10 @@ def evaluate_variant(
         gt_frames = [gt_seq.frames[i] for i in gt_indices]
         dyn_links = []
         for row, phase_id in zip(gt_phase_static_rows, phase_ids):
-            links = [ln for ln in _json_list(row.get("dynamic_links")) if ln in asset.visual_links]
+            links_raw = row.get("dynamic_links")
+            if links_raw is None or str(links_raw).strip() == "":
+                links_raw = row.get("dynamic_links_json")
+            links = [ln for ln in _json_list(links_raw) if ln in asset.visual_links]
             if not links:
                 links = dynamic_links_for_phase(annotation, phase_id, asset)
             dyn_links.append(links)
@@ -1849,6 +1877,7 @@ def evaluate_case(case: dict[str, Any], args: argparse.Namespace) -> tuple[list[
             continue
         try:
             pred_seq, pred_source_warning = _load_eval_sequence(seq_path, glb_path, asset, args)
+            scale_diag = geometry_scale_diagnostic(asset, pred_seq, gt_seq)
             pred_seq, normalization_info = normalize_prediction_geometry_to_gt(
                 asset,
                 pred_seq,
@@ -1861,6 +1890,11 @@ def evaluate_case(case: dict[str, Any], args: argparse.Namespace) -> tuple[list[
             pc["prediction_glb"] = str(glb_path) if glb_path is not None else None
             pc["prediction_sequence_source"] = pred_seq.source
             pc["gt_sequence_source"] = gt_seq.source
+            pc["geometry_initial_gt_diag"] = scale_diag.get("gt_initial_diag")
+            pc["geometry_initial_pred_diag"] = scale_diag.get("pred_initial_diag")
+            pc["geometry_initial_pred_to_gt_scale_ratio"] = scale_diag.get("pred_to_gt_diag_ratio")
+            pc["geometry_scale_warning"] = scale_diag.get("warning")
+            pc["geometry_scale_diagnostic"] = scale_diag
             pc["geometry_normalization"] = normalization_info
             pc["prediction_num_frames"] = len(pred_seq.frames)
             pc["prediction_last_time_s"] = float(pred_seq.frames[-1].time_s) if pred_seq.frames else None
@@ -1872,6 +1906,7 @@ def evaluate_case(case: dict[str, Any], args: argparse.Namespace) -> tuple[list[
                     pred_source_warning,
                     gt_source_warning,
                     _prediction_warning(pred_seq.path, pred_seq, plan_path),
+                    scale_diag.get("warning"),
                 )
                 if x
             ]
@@ -2268,6 +2303,12 @@ def main() -> int:
         "prediction_glb",
         "prediction_sequence_source",
         "gt_sequence_source",
+        "geometry_initial_gt_diag",
+        "geometry_initial_pred_diag",
+        "geometry_initial_pred_to_gt_scale_ratio",
+        "geometry_scale_warning",
+        "geometry_scale_diagnostic",
+        "geometry_normalization",
         "prediction_num_frames",
         "prediction_last_time_s",
         "prediction_plan_duration_s",

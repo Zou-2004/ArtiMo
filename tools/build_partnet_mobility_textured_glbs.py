@@ -47,7 +47,10 @@ def _process_one(
     canonicalize_urdf_names_flag: bool,
     keep_joint_names: bool,
 ) -> dict:
-    asset_dir = Path(asset_dir_str).resolve()
+    # Keep the logical prepared-data path instead of resolving symlinks. The
+    # benchmark uses names such as bin1/trolley2, while source datasets may use
+    # raw ids such as PartNet's 102186.
+    asset_dir = Path(asset_dir_str).absolute()
     asset_id = asset_dir.name
     out_glb = asset_dir / f"animated_textured_{asset_id}.glb"
     out_report = out_glb.with_suffix(".report.json")
@@ -154,7 +157,7 @@ def main() -> None:
             except Exception as exc:
                 row = {
                     "asset_id": asset_id,
-                    "asset_dir": str((root / asset_id).resolve()),
+                    "asset_dir": str((root / asset_id).absolute()),
                     "status": "failed",
                     "error": f"{type(exc).__name__}: {exc}",
                 }

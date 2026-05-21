@@ -433,6 +433,22 @@ def _view_from_name(path: Path) -> tuple[str, float, float]:
 def _load_noncausal_views(path: Path) -> dict[str, tuple[str, float, float]]:
     out = {}
     if not path.exists():
+        rel_candidates = [path]
+        parts = path.parts
+        if "puppet_master_noncausal" in parts:
+            idx = parts.index("puppet_master_noncausal")
+            rel_candidates.append(Path(*parts[idx:]))
+        for root in _project_search_roots():
+            for rel in rel_candidates:
+                if rel.is_absolute():
+                    continue
+                cand = root / rel
+                if cand.exists():
+                    path = cand
+                    break
+            if path.exists():
+                break
+    if not path.exists():
         return out
     for row in _read_json(path):
         asset = str(row.get("asset") or "")

@@ -1,0 +1,35 @@
+{
+  "asset_name": "microwave_door_13",
+  "source_asset_dir": "/home/chunyu/causal-articulation/ArtVIP/Articulated_objects/small_appliances/microwave/microwave_1",
+  "source_model": "/home/chunyu/causal-articulation/ArtVIP/Articulated_objects/small_appliances/microwave/microwave_1/model_microwave_1.usd",
+  "num_links": 5,
+  "num_joints": 4,
+  "root_link": "link_12",
+  "joint_name_map_old_to_new": {
+    "RevoluteJoint_microwave_1_left": "joint_0",
+    "RevoluteJoint_microwave_1_down": "joint_1",
+    "PrismaticJoint_microwave_1_down": "joint_2",
+    "joint_link_12_to_link_23": "joint_3"
+  },
+  "copied_sim_scripts": 1,
+  "external_sim_code_root": null,
+  "axis_alignment_report": "axis_alignment_report.json",
+  "max_origin_position_error_m": 0.0,
+  "max_axis_error_deg": 0.0,
+  "mesh_localization_bbox_center_norm_max": 0.2730443227848873,
+  "mesh_localization_bbox_center_norm_by_link": {
+    "link_1": 0.25557936047421603,
+    "link_11": 0.001415982077260865,
+    "link_12": 0.2730443227848873,
+    "link_23": 0.015280706376772278,
+    "link_7": 0.014347342341738394
+  },
+  "needs_behavior_runtime": true,
+  "behavior_runtime_reasons": [
+    "usd_behavior_script",
+    "omni_kit_scripting",
+    "usd_drive_api",
+    "visibility_logic",
+    "dynamic_control_api"
+  ]
+}

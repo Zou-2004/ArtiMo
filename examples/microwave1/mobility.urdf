@@ -1,0 +1,99 @@
+<?xml version="1.0"?>
+<robot name="small_appliances__microwave__microwave_1">
+  <link name="link_1">
+    <visual>
+      <origin xyz="0.000000000 0.000000000 0.000000000" rpy="0.000000000 0.000000000 0.000000000"/>
+      <geometry>
+        <mesh filename="./meshes/link_1.obj"/>
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0.000000000 0.000000000 0.000000000" rpy="0.000000000 0.000000000 0.000000000"/>
+      <geometry>
+        <mesh filename="./meshes/link_1.obj"/>
+      </geometry>
+    </collision>
+  </link>
+  <link name="link_11">
+    <visual>
+      <origin xyz="0.000000000 0.000000000 0.000000000" rpy="0.000000000 0.000000000 0.000000000"/>
+      <geometry>
+        <mesh filename="./meshes/link_11.obj"/>
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0.000000000 0.000000000 0.000000000" rpy="0.000000000 0.000000000 0.000000000"/>
+      <geometry>
+        <mesh filename="./meshes/link_11.obj"/>
+      </geometry>
+    </collision>
+  </link>
+  <link name="link_12">
+    <visual>
+      <origin xyz="0.000000000 0.000000000 0.000000000" rpy="0.000000000 0.000000000 0.000000000"/>
+      <geometry>
+        <mesh filename="./meshes/link_12.obj"/>
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0.000000000 0.000000000 0.000000000" rpy="0.000000000 0.000000000 0.000000000"/>
+      <geometry>
+        <mesh filename="./meshes/link_12.obj"/>
+      </geometry>
+    </collision>
+  </link>
+  <link name="link_23">
+    <visual>
+      <origin xyz="0.000000000 0.000000000 0.000000000" rpy="0.000000000 0.000000000 0.000000000"/>
+      <geometry>
+        <mesh filename="./meshes/link_23.obj"/>
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0.000000000 0.000000000 0.000000000" rpy="0.000000000 0.000000000 0.000000000"/>
+      <geometry>
+        <mesh filename="./meshes/link_23.obj"/>
+      </geometry>
+    </collision>
+  </link>
+  <link name="link_7">
+    <visual>
+      <origin xyz="0.000000000 0.000000000 0.000000000" rpy="0.000000000 0.000000000 0.000000000"/>
+      <geometry>
+        <mesh filename="./meshes/link_7.obj"/>
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0.000000000 0.000000000 0.000000000" rpy="0.000000000 0.000000000 0.000000000"/>
+      <geometry>
+        <mesh filename="./meshes/link_7.obj"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="joint_0" type="revolute">
+    <parent link="link_12"/>
+    <child link="link_1"/>
+    <origin xyz="-0.270511687 0.037698101 -0.056284498" rpy="0.000000000 -0.000000000 0.000000000"/>
+    <axis xyz="0.000000000 0.000000000 1.000000000"/>
+    <limit lower="-1.570796327" upper="0.000000000" effort="1000" velocity="100"/>
+  </joint>
+  <joint name="joint_1" type="revolute">
+    <parent link="link_12"/>
+    <child link="link_7"/>
+    <origin xyz="-0.037514400 0.203393206 -0.245856002" rpy="0.000000000 -0.000000000 0.000000000"/>
+    <axis xyz="0.000000000 0.000000000 1.000000000"/>
+    <limit lower="-3.141592654" upper="0.000000000" effort="1000" velocity="100"/>
+  </joint>
+  <joint name="joint_2" type="prismatic">
+    <parent link="link_12"/>
+    <child link="link_11"/>
+    <origin xyz="0.242999598 -0.002999200 -0.304165214" rpy="0.000000000 -0.000000000 0.000000000"/>
+    <axis xyz="0.000000000 1.000000000 0.000000000"/>
+    <limit lower="0.000000000" upper="0.010000000" effort="1000" velocity="100"/>
+  </joint>
+  <joint name="joint_3" type="fixed">
+    <parent link="link_12"/>
+    <child link="link_23"/>
+    <origin xyz="-0.011160500 0.163909600 -0.064876400" rpy="0.000000000 -0.000000000 0.000000000"/>
+  </joint>
+</robot>

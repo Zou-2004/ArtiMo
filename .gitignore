@@ -11,3 +11,4 @@ benchmark/
 benchmark_release/
 data/
 asset/
+record_materialization/

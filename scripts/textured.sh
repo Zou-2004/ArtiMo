@@ -71,7 +71,7 @@ prepare_mobility_urdf() {
   local candidates=()
   while IFS= read -r -d '' urdf; do
     candidates+=("${urdf}")
-  done < <(find "${asset_root}" -maxdepth 1 -type f -name "*.urdf" ! -name "mobility.urdf" -print0)
+  done < <(find -H "${asset_root}" -maxdepth 1 -type f -name "*.urdf" ! -name "mobility.urdf" -print0)
   if [[ "${#candidates[@]}" -eq 1 ]]; then
     echo "[INFO] Preparing mobility.urdf from ${candidates[0]}"
     cp "${candidates[0]}" "${mobility_urdf}"
@@ -88,7 +88,7 @@ build_one_asset() {
     return 0
   fi
   prepare_mobility_urdf "${asset_root}" "${URDF_INPUT:-}"
-  if ! find "${asset_root}" -type f -name "*.urdf" -print -quit | grep -q .; then
+  if ! find -H "${asset_root}" -type f -name "*.urdf" -print -quit | grep -q .; then
     echo "[WARN] Skip ${asset_name}: no URDF found"
     return 0
   fi

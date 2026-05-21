@@ -230,7 +230,17 @@ def _evaluate_case(case: dict[str, Any], args: argparse.Namespace) -> tuple[dict
     per_case["prediction_file"] = str(case["prediction_file"])
     per_case["prediction_num_frames"] = len(pred_seq.frames)
     per_case["prediction_last_time_s"] = float(pred_seq.frames[-1].time_s) if pred_seq.frames else None
-    per_case["alignment_chamfer"] = (match_diagnose.get("alignment") or {}).get("chamfer")
+    alignment = match_diagnose.get("alignment") or {}
+    scale_diag = ev.geometry_scale_diagnostic(asset, pred_seq, gt_seq)
+    per_case["alignment_mode"] = alignment.get("mode")
+    per_case["alignment_scale"] = alignment.get("scale")
+    per_case["alignment_chamfer"] = alignment.get("chamfer")
+    per_case["motion_scale_mode"] = match_diagnose.get("effective_motion_scale_mode")
+    per_case["geometry_initial_gt_diag"] = scale_diag.get("gt_initial_diag")
+    per_case["geometry_initial_pred_diag"] = scale_diag.get("pred_initial_diag")
+    per_case["geometry_initial_pred_to_gt_scale_ratio"] = scale_diag.get("pred_to_gt_diag_ratio")
+    per_case["geometry_scale_warning"] = scale_diag.get("warning")
+    per_case["geometry_scale_diagnostic"] = scale_diag
     per_case["num_components"] = match_diagnose.get("num_components")
     return per_case, per_phase, per_link, matched, match_diagnose
 
@@ -252,6 +262,13 @@ def parse_args() -> argparse.Namespace:
         help="Use a variant GLB from the manifest, e.g. full_agent, as the prediction source instead of matching files in --pred_dir.",
     )
     parser.add_argument("--cases_manifest", type=Path, default=REPO_ROOT / "ablation_eval_combined_latest" / "diagnose" / "resolved_manifest.json")
+    parser.add_argument(
+        "--data_root",
+        type=Path,
+        action="append",
+        default=[],
+        help="Root containing causal_data/not_causal_data asset folders when using the release manifest.",
+    )
     parser.add_argument("--out_dir", type=Path, default=REPO_ROOT / "aam_3d_eval_latest")
     parser.add_argument("--variant_name", default="animate_anymesh")
     parser.add_argument("--clean_extra", action="store_true")
@@ -274,7 +291,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--allow_equal_frames", action="store_true")
     parser.add_argument("--disable_terminal_state_check", action="store_true")
     parser.add_argument("--terminal_score_policy", choices=["min", "average"], default="min")
-    parser.add_argument("--alignment_mode", choices=["none", "axis_extent", "similarity", "scale_translate_3d"], default="none")
+    parser.add_argument("--alignment_mode", choices=["none", "axis_extent", "similarity", "scale_translate_3d"], default="scale_translate_3d")
     parser.add_argument("--align_sample_points", type=int, default=3000)
     parser.add_argument("--max_component_points", type=int, default=256)
     parser.add_argument("--min_component_faces", type=int, default=1)
@@ -404,6 +421,7 @@ def main() -> int:
 
     manifest = json.loads(Path(args.cases_manifest).read_text(encoding="utf-8"))
     cases = manifest.get("cases", manifest) if isinstance(manifest, dict) else manifest
+    cases = [ev._resolve_release_case_paths(dict(case), args, Path(args.cases_manifest)) for case in list(cases)]
     mapped, missing, extras = _build_mapping(cases, Path(args.pred_dir), str(args.prediction_variant or "").strip() or None)
     if args.max_cases and args.max_cases > 0:
         mapped = mapped[: int(args.max_cases)]
@@ -538,7 +556,15 @@ def main() -> int:
             *metric_keys,
             "prediction_num_frames",
             "prediction_last_time_s",
+            "alignment_mode",
+            "alignment_scale",
             "alignment_chamfer",
+            "motion_scale_mode",
+            "geometry_initial_gt_diag",
+            "geometry_initial_pred_diag",
+            "geometry_initial_pred_to_gt_scale_ratio",
+            "geometry_scale_warning",
+            "geometry_scale_diagnostic",
             "num_components",
             "prediction_file",
         ],

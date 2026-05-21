@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -67,8 +68,8 @@ def _converted_dir_from_source_file(row: dict[str, str]) -> str | None:
         if "Articulated_objects" in parts:
             idx = parts.index("Articulated_objects")
             asset_parts = parts[idx + 1 : -1]
-            return "__".join(asset_parts) if asset_parts else None
-        return "__".join(parts[:-1]) if len(parts) > 1 else None
+            return "__".join(_safe_dataset_part(p) for p in asset_parts) if asset_parts else None
+        return "__".join(_safe_dataset_part(p) for p in parts[:-1]) if len(parts) > 1 else None
     if dataset == "Lightwheel":
         lowered = [p.lower() for p in parts]
         if "manipulation" in lowered:
@@ -79,6 +80,13 @@ def _converted_dir_from_source_file(row: dict[str, str]) -> str | None:
         if asset_parts:
             return "lightwheel__" + "__".join(p.lower() for p in asset_parts)
     return None
+
+
+def _safe_dataset_part(text: str) -> str:
+    text = str(text).replace(" ", "_")
+    text = re.sub(r"[^0-9a-zA-Z_]+", "_", text)
+    text = re.sub(r"_+", "_", text).strip("_")
+    return text or "asset"
 
 
 def _has_primary_usd(path: Path) -> bool:

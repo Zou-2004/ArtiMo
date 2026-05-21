@@ -1,0 +1,38 @@
+{
+  "max_origin_position_error_m": 0.0,
+  "max_axis_error_deg": 0.0,
+  "joints": [
+    {
+      "joint": "joint_0",
+      "type": "revolute",
+      "parent": "link_12",
+      "child": "link_1",
+      "origin_position_error_m": 0.0,
+      "axis_error_deg": 0.0
+    },
+    {
+      "joint": "joint_1",
+      "type": "revolute",
+      "parent": "link_12",
+      "child": "link_7",
+      "origin_position_error_m": 0.0,
+      "axis_error_deg": 0.0
+    },
+    {
+      "joint": "joint_2",
+      "type": "prismatic",
+      "parent": "link_12",
+      "child": "link_11",
+      "origin_position_error_m": 0.0,
+      "axis_error_deg": 0.0
+    },
+    {
+      "joint": "joint_3",
+      "type": "fixed",
+      "parent": "link_12",
+      "child": "link_23",
+      "origin_position_error_m": 0.0,
+      "axis_error_deg": 0.0
+    }
+  ]
+}
