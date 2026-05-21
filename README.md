@@ -49,6 +49,8 @@ set +a
 
 At minimum, set one model key such as `OPENAI_API_KEY` or `GEMINI_API_KEY`.
 For high-quality rendering, set `BLENDER_BIN=/path/to/blender`.
+For faster visual rasterization and 3D evaluation, install PyTorch3D and enable the Torch/PyTorch3D raster settings
+For more deails of installation, see [Documentation](docs/Documentation.md#Environment).
 
 ## Quickstart: Microwave
 
@@ -67,7 +69,7 @@ Run ArtiMo:
 ```bash
 scripts/run_agent.sh \
   --asset_root examples/microwave1 \
-  --action_text "fully open the microwave door" \
+  --action_text "Fully open the microwave door" \
   --out_root outputs/microwave1_fully_open \
   --vlm_model gemini-3.1-pro-preview \
   --llm_model gpt-5.4 \
@@ -107,7 +109,7 @@ python tools/run_plan.py \
 
 | Task | Entry point | Details |
 | --- | --- | --- |
-| Prepare a raw URDF + mesh asset | [scripts/textured.sh](scripts/textured.sh) | [docs/Documentation.md](docs/Documentation.md#input-assets) |
+| Prepare a raw URDF + mesh asset & Combination with [Articraft](https://github.com/mattzh72/articraft) | [scripts/textured.sh](scripts/textured.sh) | [docs/Documentation.md](docs/Documentation.md#input-assets) |
 | Run ArtiMo on one action | [scripts/run_agent.sh](scripts/run_agent.sh) | [docs/Documentation.md](docs/Documentation.md#run-artimo) |
 | Use mask-conditioned input | [tools/run_agent_single.py](tools/run_agent_single.py) | [docs/Documentation.md](docs/Documentation.md#mask-conditioned-input) |
 | Execute an existing plan | [tools/run_plan.py](tools/run_plan.py) | [docs/Documentation.md](docs/Documentation.md#execute-an-existing-plan) |
@@ -127,9 +129,9 @@ ArtiMo/
   examples/     Small example assets.
 ```
 
-## Notes
+<!-- ## Notes
 
 - Do not commit `.env` or API keys.
 - PyTorch3D and Isaac Sim are optional; install them only for GPU point-cloud
   evaluation or Isaac Sim execution.
-- Benchmark data is distributed separately on HuggingFace.
+- Benchmark data is distributed separately on HuggingFace. -->
