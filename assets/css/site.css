@@ -74,7 +74,7 @@ video {
 }
 
 .nav {
-  max-width: 1180px;
+  max-width: 1480px;
   margin: 0 auto;
   padding: 14px 24px;
   display: flex;
@@ -118,17 +118,17 @@ video {
 
 .hero,
 .section {
-  max-width: 1180px;
+  max-width: 1480px;
   margin: 0 auto;
   padding: 64px 24px;
 }
 
 .hero {
-  padding-top: 78px;
+  padding-top: 54px;
 }
 
 .hero-copy {
-  max-width: 900px;
+  max-width: 1180px;
   margin: 0 auto 34px;
   text-align: center;
 }
@@ -155,6 +155,16 @@ h1 {
   font-weight: 780;
 }
 
+.hero-title {
+  max-width: 1120px;
+  margin: 0 auto;
+}
+
+.hero-title .title-line {
+  display: block;
+  white-space: nowrap;
+}
+
 h2 {
   font-size: clamp(28px, 3.6vw, 44px);
   font-weight: 760;
@@ -170,6 +180,61 @@ h3 {
   margin: 22px auto 0;
   color: var(--muted);
   font-size: clamp(17px, 2vw, 22px);
+}
+
+.author-block {
+  max-width: 980px;
+  margin: 28px auto 0;
+  text-align: center;
+}
+
+.author-list,
+.affiliations {
+  display: flex;
+  justify-content: center;
+  flex-wrap: wrap;
+  column-gap: 34px;
+  row-gap: 12px;
+}
+
+.author {
+  color: var(--ink);
+  font-size: clamp(18px, 2.2vw, 28px);
+  font-weight: 740;
+  line-height: 1.15;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+a.author:hover {
+  color: var(--accent-dark);
+  text-decoration: underline;
+  text-decoration-thickness: 2px;
+  text-underline-offset: 4px;
+}
+
+.author sup,
+.affiliations sup,
+.author-note sup {
+  font-size: 0.58em;
+  line-height: 0;
+  vertical-align: super;
+}
+
+.affiliations {
+  margin-top: 20px;
+  column-gap: 38px;
+  color: var(--ink);
+  font-size: clamp(15px, 1.7vw, 22px);
+  font-weight: 680;
+  line-height: 1.25;
+}
+
+.author-note {
+  margin: 12px auto 0;
+  color: var(--muted);
+  font-size: clamp(13px, 1.2vw, 16px);
+  font-weight: 560;
 }
 
 .link-row {
@@ -249,6 +314,17 @@ h3 {
 .hero-media video,
 .figure-frame img {
   background: #fff;
+}
+
+.hero-media {
+  max-width: 1360px;
+  margin-inline: auto;
+}
+
+.hero-media video {
+  max-height: min(66vh, 760px);
+  object-fit: contain;
+  background: #000;
 }
 
 .figure-frame figcaption {
@@ -522,6 +598,10 @@ video:not([src]) {
   .nav {
     align-items: flex-start;
     flex-direction: column;
+  }
+
+  .hero-title .title-line {
+    white-space: normal;
   }
 
   .hero,
