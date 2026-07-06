@@ -1,0 +1,260 @@
+{
+  "asset_root": "/home/chunyu/causal_agent/data/safe1",
+  "urdf": "/home/chunyu/causal_agent/data/safe1/isaacsim_bundle/import_asset/mobility.urdf",
+  "output_glb": "/home/chunyu/causal_agent/data/safe1/animated_textured_safe1.glb",
+  "build_mode": "urdf_preview",
+  "fps": 30,
+  "frames_per_joint": 36,
+  "initial_pose_mode": "zeros",
+  "max_preview_joints": 8,
+  "preview_joint_count": 3,
+  "num_frames": 129,
+  "ordered_links_mapped_to_part_nodes": [
+    "link_0",
+    "link_1",
+    "link_2",
+    "link_3"
+  ],
+  "fixed_merge_members": {
+    "link_0": [
+      "link_0"
+    ],
+    "link_1": [
+      "link_1"
+    ],
+    "link_2": [
+      "link_2"
+    ],
+    "link_3": [
+      "link_3"
+    ]
+  },
+  "joints_count": 4,
+  "movable_joints": [
+    "joint_0",
+    "joint_1",
+    "joint_3"
+  ],
+  "parts": [
+    {
+      "part_node": "part_node_0",
+      "part_node_submeshes": [
+        "part_node_0",
+        "part_node_0__sub_01",
+        "part_node_0__sub_02",
+        "part_node_0__sub_03",
+        "part_node_0__sub_04"
+      ],
+      "link_name": "link_0",
+      "rest_transform": [
+        [
+          -3.8285686989269494e-16,
+          -3.8285686989269494e-16,
+          -1.0,
+          1.1102230246251565e-16
+        ],
+        [
+          -1.0,
+          1.4657938282403194e-31,
+          3.8285686989269494e-16,
+          0.21093099999999992
+        ],
+        [
+          0.0,
+          1.0,
+          -3.8285686989269494e-16,
+          -0.16433231908762147
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "bbox_extent_local": [
+        0.20058700000000002,
+        0.20058699999999996,
+        0.08915000000000006
+      ],
+      "submesh_count": 5
+    },
+    {
+      "part_node": "part_node_1",
+      "part_node_submeshes": [
+        "part_node_1",
+        "part_node_1__sub_01",
+        "part_node_1__sub_02",
+        "part_node_1__sub_03",
+        "part_node_1__sub_04",
+        "part_node_1__sub_05",
+        "part_node_1__sub_06",
+        "part_node_1__sub_07",
+        "part_node_1__sub_08",
+        "part_node_1__sub_09",
+        "part_node_1__sub_10",
+        "part_node_1__sub_11",
+        "part_node_1__sub_12",
+        "part_node_1__sub_13",
+        "part_node_1__sub_14",
+        "part_node_1__sub_15",
+        "part_node_1__sub_16",
+        "part_node_1__sub_17",
+        "part_node_1__sub_18",
+        "part_node_1__sub_19",
+        "part_node_1__sub_20",
+        "part_node_1__sub_21",
+        "part_node_1__sub_22",
+        "part_node_1__sub_23",
+        "part_node_1__sub_24",
+        "part_node_1__sub_25",
+        "part_node_1__sub_26",
+        "part_node_1__sub_27",
+        "part_node_1__sub_28",
+        "part_node_1__sub_29",
+        "part_node_1__sub_30",
+        "part_node_1__sub_31",
+        "part_node_1__sub_32",
+        "part_node_1__sub_33",
+        "part_node_1__sub_34",
+        "part_node_1__sub_35",
+        "part_node_1__sub_36",
+        "part_node_1__sub_37",
+        "part_node_1__sub_38",
+        "part_node_1__sub_39",
+        "part_node_1__sub_40",
+        "part_node_1__sub_41"
+      ],
+      "link_name": "link_1",
+      "rest_transform": [
+        [
+          -3.8285686989269494e-16,
+          -3.8285686989269494e-16,
+          -1.0,
+          -1.1102230246251565e-16
+        ],
+        [
+          -1.0,
+          1.4657938282403194e-31,
+          3.8285686989269494e-16,
+          0.026321064298032104
+        ],
+        [
+          0.0,
+          1.0,
+          -3.8285686989269494e-16,
+          0.20624226526354253
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "bbox_extent_local": [
+        0.093984,
+        0.09398299999999998,
+        0.046990999999999894
+      ],
+      "submesh_count": 42
+    },
+    {
+      "part_node": "part_node_2",
+      "part_node_submeshes": [
+        "part_node_2",
+        "part_node_2__sub_01",
+        "part_node_2__sub_02",
+        "part_node_2__sub_03"
+      ],
+      "link_name": "link_2",
+      "rest_transform": [
+        [
+          -3.8285686989269494e-16,
+          -3.8285686989269494e-16,
+          -1.0,
+          0.0
+        ],
+        [
+          -1.0,
+          1.4657938282403194e-31,
+          3.8285686989269494e-16,
+          0.0
+        ],
+        [
+          0.0,
+          1.0,
+          -3.8285686989269494e-16,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "bbox_extent_local": [
+        1.107658,
+        1.208355,
+        1.248096
+      ],
+      "submesh_count": 4
+    },
+    {
+      "part_node": "part_node_3",
+      "part_node_submeshes": [
+        "part_node_3",
+        "part_node_3__sub_01",
+        "part_node_3__sub_02",
+        "part_node_3__sub_03",
+        "part_node_3__sub_04",
+        "part_node_3__sub_05",
+        "part_node_3__sub_06",
+        "part_node_3__sub_07",
+        "part_node_3__sub_08",
+        "part_node_3__sub_09",
+        "part_node_3__sub_10",
+        "part_node_3__sub_11",
+        "part_node_3__sub_12",
+        "part_node_3__sub_13",
+        "part_node_3__sub_14",
+        "part_node_3__sub_15",
+        "part_node_3__sub_16"
+      ],
+      "link_name": "link_3",
+      "rest_transform": [
+        [
+          -3.8285686989269494e-16,
+          -3.8285686989269494e-16,
+          -1.0,
+          -0.6316811092181409
+        ],
+        [
+          -1.0,
+          1.4657938282403194e-31,
+          3.8285686989269494e-16,
+          -0.4165463056150163
+        ],
+        [
+          0.0,
+          1.0,
+          -3.8285686989269494e-16,
+          0.42991
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "bbox_extent_local": [
+        0.9130780000000001,
+        0.9499,
+        0.3552560000000001
+      ],
+      "submesh_count": 17
+    }
+  ]
+}

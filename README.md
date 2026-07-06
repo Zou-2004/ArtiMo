@@ -53,26 +53,26 @@ For faster visual rasterization and 3D evaluation, install PyTorch3D and enable
 the Torch/PyTorch3D raster settings. For installation details, see
 [Documentation](docs/Documentation.md#environment).
 
-## Quickstart: Microwave
+## Quickstart: Safe
 
 This repository includes a small ready-to-run asset:
 
 ```text
-examples/microwave1/
+examples/safe1/
   mobility.urdf
-  meshes/
-  textures/
-  animated_textured_microwave1.glb
+  textured_objs/
+  images/
+  animated_textured_safe1.glb
 ```
 
 Run ArtiMo:
 
 ```bash
 scripts/run_agent.sh \
-  --asset_root examples/microwave1 \
-  --action_text "Fully open the microwave door" \
-  --out_root outputs/microwave1_fully_open \
-  --vlm_model gemini-3.1-pro-preview \
+  --asset_root examples/safe1 \
+  --action_text "Turn the combination dial to unlock the safe, then swing the door fully open in one continuous motion" \
+  --out_root outputs/safe1_unlock_and_open \
+  --vlm_model gemini-3.1-pro\
   --llm_model gpt-5.4 \
   --api_provider openai \
   --use_glb_scene auto \
@@ -86,7 +86,7 @@ scripts/run_agent.sh \
 Main outputs:
 
 ```text
-outputs/microwave1_fully_open/microwave1/
+outputs/safe1_unlock_and_open/safe1/
   causal.json
   plan.json
   trajectory.jsonl
@@ -98,10 +98,10 @@ If you only want to execute an existing plan and export a GLB:
 
 ```bash
 python tools/run_plan.py \
-  --asset_root examples/microwave1 \
+  --asset_root examples/safe1 \
   --plan_json /path/to/plan.json \
-  --out outputs/plan_replay/microwave1 \
-  --trajectory_jsonl outputs/plan_replay/microwave1/trajectory.jsonl \
+  --out outputs/plan_replay/safe1 \
+  --trajectory_jsonl outputs/plan_replay/safe1/trajectory.jsonl \
   --export_animated_glb \
   --use_glb_scene auto
 ```
