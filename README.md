@@ -70,7 +70,7 @@ Run ArtiMo:
 ```bash
 scripts/run_agent.sh \
   --asset_root examples/safe1 \
-  --action_text "Turn the combination dial to unlock the safe, then swing the door fully open in one continuous motion" \
+  --action_text "Unlock and fully open the safe. To unlock the combination lock, turn the combination dial clockwise by 90 degrees. To open the door, turn the door handle clockwise by 90 degrees first." \
   --out_root outputs/safe1_unlock_and_open \
   --vlm_model gemini-3.1-pro\
   --llm_model gpt-5.4 \
