@@ -327,6 +327,18 @@ a.author:hover {
   background: #000;
 }
 
+.method-image-link {
+  display: block;
+  padding: clamp(24px, 3.2vw, 48px);
+  background: #fff;
+  cursor: zoom-in;
+}
+
+.method-image {
+  width: min(100%, 1320px);
+  margin-inline: auto;
+}
+
 .figure-frame figcaption {
   padding: 14px 18px 16px;
   border-top: 1px solid var(--line);
@@ -613,6 +625,10 @@ video:not([src]) {
   .multimodal-grid,
   .comparison-grid {
     grid-template-columns: 1fr;
+  }
+
+  .method-image-link {
+    padding: 18px 12px;
   }
 
   model-viewer {
