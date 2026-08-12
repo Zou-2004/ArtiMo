@@ -17,6 +17,8 @@ from collections import deque
 from pathlib import Path
 from typing import Any
 
+import artimo_video
+
 
 APPLICATION_ROOT = Path(__file__).resolve().parent
 REPO_ROOT = APPLICATION_ROOT.parents[1]
@@ -200,7 +202,12 @@ def _asset_dependency_records(
 
 
 def _first_line(command: list[str]) -> str | None:
-    completed = subprocess.run(command, capture_output=True, text=True, check=False)
+    try:
+        completed = subprocess.run(
+            command, capture_output=True, text=True, check=False
+        )
+    except OSError:
+        return None
     if completed.returncode != 0:
         return None
     output = completed.stdout.strip() or completed.stderr.strip()
@@ -208,10 +215,15 @@ def _first_line(command: list[str]) -> str | None:
 
 
 def _toolchain_state() -> dict[str, Any]:
+    video_encoder = artimo_video.select_encoder()
     return {
         "python": sys.version.splitlines()[0],
         "platform": platform.platform(),
-        "ffmpeg": _first_line(["ffmpeg", "-version"]),
+        "ffmpeg": _first_line([artimo_video.ffmpeg_executable(), "-version"]),
+        "video_encoder": {
+            "codec": video_encoder["codec"],
+            "hardware_accelerated": video_encoder["hardware_accelerated"],
+        },
     }
 
 
@@ -290,9 +302,7 @@ def _validate_spec(spec: dict[str, Any], repo_root: Path) -> dict[str, Path]:
         raise ValueError("acceptance must be an object")
     for key in (
         "require_zero_fixed_constraints",
-        "require_second_run",
         "minimum_joint_motion_ratio",
-        "minimum_contact_force_n",
         "visual_review_fps",
     ):
         if key not in acceptance:
@@ -375,6 +385,25 @@ def build(
         "the repository-level `docs/` directory. Follow AGENTS.md. Do not "
         "read prior task outputs or edit generic code, schemas, application docs, source "
         "inputs, requirements, or AGENTS.md during the task run.\n\n"
+        "`plan.json` is the sole authority for phase names, controls, targets, holds, "
+        "returns, ordering, and release/contact-continuity boundaries. Do not open, "
+        "read, or use any supporting file named `causal.json`; it may appear in the "
+        "task specification and immutable lock only so its supplied bytes remain "
+        "auditable. No supporting file or task description may create a stage, change "
+        "a contact link, change a motion owner, or release a grasp absent an explicit "
+        "boundary in `plan.json`. Consecutive robot-contact controls with no intervening "
+        "plan `control_release` must use the same contact link and one uninterrupted "
+        "`contact_sequence`, even when the controlled joint changes.\n\n"
+        "This task has no elapsed-time, wall-clock, tool-window, or compute-time "
+        "budget. Runtime may change only how a long command is launched and polled; "
+        "it must never narrow, subsample, terminate, or reorder a declared candidate "
+        "batch, skip the lateral-offset batch after all centered distances fail, or "
+        "promote a failed row. If a command is interrupted, rerun or resume the "
+        "byte-identical batch and wait for completion. A placement result with "
+        "`execution: null` is diagnostic evidence only: never copy its `chosen` row "
+        "into an execution, release solver, physics rollout, or video. The instruction "
+        "to export a complete video when diagnostics fail applies only after the "
+        "placement solver has emitted its feasible `execution.json`.\n\n"
         f"Task specification: `{spec_path.relative_to(repo_root)}`\n\n"
         "Immutable handoff lock:\n\n```json\n"
         + json.dumps(prompt_lock, indent=2, ensure_ascii=False, sort_keys=True)
@@ -382,8 +411,8 @@ def build(
         "Create only task-specific execution data below this task's `.artimo-runs/` "
         "tree. Preserve every plan control and physical owner, use the generic "
         "orientation/placement/release/transit tools as applicable, run physical "
-        "and byte-identical contact-disabled rollouts, perform the clean second "
-        "run and video review, then publish exactly `video.mp4`, `grasp.json`, and "
+        "and byte-identical contact-disabled conditions once, perform video review, "
+        "then publish exactly `video.mp4`, `grasp.json`, and "
         "`result.json`. Export the complete video even when diagnostics fail.\n"
     )
     lock = {

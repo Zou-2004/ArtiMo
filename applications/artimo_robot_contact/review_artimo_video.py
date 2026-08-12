@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -23,25 +22,16 @@ from typing import Any
 import imageio.v2 as imageio
 import numpy as np
 
+import artimo_video
+
 
 def _probe(video: Path) -> dict[str, Any]:
-    completed = subprocess.run(
-        [
-            "ffprobe", "-v", "error",
-            "-show_entries", "stream=codec_name,width,height,nb_frames,avg_frame_rate",
-            "-show_entries", "format=duration",
-            "-of", "json", str(video),
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if completed.returncode != 0:
-        raise RuntimeError(f"ffprobe failed for {video}: {completed.stderr.strip()}")
-    return json.loads(completed.stdout)
+    return artimo_video.probe_video(video)
 
 
-def _sampled_frames(video: Path, sample_fps: float) -> tuple[list[np.ndarray], list[float], float, int]:
+def _sampled_frames_once(
+    video: Path, sample_fps: float, input_params: list[str]
+) -> tuple[list[np.ndarray], list[float], float, int]:
     """Read frames at no less than ``sample_fps``, plus native-rate differences.
 
     Returns the subsampled frames used for blank/stale checks together with
@@ -49,30 +39,61 @@ def _sampled_frames(video: Path, sample_fps: float) -> tuple[list[np.ndarray], l
     judged at full rate: at 5 fps two sampled frames are six frames apart, so
     ordinary fast motion looks like a cut.
     """
-    reader = imageio.get_reader(str(video))
-    metadata = reader.get_meta_data()
-    source_fps = float(metadata.get("fps") or 0.0)
-    if source_fps <= 0.0:
-        raise RuntimeError(f"Could not determine frame rate for {video}")
-    stride = max(1, int(source_fps // sample_fps)) if sample_fps > 0 else 1
-    frames: list[np.ndarray] = []
-    native_differences: list[float] = []
-    previous: np.ndarray | None = None
-    total = 0
-    for index, raw in enumerate(reader):
-        frame = np.asarray(raw, dtype=np.uint8)
-        total += 1
-        if previous is not None:
-            native_differences.append(
-                float(np.mean(np.abs(frame.astype(np.int16) - previous.astype(np.int16))))
-            )
-        previous = frame
-        if index % stride == 0:
-            frames.append(frame)
-    reader.close()
+    reader = imageio.get_reader(str(video), input_params=input_params)
+    try:
+        metadata = reader.get_meta_data()
+        source_fps = float(metadata.get("fps") or 0.0)
+        if source_fps <= 0.0:
+            raise RuntimeError(f"Could not determine frame rate for {video}")
+        stride = max(1, int(source_fps // sample_fps)) if sample_fps > 0 else 1
+        frames: list[np.ndarray] = []
+        native_differences: list[float] = []
+        previous: np.ndarray | None = None
+        total = 0
+        for index, raw in enumerate(reader):
+            frame = np.asarray(raw, dtype=np.uint8)
+            total += 1
+            if previous is not None:
+                native_differences.append(
+                    float(
+                        np.mean(
+                            np.abs(
+                                frame.astype(np.int16)
+                                - previous.astype(np.int16)
+                            )
+                        )
+                    )
+                )
+            previous = frame
+            if index % stride == 0:
+                frames.append(frame)
+    finally:
+        reader.close()
     if not frames:
         raise RuntimeError(f"No frames decoded from {video}")
     return frames, native_differences, source_fps, total
+
+
+def _sampled_frames(
+    video: Path, sample_fps: float
+) -> tuple[list[np.ndarray], list[float], float, int, dict[str, Any]]:
+    backend = artimo_video.select_decoder(video)
+    try:
+        decoded = _sampled_frames_once(
+            video, sample_fps, list(backend["input_params"])
+        )
+    except Exception as exc:
+        if not backend["hardware_accelerated"] or backend["requested"] != "auto":
+            raise
+        backend = {
+            **backend,
+            "backend": "cpu",
+            "hardware_accelerated": False,
+            "input_params": [],
+            "fallback_reason": str(exc),
+        }
+        decoded = _sampled_frames_once(video, sample_fps, [])
+    return *decoded, backend
 
 
 def review(
@@ -83,7 +104,13 @@ def review(
 ) -> dict[str, Any]:
     result = json.loads(result_json.read_text(encoding="utf-8"))
     physical = result["physical"]
-    frames, native_differences, source_fps, total_frames = _sampled_frames(video, requested_fps)
+    (
+        frames,
+        native_differences,
+        source_fps,
+        total_frames,
+        decode_backend,
+    ) = _sampled_frames(video, requested_fps)
     effective_fps = source_fps * len(frames) / max(total_frames, 1)
     probe = _probe(video)
     streams = probe.get("streams", [])
@@ -172,6 +199,7 @@ def review(
         "no_rendering_artifacts": bool(no_artifacts),
         "evidence": {
             "video_codec": streams[0].get("codec_name") if streams else None,
+            "video_decode": decode_backend,
             "video_duration_s": float(probe.get("format", {}).get("duration", 0.0)),
             "source_fps": source_fps,
             "total_frames": total_frames,

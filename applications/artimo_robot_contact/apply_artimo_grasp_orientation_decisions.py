@@ -2,30 +2,21 @@
 """Hard-filter wrist rolls by reviewed visual semantics before planning.
 
 The renderer emits separate immutable images for every candidate and view.  An
-agent records a decision for every roll.  This tool verifies that all exact
-images were reviewed, removes every visual-invalid candidate, applies numerical
-gates only to the remaining visual-valid set, and emits the sole execution that
-may continue to placement/IK/transit.  It never knows an asset or task name.
+agent records a decision and visual priority for every roll.  This tool verifies
+that all exact images were reviewed, removes every visual-invalid candidate,
+and records the remaining priority order without running IK.  Full-path IK is
+deferred to placement, where the real robot base is known; placement tries the
+best visual choice completely before considering the next.  Nothing here knows
+an asset or task name.
 """
 from __future__ import annotations
 
 import argparse
 import hashlib
 import json
-import math
 import shutil
-import subprocess
-import sys
 from pathlib import Path
-from typing import Any, Callable
-
-from render_artimo_grasp_orientation_candidates import _candidate_summary
-
-
-APP_ROOT = Path(__file__).resolve().parent
-REPO = APP_ROOT.parents[1]
-SCENE_RENDERER = APP_ROOT / "visualize_artimo_scene.py"
-
+from typing import Any
 
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
@@ -42,87 +33,11 @@ def _read_json(path: Path) -> dict[str, Any]:
     return value
 
 
-def _numerically_eligible(
-    candidate: dict[str, Any], *, require_bilateral_contact: bool
-) -> bool:
-    summary = candidate.get("summary")
-    if not isinstance(summary, dict):
-        return False
-    required = (
-        "all_samples_ik_success",
-        "all_samples_target_contact_geometry_ready",
-        "all_samples_forbidden_clearance_passed",
-    )
-    return all(bool(summary.get(key)) for key in required) and (
-        not require_bilateral_contact
-        or bool(summary.get("all_samples_bilateral_physical_contact"))
-    )
-
-
-def _rank(candidate: dict[str, Any]) -> tuple[float, float, float, str]:
-    summary = candidate["summary"]
-    clearance = summary.get("minimum_reported_forbidden_clearance_m")
-    numeric_clearance = math.inf if clearance is None else float(clearance)
-    return (
-        -numeric_clearance,
-        float(summary["maximum_ik_position_error_m"]),
-        float(summary["maximum_ik_orientation_error_deg"]),
-        str(candidate["id"]),
-    )
-
-
-def _probe_candidate(
-    candidate: dict[str, Any], report: dict[str, Any], output: Path
-) -> dict[str, Any]:
-    """Run numerical evidence only after this roll passed visual review."""
-    probe_directory = output / "numerical_probes" / str(candidate["id"])
-    command = [
-        sys.executable,
-        str(SCENE_RENDERER),
-        "--task-spec",
-        str(report["task_spec"]),
-        "--execution",
-        str(candidate["execution"]),
-        "--out",
-        str(probe_directory),
-        "--stage",
-        str(int(report["stage_index"])),
-        "--maximum-target-gap-m",
-        str(float(report.get("maximum_target_gap_m", 0.006))),
-    ]
-    completed = subprocess.run(
-        command,
-        cwd=REPO,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        check=False,
-    )
-    probe_directory.mkdir(parents=True, exist_ok=True)
-    (probe_directory / "probe.log").write_text(
-        completed.stdout, encoding="utf-8"
-    )
-    if completed.returncode != 0:
-        raise RuntimeError(
-            f"Numerical probe failed for {candidate['id']}; see "
-            f"{probe_directory / 'probe.log'}"
-        )
-    scene_path = probe_directory / "scene.json"
-    scene = _read_json(scene_path)
-    summary = _candidate_summary(scene)
-    summary["probe_scene"] = str(scene_path)
-    summary["probe_scene_sha256"] = _sha256(scene_path)
-    return summary
-
-
 def apply_decisions(
     report_path: Path,
     decisions_path: Path,
     output: Path,
     prior_gate_path: Path | None = None,
-    probe_candidate: Callable[
-        [dict[str, Any], dict[str, Any], Path], dict[str, Any]
-    ] | None = None,
 ) -> dict[str, Any]:
     report_path = report_path.expanduser().resolve()
     decisions_path = decisions_path.expanduser().resolve()
@@ -132,8 +47,11 @@ def apply_decisions(
         raise ValueError("Orientation report must use schema_version 4")
     if report.get("visual_render_ik_was_run") is not False:
         raise ValueError("Visual orientation report must prove that IK was not run")
-    if int(decisions.get("schema_version", 0)) != 1:
-        raise ValueError("Visual decisions must use schema_version 1")
+    if int(decisions.get("schema_version", 0)) != 2:
+        raise ValueError(
+            "Visual decisions must use schema_version 2 with visual_priority; "
+            "rerender legacy orientation reports"
+        )
     if decisions.get("report_sha256") != _sha256(report_path):
         raise ValueError("Visual decisions report_sha256 does not match report.json")
     if decisions.get("stage_id") != report.get("stage_id"):
@@ -186,6 +104,17 @@ def apply_decisions(
         reason = row.get("reason")
         if not isinstance(reason, str) or len(reason.strip()) < 8:
             raise ValueError(f"{candidate_id}.reason must explain the visual decision")
+        priority = row.get("visual_priority")
+        if status == "valid":
+            if isinstance(priority, bool) or not isinstance(priority, int) or priority < 1:
+                raise ValueError(
+                    f"{candidate_id}.visual_priority must be a positive integer "
+                    "for every visual-valid roll"
+                )
+        elif priority is not None:
+            raise ValueError(
+                f"{candidate_id}.visual_priority must be null for a visual-invalid roll"
+            )
         expected_images = by_id[candidate_id].get("orientation_images")
         if not isinstance(expected_images, dict) or len(expected_images) != 4:
             raise ValueError(f"{candidate_id} does not declare four separate views")
@@ -206,40 +135,41 @@ def apply_decisions(
         missing = sorted(set(by_id) - set(decision_by_id))
         raise ValueError(f"Every candidate requires a visual decision; missing {missing}")
 
-    visual_valid = [
-        by_id[candidate_id]
-        for candidate_id, row in decision_by_id.items()
-        if row["visual_status"] == "valid"
-    ]
+    visual_valid = sorted(
+        [
+            by_id[candidate_id]
+            for candidate_id, row in decision_by_id.items()
+            if row["visual_status"] == "valid"
+        ],
+        key=lambda candidate: int(
+            decision_by_id[str(candidate["id"])]["visual_priority"]
+        ),
+    )
     if not visual_valid:
         raise ValueError("No visually valid grasp orientation remains")
+    priorities = [
+        int(decision_by_id[str(candidate["id"])]["visual_priority"])
+        for candidate in visual_valid
+    ]
+    if priorities != list(range(1, len(visual_valid) + 1)):
+        raise ValueError(
+            "Visual-valid visual_priority values must be unique and contiguous "
+            "starting at 1"
+        )
 
     output = output.expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
-    probe = _probe_candidate if probe_candidate is None else probe_candidate
-    numerically_probed: list[dict[str, Any]] = []
-    for candidate in visual_valid:
-        candidate_copy = dict(candidate)
-        candidate_copy["summary"] = probe(candidate_copy, report, output)
-        numerically_probed.append(candidate_copy)
+    chosen = visual_valid[0]
     interaction = str(report.get("interaction", "explicit_ideal_feasibility"))
     require_bilateral_contact = interaction == "explicit_ideal_feasibility"
-    eligible = [
-        candidate
-        for candidate in numerically_probed
-        if _numerically_eligible(
-            candidate, require_bilateral_contact=require_bilateral_contact
-        )
-    ]
-    if not eligible:
-        contact_requirement = (
-            "bilateral physical contact, " if require_bilateral_contact else ""
-        )
-        raise ValueError(
-            "Visually valid orientations all fail IK, "
-            f"{contact_requirement}target contact geometry, or clearance"
-        )
-    chosen = min(eligible, key=_rank)
+    for candidate in visual_valid:
+        candidate_execution = Path(candidate["execution"]).expanduser().resolve()
+        if not candidate_execution.is_file():
+            raise ValueError(f"Candidate execution does not exist: {candidate_execution}")
+        if candidate.get("execution_sha256") != _sha256(candidate_execution):
+            raise ValueError(
+                f"Candidate {candidate['id']} execution changed after rendering"
+            )
     chosen_execution = Path(chosen["execution"]).expanduser().resolve()
     if not chosen_execution.is_file():
         raise ValueError(f"Chosen execution does not exist: {chosen_execution}")
@@ -247,6 +177,7 @@ def apply_decisions(
         raise ValueError("Chosen candidate execution changed after rendering")
 
     prior_stages: list[dict[str, Any]] = []
+    prior_candidate_groups: list[dict[str, Any]] = []
     if prior_gate_path is not None:
         prior_gate_path = prior_gate_path.expanduser().resolve()
         prior = _read_json(prior_gate_path)
@@ -257,6 +188,7 @@ def apply_decisions(
                 "Prior gate execution does not match this orientation report template"
             )
         prior_stages = list(prior.get("stages", []))
+        prior_candidate_groups = list(prior.get("placement_candidate_groups", []))
     duplicate_stage_ids = sorted(
         set(covered_stage_ids)
         & {str(item.get("stage_id")) for item in prior_stages}
@@ -281,10 +213,11 @@ def apply_decisions(
             for candidate_id, row in decision_by_id.items()
             if row["visual_status"] == "invalid"
         ),
-        "numerically_evaluated_candidate_ids": sorted(
-            str(item["id"]) for item in numerically_probed
+        "visual_priority_candidate_ids": [str(item["id"]) for item in visual_valid],
+        "numerically_evaluated_candidate_ids": [],
+        "numerical_probe_policy": (
+            "deferred_to_full_placement_at_actual_robot_base"
         ),
-        "numerical_probe_policy": "visual_valid_only_after_hard_exclusion",
         "interaction": interaction,
         "bilateral_contact_required": require_bilateral_contact,
         "contact_sequence": report.get("contact_sequence"),
@@ -316,6 +249,24 @@ def apply_decisions(
         "execution": str(execution_out),
         "execution_sha256": _sha256(execution_out),
         "stages": prior_stages + covered_stage_gates,
+        "placement_candidate_groups": prior_candidate_groups
+        + [
+            {
+                "stage_ids": list(covered_stage_ids),
+                "candidates": [
+                    {
+                        "id": str(candidate["id"]),
+                        "visual_priority": int(
+                            decision_by_id[str(candidate["id"])]["visual_priority"]
+                        ),
+                        "roll_degrees": float(candidate["roll_degrees"]),
+                        "execution": str(Path(candidate["execution"]).resolve()),
+                        "execution_sha256": str(candidate["execution_sha256"]),
+                    }
+                    for candidate in visual_valid
+                ],
+            }
+        ],
     }
     gate_path = output / "orientation_gate.json"
     gate_path.write_text(json.dumps(gate, indent=2) + "\n", encoding="utf-8")

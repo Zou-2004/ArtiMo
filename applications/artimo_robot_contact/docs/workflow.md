@@ -21,8 +21,8 @@ proposing or scoring any transit route.
 The only execution-plan format is
 `applications/artimo_robot_contact/schemas/artimo_robot_execution.schema.json`.
 The only simulator entry point is
-`applications/artimo_robot_contact/run_artimo_physics.py`; publish matching
-clean reruns only through
+`applications/artimo_robot_contact/run_artimo_physics.py`; publish its one
+complete physical-plus-negative-control rollout only through
 `applications/artimo_robot_contact/finalize_artimo_delivery.py`. The outer
 launchers are `applications/artimo_robot_contact/run_artimo_robot_pipeline.py`
 and `applications/artimo_robot_contact/run_agent_task.py`.
@@ -41,10 +41,13 @@ These generic helpers exist; use them instead of inventing a private script:
   and magenta in isolated views. Open every file and classify every roll before
   freezing orientation; the renderer intentionally never auto-selects one.
 - `applications/artimo_robot_contact/apply_artimo_grasp_orientation_decisions.py` validates the exact four
-  reviewed image hashes and one `valid`/`invalid` visual decision for every
-  roll. It hard-excludes every visual-invalid roll before any IK call, runs
-  IK/contact-geometry/clearance probes only for visual-valid rolls, plus
-  bilateral-contact probes for `open_then_close` grasps, and emits
+  reviewed image hashes, one `valid`/`invalid` visual decision for every roll,
+  and a unique contiguous visual priority for every visual-valid roll. It
+  hard-excludes every visual-invalid roll and records their visual-priority
+  order without running IK. The placement solver evaluates each visual-valid
+  roll only at actual candidate Panda bases, completing the full placement
+  search for the best visual roll before trying the next. It includes
+  bilateral-contact checks for `open_then_close` grasps and emits
   the only execution and chained orientation gate allowed to enter placement.
   Use it once per independent grasp acquisition in plan order. One application
   covers every consecutive stage in the same `contact_sequence`: rotate all of
@@ -64,8 +67,9 @@ These generic helpers exist; use them instead of inventing a private script:
   support remain forbidden against the target. Run it before accepting a fixed placement;
   do not replace it with endpoint-only IK checks.
 - `applications/artimo_robot_contact/solve_artimo_release_clearance.py` searches a post-release end-effector
-  retreat and scores the complete robot/support against the full plan-declared
-  passive-return sweep. Use it whenever a spring return follows robot contact;
+  retreat and scores the complete robot/support against every later
+  plan-declared mechanism-motion and passive-return sweep. Use it whenever
+  robot contact triggers later moving geometry or a spring return follows;
   copy only its chosen pose and measured clearance into execution data. A
   solver-authored release route replaces the default link-relative retreat: it
   starts at the exact final grasp command and the planner serializes a dense
@@ -128,7 +132,7 @@ interaction-class gap; never add an asset name or calibrated constant to code.
 ## Cost model for search
 
 Planning diagnostics may rank candidates before rollout, but no IK, clearance,
-contact, force, motion-ratio, negative-control, or visual-QA boolean may stop or
+contact, motion-ratio, negative-control, or visual-QA boolean may stop or
 truncate execution. The final selected execution always runs every `plan.json`
 control in order and always exports its complete video. Diagnostics are recorded
 in `result.json` for human inspection only; they are never export gates.
@@ -138,8 +142,22 @@ contact point/orientation batch, one centered-distance batch, and, only if all
 centered distances fail, one lateral-offset batch. Select and freeze a candidate
 after each batch. Do not repeatedly reset and actuate the asset through the full
 plan for individual wrist rolls or contact points. Run the complete physical
-plan only for the final frozen execution data (plus its byte-identical negative
-control and the required second clean verification run).
+plan only once for the final frozen execution data, including its byte-identical
+negative-control condition.
+
+There is no wall-clock, elapsed-time, tool-window, or compute-time budget for a
+task. A long numerical batch may be launched in the background and polled, but
+runtime never authorizes narrowing or subsampling its declared candidates,
+accepting a failed row, skipping the lateral batch, or moving on to rollout. If
+the process is interrupted, resume it when supported or rerun the byte-identical
+batch and wait for completion. Do not replace it with a smaller batch.
+
+`solve_artimo_placement.py` writes `execution.json` only for a genuinely
+feasible placement. When `placement.json` contains `execution: null`, its
+`chosen` member is rejection diagnostics, not an executable fallback. Never
+copy that row by hand into release-clearance input or physics execution. The
+requirement to retain a complete video despite later diagnostic failures begins
+only after placement has emitted a feasible `execution.json`.
 
 The Panda is always a stiff trajectory executor, not an actuator-limit
 experiment. The shared harness fixes every arm joint to 1000 N maximum motor
@@ -181,15 +199,18 @@ precontact pose is a shared-harness regression, not a contact/placement variable
    when no new endpoint is introduced. A phase name such as "throw", "open",
    "effect", or "settle" is not evidence of an internal actuator. The schema,
    simulator, and verifier reject missing, duplicate, or contradictory owners.
-   Every `robot_contact` phase becomes a contact stage. When consecutive robot
-   phases contact the same object link, default to one uninterrupted grasp and
-   give them one `contact_sequence`: the contact link, link-local pose, finger opening,
+   Every `robot_contact` phase becomes a contact stage. `plan.json` is the only
+   authority for contact release boundaries; never read `causal.json` to split,
+   replace, or reorder robot actions. When consecutive robot-owned controls have
+   no intervening plan `control_release`, they must use one uninterrupted grasp
+   and one `contact_sequence`, including when the controlled joint or moving
+   parent link changes. The contact link, link-local pose, finger opening,
    interaction, and allowed robot links remain identical while the robot
    continuously follows each plan-owned joint path. Do not release merely
-   because a phase or driver joint changed. A different contact link is the
-   ordinary release/reacquire boundary; releasing and reacquiring the same link
-   requires an explicit plan-semantic release boundary such as a declared
-   passive return. At a same-sequence phase boundary, inherit the exact final
+   because a phase or driver joint changed. A different contact link is allowed
+   only after an explicit plan-semantic release boundary such as a declared
+   `control_release` or passive return. At a same-sequence phase boundary,
+   inherit the exact final
    arm joint vector as the next stage's sample zero; never rerun IK for the
    unchanged pose. Never replace required
    robot work with a causal motor merely because the target joint is reachable
@@ -289,15 +310,21 @@ precontact pose is a shared-harness regression, not a contact/placement variable
    centered grasptarget to a nominated tool surface changes the rendered
    geometry, any earlier centered-gripper visual decisions are stale: rerender
    the full eight-roll visual-only batch before allowing any roll into IK.
-   Record `valid` or
-   `invalid` plus a concrete reason for every roll in the emitted decision
-   template. A wrong visual angle is a hard exclusion even if its IK residual
-   or clearance is better.
+   Record `valid` or `invalid` plus a concrete reason for every roll in the
+   emitted decision template. Give every visual-valid roll a unique contiguous
+   `visual_priority` starting at 1; rank the single best semantic and geometric
+   visual choice first. A wrong visual angle is a hard exclusion even if its IK
+   residual or clearance is better.
    The render report must state `visual_render_ik_was_run: false` and contain no
    numerical summaries. Run
-   `applications/artimo_robot_contact/apply_artimo_grasp_orientation_decisions.py`; only then may it invoke
-   IK/contact-geometry/clearance probes, and only for the visual-valid set;
-   bilateral contact is additionally required for `open_then_close`. It
+   `applications/artimo_robot_contact/apply_artimo_grasp_orientation_decisions.py`; that step runs no IK and
+   passes only the visual-valid priority list to placement. Placement evaluates
+   the complete bounded base search and dense path for priority 1. Only if no
+   placement is feasible may it invoke IK for priority 2, and so on. Never use
+   the template/default Panda base plus a sparse five-point IK probe as an
+   orientation gate: placement has not fixed that base, and its later dense
+   path would duplicate the calculation. Bilateral contact is additionally
+   required for `open_then_close`. The decision tool
    emits `execution.json` plus
    `orientation_gate.json`. The gate records every stage covered by one
    continuous sequence. For the next independent grasp acquisition, render it
@@ -318,7 +345,7 @@ precontact pose is a shared-harness regression, not a contact/placement variable
    ad-hoc search dimensions or returning to an already frozen variable class.
    Persist only useful
    diagnostics: candidate pose, IK residual, swept-path clearance, target
-   contact/force, and rejection reason. Do not run unrelated asset scans or
+   contact, and rejection reason. Do not run unrelated asset scans or
    move a calibrated value into Python.
    For a push or button control, do not keep a single canonical wrist pose:
    derive the outward surface normal from the declared link-frame contact
@@ -361,17 +388,21 @@ precontact pose is a shared-harness regression, not a contact/placement variable
    a shared constraint-lifecycle regression; do not tune force, friction,
    penetration, or arm gains. For a physical push, timing may be repaired with
    `manipulation_sample_hold_s` while preserving plan endpoints and ownership.
-   A plan-declared `passive_return` must never begin while the released gripper,
-   arm, fixed base, or support remains in the returning link's swept volume. On
-   the final preceding grasp stage, declare `release_before_phase`,
+   Any object motion that depends on a robot-contact stage, including an
+   `internal_mechanism` effect and a plan-declared `passive_return`, must never
+   begin while the released gripper, arm, fixed base, or support remains in the
+   moving link's swept volume. On the final preceding contact stage, declare
+   `release_before_phase` no later than the earliest dependent moving phase,
    `release_retreat_waypoints_world`, and
    `minimum_release_swept_clearance_m`; obtain the waypoint with
    `applications/artimo_robot_contact/solve_artimo_release_clearance.py`. The command order is fixed:
    finish robot-owned motion, open fingers/remove any disclosed ideal grasp,
-   execute the clearance retreat, then enable the passive return. Reject a
-   candidate unless the full retreat path and every sampled return state clear
-   the complete robot and support. Increasing spring force is not a clearance
-   repair.
+   execute the clearance retreat, hold briefly at the solved safe endpoint,
+   then enable the dependent mechanism motion or passive return. The scheduler
+   provides a fixed nonzero endpoint settle; an ArtiMo phase boundary is never
+   treated as zero-time robot motion. Reject a candidate unless the full
+   retreat path and every sampled later plan state clear the complete robot and
+   support. Increasing mechanism or spring force is not a clearance repair.
    Once the contact surface is validated, write bounded placement-search data
    and run `applications/artimo_robot_contact/solve_artimo_placement.py`. Start with `contact_facing` mode.
    Ground the object once and keep its orientation fixed for a placement trial.
@@ -392,9 +423,14 @@ precontact pose is a shared-harness regression, not a contact/placement variable
    World-frame release waypoints are valid only for the fixed base that created
    them. Placement must ignore/remove any stale
    `release_retreat_waypoints_world`, then the release-clearance solver creates
-   a fresh waypoint after the base is fixed. If `release_before_phase` names a
-   passive return, the executable robot path ends at that safe waypoint and
-   holds there during the return; do not invent a retreat-to-home segment.
+   a fresh waypoint after the base is fixed. Placement therefore validates the
+   release boundary but permits its route and measured release clearance to be
+   absent; the physical runner and delivery verifier remain strict and reject
+   that incomplete execution. `release_before_phase` may not be
+   later than the first causally dependent moving phase merely because a
+   control return occurs afterward. The executable robot path ends at the safe
+   waypoint, settles there, and holds there during the later object motion; do
+   not invent a retreat-to-home segment.
    A later stage on a different contact releases and retreats, then transits
    directly from that retreat endpoint to the next stage's precontact path.
    Changing contacts requires a new transit, but does not imply an intermediate
@@ -451,24 +487,21 @@ precontact pose is a shared-harness regression, not a contact/placement variable
    For each causal rule, record first target contact, driver motion, latch,
    effect enable, and effect motion ticks. Driver motion cannot precede contact;
    effect enable/motion must follow it. Require every unowned object joint to
-   remain within the fixed initial-state tolerance in both runs.
-   Derive gravity-loaded `passive_return` force from inverse dynamics times a
-   disclosed safety factor, bounded by URDF effort; never tune it by duration.
-   Record peak force as evidence, never as a generic upper-bound gate; only an
-   explicit user/handoff safety limit may make it pass/fail.
+   remain within the fixed initial-state tolerance in both physical and hidden
+   negative-control conditions.
+   Derive gravity-loaded `passive_return` actuator capacity from inverse dynamics
+   times a disclosed safety factor, bounded by URDF effort; never tune it by
+   duration. Target-contact force is not measured or used as a gate.
 7. **Render and inspect.** Publish the complete physical rollout. Derive the
    visual-QA booleans with `applications/artimo_robot_contact/review_artimo_video.py` at no less than the
    task's requested frame rate; it checks blank/stale frames, camera
    discontinuity, measured interpenetration depth, target contact, and requested
    motion. Preserve false values honestly but never withhold the video.
-8. **Re-run frozen execution data.** Do not ask the agent to choose a second grasp.
-   Re-execute the selected execution JSON from a clean simulator and record
-   command, contact, and motion comparisons without gating export.
-9. **Publish.** Final output always contains exactly `video.mp4`, `grasp.json`,
+8. **Publish.** Final output always contains exactly `video.mp4`, `grasp.json`,
    and `result.json`. Verification is diagnostic evidence, not permission to
    stop or omit files. `video_exported` reports file creation independently;
    `passed` may be true only when the video exists and all measured diagnostics
-   pass.
+   pass. Do not repeat a successful rollout for reproducibility checking.
 
 ## Invariants
 - Never replay or reset object joint motion after initialization.
@@ -483,7 +516,7 @@ precontact pose is a shared-harness regression, not a contact/placement variable
   work or report that ownership is missing from the handoff.
 - Never globally disable robot/object collisions.
 - A control-triggered effect starts no earlier than `source_effect_phase` and
-  only after measured displacement, target force/dwell, and its clearance gate.
+  only after measured displacement, target-contact dwell, and its clearance gate.
 - A public video contains only causal physics: drivers cannot precede contact,
   and effects cannot precede latch/enable.
 - Every `open_then_close` grasp uses one disclosed ideal fixed attachment after

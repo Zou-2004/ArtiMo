@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Search an asset-agnostic robot retreat outside a passive-return sweep.
+"""Search an asset-agnostic robot retreat outside a later plan-motion sweep.
 
 The input is the same task/execution pair used by the physics harness.  The
 tool starts at the final executable grasp pose, opens the fingers, searches
 nearby world-frame end-effector poses, and scores both the retreat path and the
-stationary robot against every sampled state of every plan-declared passive
-return.  It writes diagnostics only; the agent copies the chosen pose into
+stationary robot against every sampled state of all dependent plan motion,
+including internal mechanisms and passive returns. It writes diagnostics only;
+the agent copies the chosen pose into
 ``release_retreat_waypoints_world`` in execution data.
 """
 

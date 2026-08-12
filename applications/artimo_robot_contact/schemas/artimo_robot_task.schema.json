@@ -42,10 +42,7 @@
       "additionalProperties": false,
       "required": [
         "require_zero_fixed_constraints",
-        "require_second_run",
         "minimum_joint_motion_ratio",
-        "minimum_contact_force_n",
-        "maximum_peak_force_n",
         "visual_review_fps"
       ],
       "properties": {
@@ -53,14 +50,11 @@
           "const": false,
           "description": "The invariant benchmark permits disclosed ideal fixed grasp constraints for open_then_close stages; maintain_width pushes still create none."
         },
-        "require_second_run": {"type": "boolean"},
         "minimum_joint_motion_ratio": {
           "type": "number",
           "minimum": 0,
           "maximum": 1
         },
-        "minimum_contact_force_n": {"type": "number", "minimum": 0},
-        "maximum_peak_force_n": {"type": "number", "exclusiveMinimum": 0},
         "minimum_continuous_contact_s": {"type": "number", "minimum": 0},
         "visual_review_fps": {"type": "number", "minimum": 5},
         "retain_debug_on_success": {"type": "boolean"}

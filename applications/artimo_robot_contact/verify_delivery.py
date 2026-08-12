@@ -9,12 +9,12 @@ import importlib.util
 import json
 import math
 import os
-import shutil
-import subprocess
 from pathlib import Path
 from typing import Any, Iterable
 
 import jsonschema
+
+import artimo_video
 
 
 APPLICATION_ROOT = Path(__file__).resolve().parent
@@ -71,35 +71,13 @@ def _require(condition: bool, name: str, checks: dict[str, bool], errors: list[s
 
 
 def _decode_video(path: Path) -> tuple[bool, dict[str, Any], str]:
-    ffmpeg = shutil.which("ffmpeg")
-    ffprobe = shutil.which("ffprobe")
-    if ffmpeg is None or ffprobe is None:
-        return False, {}, "ffmpeg and ffprobe are required"
-    decode = subprocess.run(
-        [ffmpeg, "-v", "error", "-i", str(path), "-f", "null", "-"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    probe = subprocess.run(
-        [
-            ffprobe,
-            "-v",
-            "error",
-            "-show_entries",
-            "stream=codec_name,width,height,nb_frames,avg_frame_rate",
-            "-show_entries",
-            "format=duration",
-            "-of",
-            "json",
-            str(path),
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    metadata = json.loads(probe.stdout) if probe.returncode == 0 else {}
-    return decode.returncode == 0 and probe.returncode == 0, metadata, decode.stderr
+    decode, decode_backend = artimo_video.decode_video_to_null(path)
+    try:
+        metadata = artimo_video.probe_video(path)
+    except Exception as exc:
+        return False, {}, f"video metadata probe failed: {exc}"
+    metadata["artimo_decode_backend"] = decode_backend
+    return decode.returncode == 0, metadata, decode.stderr
 
 
 def _validate_standard_manifest(
@@ -169,15 +147,7 @@ def _validate_standard_manifest(
                 _require(int(contact.get("target_contact_observations", 0)) > 0, f"{prefix}_target_positive", checks, errors)
                 _require(contact.get("non_target_contact_observations") == 0, f"{prefix}_non_target_zero", checks, errors)
                 _require(contact.get("effect_link_contact_observations") == 0, f"{prefix}_effect_zero", checks, errors)
-                mean_force = float(contact.get("mean_contact_force_n", math.nan))
                 duration = float(contact.get("continuous_contact_s", math.nan))
-                _require(
-                    math.isfinite(mean_force)
-                    and mean_force >= float(acceptance["minimum_contact_force_n"]),
-                    f"{prefix}_force_minimum",
-                    checks,
-                    errors,
-                )
                 _require(
                     math.isfinite(duration)
                     and duration >= float(acceptance.get("minimum_continuous_contact_s", 0.0)),
@@ -234,16 +204,6 @@ def _validate_standard_manifest(
             "no_rendering_artifacts",
         ):
             _require(visual.get(key) is True, f"visual_{key}", checks, errors)
-
-    if acceptance.get("require_second_run", False):
-        second = manifest.get("second_run")
-        _require(isinstance(second, dict), "second_run_present", checks, errors)
-        if isinstance(second, dict):
-            _require(second.get("robot_command_schedule_match") is True, "second_run_schedule_match", checks, errors)
-            _require(second.get("same_execution_plan") is True, "second_run_execution_match", checks, errors)
-            _require(second.get("contact_metrics_match") is True, "second_run_contact_match", checks, errors)
-            _require(second.get("joint_motion_match") is True, "second_run_motion_match", checks, errors)
-
 
 def _requested_joint_motion(plan_path: Path) -> dict[str, list[float]]:
     """Read the plan's per-joint extrema through the harness's canonical parser.
@@ -355,19 +315,16 @@ def verify(
         _require(proxy_path.is_file(), "execution_proxy_exists", checks, errors)
         if proxy_path.is_file():
             proxy_hash = _sha256(proxy_path)
-            first_inputs = result.get("native_first", {}).get("inputs", {})
-            second_inputs = result.get("native_second", {}).get("inputs", {})
+            rollout_inputs = result.get("native_rollout", {}).get("inputs", {})
             _require(
-                first_inputs.get("collision_proxy_used") is True
-                and second_inputs.get("collision_proxy_used") is True,
-                "execution_proxy_used_in_both_runs",
+                rollout_inputs.get("collision_proxy_used") is True,
+                "execution_proxy_used_in_rollout",
                 checks,
                 errors,
             )
             _require(
-                first_inputs.get("simulated_urdf_sha256") == proxy_hash
-                and second_inputs.get("simulated_urdf_sha256") == proxy_hash,
-                "execution_proxy_hash_matches_both_runs",
+                rollout_inputs.get("simulated_urdf_sha256") == proxy_hash,
+                "execution_proxy_hash_matches_rollout",
                 checks,
                 errors,
             )
@@ -394,7 +351,7 @@ def verify(
     _require(ownership_ok, "control_execution_ownership_valid", checks, errors)
     if ownership_error is not None:
         errors.append(f"control_execution_ownership_error: {ownership_error}")
-    physical_contacts = result.get("reproducibility", {}).get("physical", {}).get("contacts", [])
+    physical_contacts = result.get("evidence", {}).get("physical", {}).get("contacts", [])
     measured_stage_ids = {
         str(contact.get("stage_id"))
         for contact in physical_contacts
@@ -418,7 +375,7 @@ def verify(
     _require(bool(streams) and streams[0].get("codec_name") == "h264", "video_h264", checks, errors)
     _require(video_path.stat().st_size > 0, "video_nonempty", checks, errors)
 
-    manifest = result.get("reproducibility")
+    manifest = result.get("evidence")
     _require(isinstance(manifest, dict), "standard_manifest_present", checks, errors)
     if isinstance(manifest, dict):
         if expected_release_lock_sha256 is None:

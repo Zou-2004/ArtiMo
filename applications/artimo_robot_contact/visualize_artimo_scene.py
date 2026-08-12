@@ -16,7 +16,6 @@ from pathlib import Path
 
 import numpy as np
 import pybullet as p
-import imageio.v2 as imageio
 from PIL import Image, ImageDraw, ImageFont
 
 APP_ROOT = Path(__file__).resolve().parent
@@ -24,6 +23,7 @@ REPO = APP_ROOT.parents[1]
 sys.path.insert(0, str(APP_ROOT))
 
 import run_artimo_physics as ph  # noqa: E402
+import artimo_video  # noqa: E402
 from artimo_ik import BulletIK, set_fingers, set_robot_arm  # noqa: E402
 
 
@@ -787,16 +787,15 @@ def main() -> int:
             preview_frames.append(np.asarray(frame, dtype=np.uint8))
         video_path = args.video.expanduser().resolve()
         video_path.parent.mkdir(parents=True, exist_ok=True)
-        imageio.mimwrite(
+        video_encoding = artimo_video.write_h264_video(
             video_path,
             preview_frames,
             fps=30,
-            codec="libx264",
-            quality=8,
             macro_block_size=2,
         )
         report["placement_preview_video"] = str(video_path)
         report["placement_preview_is_physical_rollout"] = False
+        report["placement_preview_video_encoding"] = video_encoding
 
     cols, rows_n = 2, (len(images) + len(overview) + 1) // 2
     sheet = Image.new("RGB", (760 * cols, 580 * rows_n), (18, 22, 30))

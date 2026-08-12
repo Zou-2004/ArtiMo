@@ -102,7 +102,7 @@
           "release_before_phase": {
             "type": "string",
             "minLength": 1,
-            "description": "Optional explicit release boundary. The harness retains the grasp through this stage and any intervening plan phases, then opens the fingers and removes a disclosed ideal attachment immediately before the named later plan phase."
+            "description": "Optional explicit release boundary. It is required when this contact triggers later mechanism motion or precedes a passive return, and may not be later than the earliest such moving phase. The harness retains contact through preceding plan-owned holds, opens/removes any disclosed attachment, executes the solved retreat, holds briefly at the safe endpoint, and only then enters the named phase."
           },
           "interaction": {
             "enum": ["physical_push", "explicit_ideal_feasibility"],
@@ -207,7 +207,7 @@
           "release_retreat_waypoints_world": {
             "type": "array",
             "minItems": 1,
-            "description": "Agent-planned end-effector poses executed after opening the fingers and before release_before_phase begins. They must place the whole robot outside the released mechanism's swept volume.",
+            "description": "Agent-planned end-effector poses executed after opening the fingers and before release_before_phase begins. They must place the whole robot outside the released mechanism's swept volume. The harness adds a fixed nonzero endpoint settle before the object phase is enabled.",
             "items": {
               "type": "object",
               "additionalProperties": false,
@@ -306,13 +306,12 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["id", "trigger_stage", "source_effect_phase", "minimum_displacement", "minimum_force_n", "minimum_dwell_s", "effects"],
+        "required": ["id", "trigger_stage", "source_effect_phase", "minimum_displacement", "minimum_dwell_s", "effects"],
         "properties": {
           "id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]*$"},
           "trigger_stage": {"type": "string", "minLength": 1},
           "source_effect_phase": {"type": "string", "minLength": 1},
           "minimum_displacement": {"type": "number", "minimum": 0},
-          "minimum_force_n": {"type": "number", "minimum": 0},
           "minimum_dwell_s": {"type": "number", "minimum": 0},
           "minimum_clearance_m": {"type": "number", "minimum": 0},
           "latch": {"type": "boolean"},

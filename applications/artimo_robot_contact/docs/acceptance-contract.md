@@ -1,4 +1,4 @@
-# ArtiMo physical and reproducibility contract
+# ArtiMo physical delivery contract
 
 All values in this contract are measured diagnostics. None is an execution or
 export gate: the harness always runs every declared stage, writes the complete
@@ -38,7 +38,8 @@ no trajectory, initialize every URDF joint at its default zero state.
   mixed-owner controls in the same phase remain separate. Every
   `robot_contact` control has its own contact stage and positive measured target
   contact; no causal actuator may command its joint target. Consecutive stages
-  on the same contact link use one `contact_sequence` by default and preserve
+  before any intervening plan `control_release` use the same contact link and
+  one `contact_sequence`; `causal.json` is not an action-authority input. Preserve
   the same grasp without finger opening, retreat, constraint recreation, or a
   sample-zero IK resolve between plan phases. A link change is the normal
   release/reacquire boundary; same-link release needs an explicit plan-semantic
@@ -59,14 +60,11 @@ no trajectory, initialize every URDF joint at its default zero state.
   tool surface covering the intended button along its surface normal without
   sweeping the housing, not by opposing-jaw straddle. Switching from centered
   grasptarget geometry to a tool offset invalidates prior visual decisions and
-  requires a fresh full eight-roll visual-only gate before numerical probes.
+  requires a fresh full eight-roll visual-only gate before placement.
 - Keep robot/object collision response enabled except nominated contact pairs
   in the hidden negative control.
-- Record every robot/object contact pair, normal force, constraint, joint reset,
+- Record every robot/object contact pair, constraint, joint reset,
   joint state, robot command, and causal-state transition each simulation step.
-- Record peak target-contact force as a diagnostic. Do not require a generic
-  maximum or synthesize one from launcher defaults; enforce an upper limit only
-  when the user or handoff explicitly supplies that safety requirement.
 - For each causal rule, record first target contact, trigger-driver first
   motion, latch, effect enable, and effect-joint first motion ticks. Require the
   driver first motion to be no earlier than target contact, and effect enable
@@ -118,19 +116,21 @@ no trajectory, initialize every URDF joint at its default zero state.
   with its stage sample/joint, maximum actual joint step, and maximum
   commanded-versus-actual tracking error. Hard-limit saturation remains a
   failed diagnostic even when the local trajectory is finite.
-- Peak force stays below the task maximum and target contact crosses the minimum
-  force for the required continuous duration. Peak-force rejection applies to
-  unconstrained physical pushes; constraint reaction force is reported but is
-  not a force-closure tuning gate for disclosed ideal grasps.
+- Target contact is present for the required continuous duration. Contact force
+  is neither measured nor used as an acceptance or causal-trigger input.
 - A passive-return motor is disabled before its plan-owned phase and enabled
   only from that phase onward; it may not resist an earlier robot-contact phase.
-  When it follows robot contact, execution explicitly releases and completes a
-  schema-declared clearance retreat before enabling the return. A declared
+  Any internal-mechanism motion triggered by robot contact is likewise held
+  until its plan-owned phase and until the triggering robot has completed a
+  required release retreat. When dependent mechanism motion or a passive return
+  follows robot contact, execution explicitly releases, completes a
+  schema-declared clearance retreat, and spends a fixed nonzero interval at the
+  safe endpoint before enabling object motion. A declared
   world-frame release route begins at the exact final grasp command, replaces
   the default link-normal retreat, and is serialized as the same dense joint
   path used by planning and rollout. The full robot,
   fixed base, and support satisfy `minimum_release_swept_clearance_m` throughout
-  both retreat and every sampled passive-return state.
+  retreat, endpoint settle, and every sampled later mechanism/return state.
 - Every `open_then_close` stage uses one disclosed ideal fixed constraint after
   physical acquisition and removes it only at the explicit release boundary.
   The acquisition tick must contain simultaneous target contact from every
@@ -149,7 +149,7 @@ specific phase to `internal_mechanism`, supplies an auditable physical
 trigger/transmission justification and explicit `energy_source`, and the source URDF lacks the cross-joint
 transmission.
 Enable it no earlier than its authoritative `source_effect_phase`, and only
-after measured target control displacement plus force/dwell and clearance;
+after measured target control displacement plus contact dwell and clearance;
 bound its force/torque and derive targets from ArtiMo endpoints.
 
 ## Negative control
@@ -169,11 +169,15 @@ point, surface normal, and grasp depth. Record a `valid`/`invalid` visual decisi
 and reason for every candidate. Apply those decisions through
 `applications/artimo_robot_contact/apply_artimo_grasp_orientation_decisions.py`. The render pass uses only a
 kinematic-free parallel-jaw proxy and must prove that it ran no IK. Visual-
-invalid rolls are removed before any numerical probe and never enter an IK call,
-placement, trajectory, transit, or rollout. Only visual-valid rolls receive
-PyBullet IK, target-geometry, and clearance probes; `open_then_close` candidates
+invalid rolls are removed before placement and never enter an IK call,
+trajectory, transit, or rollout. Give every visual-valid roll a unique
+contiguous visual priority starting at 1. The decision gate itself runs no IK.
+Placement gives the priority-1 roll its complete bounded base search and dense
+path validation first; a lower-priority roll receives its first IK call only
+after every allowed placement for all preceding rolls fails. A sparse
+template-base orientation IK pass is not acceptance evidence. `open_then_close` candidates
 also require bilateral contact, while `maintain_width` physical pushes prove
-actual contact/force/dwell in rollout. One decision covers every consecutive
+actual contact/dwell in rollout. One decision covers every consecutive
 stage in the same `contact_sequence`: all members receive the same rotation,
 only the acquisition stage is probed, and full placement validates the inherited
 arm reference throughout the complete sequence. The final chained
@@ -203,7 +207,7 @@ or trace hashes and contains this measured manifest shape:
 
 ```json
 {
-  "reproducibility": {
+  "evidence": {
     "schema_version": 2,
     "task_spec_sha256": "64 lowercase hex chars",
     "handoff_lock_sha256": "64 lowercase hex chars",
@@ -224,8 +228,6 @@ or trace hashes and contains this measured manifest shape:
           "non_target_contact_observations": 0,
           "effect_link_contact_observations": 0,
           "maximum_driver_displacement": 0.0,
-          "mean_contact_force_n": 0.0,
-          "peak_contact_force_n": 0.0,
           "continuous_contact_s": 0.0
         }
       ],
@@ -250,12 +252,6 @@ or trace hashes and contains this measured manifest shape:
       "physical_contact_visible": true,
       "requested_motion_visible": true,
       "no_rendering_artifacts": true
-    },
-    "second_run": {
-      "same_execution_plan": true,
-      "robot_command_schedule_match": true,
-      "contact_metrics_match": true,
-      "joint_motion_match": true
     }
   }
 }

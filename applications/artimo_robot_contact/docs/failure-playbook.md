@@ -28,7 +28,7 @@ phases, suppress video export, or make the runner return a failure status.
 6. continuous waypoint IK and swept-path clearance, then bounded lateral stance
    refinement only if the centered distances fail;
 7. release retreat and the full passive-return swept-volume clearance;
-8. target contact pair, direction, force, travel, and dwell for every
+8. target contact pair, direction, travel, and dwell for every
    robot-owned stage;
 9. causal-rule state and declared internal-effect targets;
 10. every plan-requested joint-motion ratio;
@@ -52,6 +52,14 @@ replay the complete object motion merely to score a wrist roll, or cycle back to
 a frozen class after trying later classes. If the bounded batches cannot produce
 a valid path, record the exact failed clearance/IK gate as a generic gap.
 
+Elapsed time is never a repair variable or a stopping rule. Do not shrink a
+batch, keep only a candidate that happened to finish first, skip lateral
+refinement, or convert a failed diagnostic row into rollout data because a
+command is slow or an interactive tool window ends. Keep the same inputs and
+wait, poll, resume, or rerun the byte-identical numerical command. A placement
+result without an emitted `execution.json` cannot enter release planning or a
+physical rollout.
+
 Never infer wrist roll from a quaternion tuple, comparison sheet, tiled card,
 or one occluded full-scene render. After fixing point, surface normal, and grasp
 depth, run
@@ -63,10 +71,14 @@ because finger shafts appear parallel to a handle or rim. Mark every candidate
 visual-valid or visual-invalid with a reason, then apply the manifest through
 `applications/artimo_robot_contact/apply_artimo_grasp_orientation_decisions.py`. Visual-invalid candidates
 are not low-ranked candidates: the visual pass runs no IK, and invalid rolls are
-absent before the first numerical probe. IK, target contact geometry, and
-whole-arm clearance may reject or rank only the visual-valid set. Require
+absent before placement. IK, target contact geometry, and whole-arm clearance
+may reject only the visual-valid set. Rank that set first by visual semantics
+with unique contiguous priorities. Give the best roll its complete bounded
+placement search and dense path validation. Probe the next priority only when
+every placement for the current choice fails. Do not use a default/template
+Panda base plus five sparse driver samples as a preliminary gate. Require
 two-sided target contact for an `open_then_close` grasp; do not require it for a
-`maintain_width` physical push, whose actual contact/force/dwell is measured
+`maintain_width` physical push, whose actual contact/dwell is measured
 during rollout. For one uninterrupted `contact_sequence`, render and probe only
 the first acquisition stage, apply its roll to every member, and validate the
 inherited arm branch with full placement; never probe a later member
@@ -205,15 +217,19 @@ Read the diagnostics before choosing a repair:
   gravity load at that object state. Set the execution-data force from that
   measurement plus a disclosed generic safety factor, bounded by URDF effort;
   do not tune blindly or extend the settle window.
-- If a released spring-return link hits or is blocked by the gripper, arm, base,
-  or support, do not increase its force. Declare `release_before_phase`, run
+- If any causally triggered moving link or released spring-return link hits or
+  is blocked by the gripper, arm, base, or support, do not increase its force.
+  Declare `release_before_phase` no later than the earliest dependent moving
+  phase, run
   `applications/artimo_robot_contact/solve_artimo_release_clearance.py`, copy the chosen world-frame retreat
   waypoint into `release_retreat_waypoints_world`, and require a positive
   `minimum_release_swept_clearance_m`. The solver route must replace, not follow,
   the default link-relative withdrawal and must start at the release command;
   validate and execute its exact dense joint path rather than an endpoint chord.
-  Verify that release and retreat finish
-  before the passive motor is enabled. Re-run this solver after fixing the robot
+  Verify that release, retreat, and the nonzero safe-endpoint settle finish
+  before the internal effect or passive motor is enabled. A later control-return
+  phase is not a valid boundary when another triggered link moves earlier.
+  Re-run this solver after fixing the robot
   base: an old world-frame release waypoint must never reject a new placement.
   If rollout collides with an internally moved link while the solver reports
   clearance, verify it projected every endpoint before `release_before_phase`
@@ -248,10 +264,9 @@ topology: those semantics come from `plan.json`. Repair the declared robot
 contact candidate or trajectory instead.
 
 For hidden contact, move the camera or add a crop rendered from the same frame.
-Never splice another rollout. Treat peak force as diagnostic unless the user or
-handoff explicitly supplies an upper safety limit. Pathological impulses can
-still reveal initialized overlap or a path driven through geometry; repair the
-placement or path without inventing a generic force bound.
+Never splice another rollout. Target-contact force is not measured and is not a
+repair variable; diagnose initialized overlap or a path driven through geometry
+from collision pairs, penetration, clearance, and object motion instead.
 
 ## 4. Generic blocked conditions
 

@@ -80,7 +80,92 @@ def _validated_orientation_gate(
     missing = sorted(required_stage_ids - set(gated_ids))
     if missing:
         raise ValueError(f"Orientation gate does not cover grasp stages {missing}")
+    groups = gate.get("placement_candidate_groups")
+    if not isinstance(groups, list) or not groups:
+        raise ValueError(
+            "Orientation gate lacks placement_candidate_groups; rerun visual "
+            "decisions so IK can be deferred to the actual placement base"
+        )
+    grouped_stage_ids: set[str] = set()
+    for group in groups:
+        stage_ids = group.get("stage_ids")
+        candidates = group.get("candidates")
+        if (
+            not isinstance(stage_ids, list)
+            or not stage_ids
+            or not isinstance(candidates, list)
+            or not candidates
+        ):
+            raise ValueError("Every placement candidate group needs stages and candidates")
+        overlap = grouped_stage_ids & {str(value) for value in stage_ids}
+        if overlap:
+            raise ValueError(
+                f"Orientation placement candidate groups overlap stages {sorted(overlap)}"
+            )
+        grouped_stage_ids.update(str(value) for value in stage_ids)
+        priorities = [int(candidate.get("visual_priority", -1)) for candidate in candidates]
+        if priorities != list(range(1, len(candidates) + 1)):
+            raise ValueError(
+                "Orientation placement candidates must remain in contiguous visual priority order"
+            )
+        for candidate in candidates:
+            candidate_path = Path(str(candidate.get("execution", ""))).expanduser().resolve()
+            if not candidate_path.is_file():
+                raise ValueError(f"Missing orientation candidate execution {candidate_path}")
+            if candidate.get("execution_sha256") != _sha256(candidate_path):
+                raise ValueError(
+                    f"Orientation candidate {candidate.get('id')!r} execution changed"
+                )
+    if grouped_stage_ids != required_stage_ids:
+        raise ValueError(
+            "Orientation placement candidate groups must cover every robot stage; "
+            f"missing={sorted(required_stage_ids - grouped_stage_ids)}"
+        )
     return {**gate, "path": str(gate_path), "sha256": _sha256(gate_path)}
+
+
+def _gated_orientation_options(
+    template: dict[str, Any], gate: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Build visual-priority orientation combinations without running IK.
+
+    Candidate files are immutable evidence from the no-IK render pass.  Only
+    their reviewed stage rotations are projected onto the placement template;
+    base position remains a placement variable.  The all-priority-1 choice is
+    evaluated across the complete placement grid before any fallback.
+    """
+    stages_by_id = {str(stage["id"]): index for index, stage in enumerate(template["stages"])}
+    groups = list(gate["placement_candidate_groups"])
+    combinations = list(itertools.product(*(group["candidates"] for group in groups)))
+    combinations.sort(
+        key=lambda choices: (
+            sum(int(choice["visual_priority"]) - 1 for choice in choices),
+            tuple(int(choice["visual_priority"]) for choice in choices),
+        )
+    )
+    options: list[dict[str, Any]] = []
+    for choices in combinations:
+        oriented = json.loads(json.dumps(template))
+        ids: list[str] = []
+        priorities: list[int] = []
+        for group, choice in zip(groups, choices):
+            source = ph._read_json(Path(str(choice["execution"])).resolve())
+            source_by_id = {str(stage["id"]): stage for stage in source["stages"]}
+            for stage_id in group["stage_ids"]:
+                oriented["stages"][stages_by_id[str(stage_id)]]["contact_pose_link"][
+                    "rotation_xyzw"
+                ] = list(source_by_id[str(stage_id)]["contact_pose_link"]["rotation_xyzw"])
+            ids.append(str(choice["id"]))
+            priorities.append(int(choice["visual_priority"]))
+        options.append(
+            {
+                "execution": oriented,
+                "candidate_ids": ids,
+                "visual_priorities": priorities,
+                "angles": None,
+            }
+        )
+    return options
 
 
 def _yaw_quat(yaw_deg: float) -> list[float]:
@@ -836,12 +921,20 @@ def solve(config: dict[str, Any], task: dict[str, Any]) -> dict[str, Any]:
                 "Visually gated contact rotations are frozen; placement bounds must "
                 f"not contain {sorted(forbidden_orientation_bounds)}"
             )
-        orientations: list[tuple[float, float, float] | None] = [None]
+        orientation_options = _gated_orientation_options(template, orientation_gate)
     else:
         tilts = bounds.get("approach_tilt_deg", [0.0])
         spins = bounds.get("approach_spin_deg", [0.0])
         rolls = bounds.get("approach_roll_deg", [0.0])
-        orientations = list(itertools.product(tilts, spins, rolls))
+        orientation_options = [
+            {
+                "execution": template,
+                "candidate_ids": [],
+                "visual_priorities": [],
+                "angles": values,
+            }
+            for values in itertools.product(tilts, spins, rolls)
+        ]
 
     if placement_mode == "contact_facing":
         distances = bounds.get("contact_facing_distance_m")
@@ -889,7 +982,7 @@ def solve(config: dict[str, Any], task: dict[str, Any]) -> dict[str, Any]:
     contacts_per_placement = (
         max(1, int(discovery.get("limit", 6))) if discover else 1
     )
-    total = placement_count * len(orientations) * contacts_per_placement
+    total = placement_count * len(orientation_options) * contacts_per_placement
     all_discovered: list[dict[str, Any]] = []
     if placement_mode == "contact_facing":
         # Search the physically interpretable centerline first: all declared
@@ -909,10 +1002,20 @@ def solve(config: dict[str, Any], task: dict[str, Any]) -> dict[str, Any]:
                 lateral_offsets[1:],
             )
         )
-        coarse_placements = iter(centered + refined)
+        coarse_placements = centered + refined
     else:
-        coarse_placements = itertools.product(object_yaws, robot_z, robot_x, robot_y, robot_yaws)
-    for placement_values in coarse_placements:
+        coarse_placements = list(
+            itertools.product(object_yaws, robot_z, robot_x, robot_y, robot_yaws)
+        )
+    # Exhaust every permitted placement for the best visual orientation before
+    # invoking IK for a lower-priority roll. This makes fallback lazy at the
+    # only base pose that matters: the one being evaluated by full placement.
+    ordered_search = (
+        (orientation_option, placement_values)
+        for orientation_option in orientation_options
+        for placement_values in coarse_placements
+    )
+    for orientation_option, placement_values in ordered_search:
         if placement_mode == "contact_facing":
             oyaw, rz, distance, yaw_offset, lateral_offset = placement_values
             explicit_pose = None
@@ -922,8 +1025,8 @@ def solve(config: dict[str, Any], task: dict[str, Any]) -> dict[str, Any]:
             yaw_offset = None
             lateral_offset = None
             explicit_pose = ([float(rx), float(ry), float(rz)], float(ryaw))
-        for orientation in orientations:
-            oriented = json.loads(json.dumps(template))
+        for orientation in [orientation_option["angles"]]:
+            oriented = json.loads(json.dumps(orientation_option["execution"]))
             oriented["scene"]["object_base_rotation_xyzw"] = _yaw_quat(oyaw)
             if orientation is None:
                 tilt = spin = roll = None
@@ -981,7 +1084,13 @@ def solve(config: dict[str, Any], task: dict[str, Any]) -> dict[str, Any]:
                 candidate = json.loads(json.dumps(placed))
                 candidate["stages"][0]["contact_pose_link"]["translation_m"] = [float(v) for v in point]
                 try:
-                    ph._validate_execution_against_plan(plan, candidate)
+                    # Placement fixes the base that world-frame release
+                    # waypoints depend on. Validate the release boundary now,
+                    # but intentionally defer the route requirement until the
+                    # dedicated release-clearance solver runs afterward.
+                    ph._validate_execution_against_plan(
+                        plan, candidate, require_release_route=False
+                    )
                     report = _score_candidate(
                         simulation_urdf, robot_urdf, candidate, initial, samples,
                         allowed_penetration, maximum_grasp_gap,
@@ -995,6 +1104,12 @@ def solve(config: dict[str, Any], task: dict[str, Any]) -> dict[str, Any]:
                         "contact_facing_lateral_offset_m": lateral_offset,
                         "approach_tilt_deg": tilt, "approach_spin_deg": spin,
                         "approach_roll_deg": roll,
+                        "orientation_candidate_ids": list(
+                            orientation_option["candidate_ids"]
+                        ),
+                        "orientation_visual_priorities": list(
+                            orientation_option["visual_priorities"]
+                        ),
                         "contact_point_link_m": point, "rejected": str(exc)[:200],
                     })
                     continue
@@ -1007,6 +1122,12 @@ def solve(config: dict[str, Any], task: dict[str, Any]) -> dict[str, Any]:
                     "contact_frame_world": frame,
                     "approach_tilt_deg": tilt, "approach_spin_deg": spin,
                     "approach_roll_deg": roll,
+                    "orientation_candidate_ids": list(
+                        orientation_option["candidate_ids"]
+                    ),
+                    "orientation_visual_priorities": list(
+                        orientation_option["visual_priorities"]
+                    ),
                     "contact_point_link_m": point,
                     "feasible": report["feasible"], "stages": report["stages"],
                 }
@@ -1017,7 +1138,7 @@ def solve(config: dict[str, Any], task: dict[str, Any]) -> dict[str, Any]:
                 print(
                     f"[{index + 1}/~{total}] obj_yaw={oyaw:3.0f} base=({rx:+.2f},{ry:+.2f},{rz:.2f}) "
                     f"yaw={ryaw:+.0f} "
-                    f"orientation={'frozen-visual-gate' if orientation is None else f'tilt={tilt:.0f} spin={spin:.0f} roll={roll:.0f}'} "
+                    f"orientation={('/'.join(orientation_option['candidate_ids']) if orientation is None else f'tilt={tilt:.0f} spin={spin:.0f} roll={roll:.0f}')} "
                     f"pt={point} -> "
                     f"solved={[s['samples_solved'] for s in report['stages']]} "
                     f"pen={[s['deepest_body_penetration_m'] for s in report['stages']]} "
@@ -1050,6 +1171,10 @@ def solve(config: dict[str, Any], task: dict[str, Any]) -> dict[str, Any]:
             "approach_tilt_deg": best["approach_tilt_deg"],
             "approach_spin_deg": best["approach_spin_deg"],
             "approach_roll_deg": best["approach_roll_deg"],
+            "orientation_candidate_ids": best.get("orientation_candidate_ids", []),
+            "orientation_visual_priorities": best.get(
+                "orientation_visual_priorities", []
+            ),
             "contact_point_link_m": best["contact_point_link_m"],
             "stages": best["stages"],
         },

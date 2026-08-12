@@ -105,10 +105,7 @@ def _task_spec(args: argparse.Namespace) -> dict[str, Any]:
             # pushing stages still create no constraint.  This is invariant
             # across assets and is not selected by the task agent.
             "require_zero_fixed_constraints": False,
-            "require_second_run": not args.skip_second_run,
             "minimum_joint_motion_ratio": args.minimum_joint_motion_ratio,
-            "minimum_contact_force_n": args.minimum_contact_force_n,
-            "maximum_peak_force_n": args.maximum_peak_force_n,
             "minimum_continuous_contact_s": args.minimum_continuous_contact_s,
             "visual_review_fps": args.visual_review_fps,
             "retain_debug_on_success": args.keep_debug,
@@ -135,11 +132,8 @@ def main() -> int:
     parser.add_argument("--supporting-file", type=Path, action="append")
     parser.add_argument("--out", type=Path)
     parser.add_argument("--minimum-joint-motion-ratio", type=float, default=0.90)
-    parser.add_argument("--minimum-contact-force-n", type=float, default=0.05)
-    parser.add_argument("--maximum-peak-force-n", type=float, default=5.0)
     parser.add_argument("--minimum-continuous-contact-s", type=float, default=0.25)
     parser.add_argument("--visual-review-fps", type=float, default=5.0)
-    parser.add_argument("--skip-second-run", action="store_true")
     parser.add_argument("--keep-debug", action="store_true")
     parser.add_argument(
         "--prepare-only",

@@ -4,8 +4,9 @@
 The contact point and approach normal remain fixed.  Each candidate rotates the
 declared contact frame only about its local +Z surface-normal axis, then reuses
 ``visualize_artimo_scene.py`` to show the object and a kinematic-free parallel-
-jaw proxy.  This first pass never runs IK.  After visual decisions, the decision
-tool runs numerical IK/contact/clearance probes only for visual-valid rolls.
+jaw proxy. This pass and the decision tool never run IK. After visual decisions,
+the placement solver evaluates visual-valid rolls lazily at actual candidate
+robot bases, completing the full placement search for one roll before the next.
 """
 from __future__ import annotations
 
@@ -339,9 +340,13 @@ def main() -> int:
         "selection": None,
         "selection_policy": (
             "Agent must open all four separate images for every candidate and mark "
-            "every roll visual-valid or visual-invalid before any IK. A visual-"
-            "invalid roll is a hard exclusion and cannot enter an IK/contact probe, "
-            "placement, trajectory, transit, or rollout. Apply decisions only through "
+            "every roll visual-valid or visual-invalid before any IK. Assign every "
+            "visual-valid roll a unique contiguous visual_priority starting at 1, "
+            "with the single best visual choice ranked first. A visual-invalid roll "
+            "is a hard exclusion and cannot enter placement, trajectory, transit, "
+            "or rollout. Full-path placement runs lazily in visual priority order "
+            "at actual candidate robot bases and stops at the first feasible roll. Apply decisions "
+            "only through "
             "applications/artimo_robot_contact/apply_artimo_grasp_orientation_decisions.py."
         ),
         "candidates": serializable_candidates,
@@ -350,13 +355,14 @@ def main() -> int:
         json.dumps(report, indent=2) + "\n", encoding="utf-8"
     )
     decision_template = {
-        "schema_version": 1,
+        "schema_version": 2,
         "report_sha256": _sha256(output / "report.json"),
         "stage_id": str(stage["id"]),
         "decisions": [
             {
                 "id": candidate["id"],
                 "visual_status": None,
+                "visual_priority": None,
                 "reason": "",
                 "reviewed_images": list(candidate["orientation_images"].values()),
             }

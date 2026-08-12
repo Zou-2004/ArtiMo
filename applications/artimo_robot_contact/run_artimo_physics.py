@@ -20,12 +20,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
-import imageio.v2 as imageio
 import numpy as np
 import pybullet as p
 from PIL import Image, ImageDraw, ImageFont
 
 import artimo_plan
+import artimo_video
 from artimo_ik import BulletIK, link_world_pose, set_fingers, set_robot_arm
 
 
@@ -46,6 +46,11 @@ PANDA_ARM_FORCE_SCALE = 1.0
 PANDA_ARM_POSITION_GAIN = 1.0
 PANDA_FINGER_FORCE_N = 200.0
 OBJECT_JOINT_STABILITY_TOLERANCE_M_OR_RAD = 1e-4
+# A release retreat is a real motion segment, not a zero-time phase boundary.
+# Hold the solved safe endpoint long enough to produce multiple physics/video
+# samples before any dependent mechanism motion or passive return is enabled.
+# This is harness policy rather than a per-asset timing knob.
+RELEASE_RETREAT_SETTLE_S = 0.10
 
 
 def _validate_execution_schema(execution: dict[str, Any]) -> None:
@@ -355,7 +360,12 @@ def _plan_requests(plan: dict[str, Any]) -> list[dict[str, Any]]:
     return artimo_plan.phase_targets(plan)
 
 
-def _validate_execution_against_plan(plan: dict[str, Any], execution: dict[str, Any]) -> None:
+def _validate_execution_against_plan(
+    plan: dict[str, Any],
+    execution: dict[str, Any],
+    *,
+    require_release_route: bool = True,
+) -> None:
     """Ensure every plan control has exactly one disclosed physical executor.
 
     Matching joint targets is not enough: without explicit ownership a contact
@@ -562,10 +572,129 @@ def _validate_execution_against_plan(plan: dict[str, Any], execution: dict[str, 
             f"unassigned={sorted(set(passive) - assigned_passive_joints)}"
         )
 
-    _validate_contact_sequences(stages, plan)
+    _validate_contact_sequences(
+        stages, plan, require_release_route=require_release_route
+    )
+    _validate_release_boundaries(plan, execution)
 
 
-def _validate_contact_sequences(stages: list[dict[str, Any]], plan: dict[str, Any]) -> None:
+def _validate_release_boundaries(
+    plan: dict[str, Any], execution: dict[str, Any]
+) -> None:
+    """Keep triggered object motion behind a completed robot retreat.
+
+    ``release_before_phase`` used to be accepted at any later plan phase.  That
+    allowed an execution to keep the robot at the contact pose while a causal
+    lid/door/panel moved, then retreat only before a still-later control return.
+    The earliest dependent moving phase is the actual safety boundary.
+    """
+    timeline = list(plan.get("timeline", []))
+    phase_order = {
+        str(phase["name"]): index for index, phase in enumerate(timeline)
+    }
+    ownership = {
+        (str(row["source_phase"]), int(row["source_control_index"])): row
+        for row in execution.get("control_execution", [])
+    }
+    stages = list(execution.get("stages", []))
+    stages_by_id = {str(stage["id"]): stage for stage in stages}
+
+    # A causal rule may be triggered by the acquisition stage of a continuous
+    # contact sequence.  Release belongs to the final stage of that sequence.
+    release_stage_by_trigger: dict[str, dict[str, Any]] = {}
+    for stage in stages:
+        sequence = stage.get("contact_sequence")
+        release_stage = stage
+        if sequence is not None:
+            release_stage = next(
+                candidate
+                for candidate in reversed(stages)
+                if candidate.get("contact_sequence") == sequence
+            )
+        release_stage_by_trigger[str(stage["id"])] = release_stage
+
+    required: dict[str, list[tuple[int, str, str]]] = {}
+    for rule in execution.get("causal_rules", []):
+        trigger_id = str(rule["trigger_stage"])
+        release_stage = release_stage_by_trigger[trigger_id]
+        phase_name = str(rule["source_effect_phase"])
+        required.setdefault(str(release_stage["id"]), []).append(
+            (phase_order[phase_name], phase_name, "causal mechanism motion")
+        )
+
+    for stage in stages:
+        source_index = phase_order[str(stage["source_phase"])]
+        driver_joint = str(stage["driver_joint"])
+        for phase_index in range(source_index + 1, len(timeline)):
+            phase = timeline[phase_index]
+            phase_name = str(phase["name"])
+            if any(
+                str(control.get("joint", "")) == driver_joint
+                and ownership[(phase_name, control_index)]["motion_owner"]
+                == "passive_return"
+                for control_index, control in enumerate(phase.get("controls", []))
+            ):
+                release_stage = release_stage_by_trigger[str(stage["id"])]
+                required.setdefault(str(release_stage["id"]), []).append(
+                    (phase_index, phase_name, "passive return")
+                )
+                break
+
+    for stage_id, boundaries in required.items():
+        stage = stages_by_id[stage_id]
+        source_index = phase_order[str(stage["source_phase"])]
+        required_index, required_phase, reason = min(boundaries)
+        if required_index <= source_index:
+            raise ValueError(
+                f"Stage {stage_id!r} triggers {reason} in phase "
+                f"{required_phase!r}, but that phase is not later than its "
+                "robot-contact phase; the plan provides no legal interval for "
+                "release and retreat"
+            )
+        declared = stage.get("release_before_phase")
+        if declared is None:
+            raise ValueError(
+                f"Stage {stage_id!r} requires release_before_phase at or before "
+                f"{required_phase!r} because that is the earliest dependent "
+                f"{reason}"
+            )
+        declared_index = phase_order[str(declared)]
+        if declared_index > required_index:
+            raise ValueError(
+                f"Stage {stage_id!r} release_before_phase {declared!r} is too "
+                f"late: {required_phase!r} begins {reason} first. The robot must "
+                "release, retreat, and settle before that earlier phase."
+            )
+
+        # An immediately following plan-owned hold preserves the physical
+        # contact.  Do not satisfy clearance by silently releasing before it.
+        held_through = source_index
+        driver_joint = str(stage["driver_joint"])
+        for phase_index in range(source_index + 1, len(timeline)):
+            phase = timeline[phase_index]
+            phase_name = str(phase["name"])
+            retains_driver = any(
+                str(control.get("mode", "")) == "hold_position"
+                and str(control.get("joint", "")) == driver_joint
+                and ownership[(phase_name, control_index)]["motion_owner"] == "hold"
+                for control_index, control in enumerate(phase.get("controls", []))
+            )
+            if not retains_driver:
+                break
+            held_through = phase_index
+        if declared_index <= held_through:
+            raise ValueError(
+                f"Stage {stage_id!r} release_before_phase {declared!r} would "
+                "release before its plan-owned hold completes"
+            )
+
+
+def _validate_contact_sequences(
+    stages: list[dict[str, Any]],
+    plan: dict[str, Any],
+    *,
+    require_release_route: bool = True,
+) -> None:
     """Require a continued grasp to be adjacent and geometrically identical."""
     phase_order = {str(phase["name"]): index for index, phase in enumerate(plan.get("timeline", []))}
     previous_order = (-1, -1)
@@ -598,14 +727,38 @@ def _validate_contact_sequences(stages: list[dict[str, Any]], plan: dict[str, An
                 raise ValueError(
                     f"contact_sequence {sequence!r} cannot preserve one grasp; changed fields={changed}"
                 )
+    timeline = list(plan.get("timeline", []))
     for left, right in zip(stages, stages[1:]):
+        left_index = phase_order[str(left["source_phase"])]
+        right_index = phase_order[str(right["source_phase"])]
+        left_driver = str(left["driver_joint"])
+        intervening = timeline[left_index + 1 : right_index + 1]
+        plan_releases_contact = any(
+            str(phase.get("phase_type", "")) == "control_release"
+            or any(
+                str(control.get("joint", "")) == left_driver
+                and str(control.get("mode", "")) in {"spring_return", "release"}
+                for control in phase.get("controls", [])
+            )
+            for phase in intervening
+        )
+
+        # The plan is the sole authority for release/reacquisition.  A later
+        # robot-owned control before any plan-declared control release must be
+        # executed through the existing grasp, even when the driven joint or
+        # the moving parent link changes.  Otherwise an agent can reinterpret
+        # an effect phase as "let go and push another link", which changes the
+        # requested physical workflow while still matching all joint targets.
+        if not plan_releases_contact and not _same_contact_sequence(left, right):
+            raise ValueError(
+                "Plan contains no control_release between adjacent robot-contact "
+                f"stages {left['id']!r} and {right['id']!r}; they must preserve "
+                "the same contact_link and one uninterrupted contact_sequence"
+            )
+
         if str(left["contact_link"]) != str(right["contact_link"]):
             continue
-        explicit_release = (
-            left.get("release_before_phase") is not None
-            and str(left["release_before_phase"]) == str(right["source_phase"])
-        )
-        if not _same_contact_sequence(left, right) and not explicit_release:
+        if not _same_contact_sequence(left, right) and not plan_releases_contact:
             raise ValueError(
                 "Adjacent robot-contact stages on the same contact_link must "
                 "preserve one contact_sequence. Release/reacquire is allowed only "
@@ -636,12 +789,14 @@ def _validate_contact_sequences(stages: list[dict[str, Any]], plan: dict[str, An
                 f"Stage {stage['id']!r} release_before_phase requires a supported "
                 "contact acquisition mode"
             )
-        if not stage.get("release_retreat_waypoints_world"):
+        if require_release_route and not stage.get("release_retreat_waypoints_world"):
             raise ValueError(
                 f"Stage {stage['id']!r} release_before_phase requires a planned "
                 "release_retreat_waypoints_world outside the released mechanism sweep"
             )
-        if float(stage.get("minimum_release_swept_clearance_m", 0.0)) <= 0.0:
+        if require_release_route and float(
+            stage.get("minimum_release_swept_clearance_m", 0.0)
+        ) <= 0.0:
             raise ValueError(
                 f"Stage {stage['id']!r} release_before_phase requires positive "
                 "minimum_release_swept_clearance_m"
@@ -2438,10 +2593,11 @@ def _schedule(
                     )
                 retreat_opening = approach_opening
             if release_before_phase is not None:
-                # A passive return may not start with the hand left in its
-                # swept volume.  Release first, execute only the explicitly
-                # planned clearance retreat, then hold there while the passive
-                # plan phase runs.
+                # Dependent mechanism motion or a passive return may not start
+                # with the hand left in its swept volume. Release first,
+                # execute only the explicitly planned clearance retreat, then
+                # visibly settle at its safe endpoint before crossing the plan
+                # boundary that enables object motion.
                 for q in plan.retreat[1:]:
                     for _ in range(3):
                         append_command(
@@ -2453,6 +2609,18 @@ def _schedule(
                             release_command_timeline_phase,
                         )
                 current = plan.retreat[-1].copy()
+                release_settle_ticks = max(
+                    1, int(round(RELEASE_RETREAT_SETTLE_S / DT))
+                )
+                for _ in range(release_settle_ticks):
+                    append_command(
+                        "release_retreat_settle",
+                        index,
+                        current,
+                        retreat_opening,
+                        finger_force,
+                        release_command_timeline_phase,
+                    )
             elif index + 1 == len(plans):
                 for q in plan.retreat:
                     for _ in range(3):
@@ -2636,6 +2804,7 @@ def _rollout(
     if client < 0:
         raise RuntimeError("Could not connect PyBullet rollout client")
     writer = None
+    video_encoding = None
     try:
         p.setPhysicsEngineParameter(
             fixedTimeStep=DT,
@@ -2717,7 +2886,9 @@ def _rollout(
                     )
 
         if video_path is not None:
-            writer = imageio.get_writer(video_path, fps=VIDEO_FPS, codec="libx264", quality=8, macro_block_size=1)
+            writer, video_encoding = artimo_video.open_h264_writer(
+                video_path, fps=VIDEO_FPS, macro_block_size=1
+            )
         stage_metrics = [
             {
                 "stage_id": plan.stage["id"],
@@ -2726,8 +2897,6 @@ def _rollout(
                 "non_target_contact_observations": 0,
                 "effect_link_contact_observations": 0,
                 "maximum_driver_displacement": 0.0,
-                "force_samples": [],
-                "peak_contact_force_n": 0.0,
                 "maximum_continuous_contact_ticks": 0,
                 "first_target_contact_tick": None,
                 "unexpected_contact_pairs": {},
@@ -2911,12 +3080,40 @@ def _rollout(
                     not state["latched"]
                     and float(metric["maximum_driver_displacement"]) >= float(rule["minimum_displacement"])
                     and current_contact_ticks[trigger_index] >= int(round(float(rule["minimum_dwell_s"]) / DT))
-                    and float(metric["peak_contact_force_n"]) >= float(rule["minimum_force_n"])
                 ):
                     state["latched"] = True
                     state["triggers"] += 1
                     state["latched_tick"] = int(tick)
-                trigger_stage_done = stage_index is None or int(stage_index) > trigger_index or phase in {"retreat", "transit", "settle"}
+                trigger_sequence = plans[trigger_index].stage.get("contact_sequence")
+                release_boundary = plans[trigger_index].stage.get("release_before_phase")
+                if trigger_sequence is not None:
+                    release_boundary = next(
+                        item.stage.get("release_before_phase")
+                        for item in reversed(plans)
+                        if item.stage.get("contact_sequence") == trigger_sequence
+                    )
+                if release_boundary is not None:
+                    # A retreat command is not proof that the robot is already
+                    # clear.  For an explicit release boundary, causal motion
+                    # becomes eligible only after the whole retreat and its
+                    # endpoint settle have completed and the scheduler crosses
+                    # into the declared later phase.
+                    trigger_stage_done = (
+                        int(command["timeline_phase_index"])
+                        >= int(timeline_phase_order[str(release_boundary)])
+                        and phase
+                        not in {
+                            "contact_release",
+                            "retreat",
+                            "release_retreat_settle",
+                        }
+                    )
+                else:
+                    trigger_stage_done = (
+                        stage_index is None
+                        or int(stage_index) > trigger_index
+                        or phase in {"retreat", "transit", "settle"}
+                    )
                 source_effect_phase_reached = int(
                     command["timeline_phase_index"]
                 ) >= int(timeline_phase_order[str(rule["source_effect_phase"])])
@@ -3045,14 +3242,11 @@ def _rollout(
                     float(metric["maximum_driver_displacement"]),
                     current_driver_displacement[index],
                 )
-                summed_force = 0.0
                 target_observed = False
                 for point in p.getContactPoints(robot_body, object_body, physicsClientId=client):
                     robot_link, object_link = int(point[3]), int(point[4])
-                    force = max(0.0, float(point[9]))
                     if robot_link in allowed_robot and object_link == allowed_object:
                         metric["target_contact_observations"] += 1
-                        summed_force += force
                         target_observed = True
                     else:
                         metric["non_target_contact_observations"] += 1
@@ -3067,10 +3261,9 @@ def _rollout(
                             phase,
                         )
                         record = metric["unexpected_contact_pairs"].setdefault(
-                            key, {"observations": 0, "peak_force_n": 0.0, "deepest_penetration_m": 0.0}
+                            key, {"observations": 0, "deepest_penetration_m": 0.0}
                         )
                         record["observations"] += 1
-                        record["peak_force_n"] = max(float(record["peak_force_n"]), force)
                         record["deepest_penetration_m"] = min(
                             float(record["deepest_penetration_m"]), float(point[8])
                         )
@@ -3079,7 +3272,6 @@ def _rollout(
                         robot_support_body, object_body, physicsClientId=client
                     ):
                         object_link = int(point[4])
-                        force = max(0.0, float(point[9]))
                         metric["non_target_contact_observations"] += 1
                         if object_link in effect_links:
                             metric["effect_link_contact_observations"] += 1
@@ -3092,14 +3284,10 @@ def _rollout(
                             key,
                             {
                                 "observations": 0,
-                                "peak_force_n": 0.0,
                                 "deepest_penetration_m": 0.0,
                             },
                         )
                         record["observations"] += 1
-                        record["peak_force_n"] = max(
-                            float(record["peak_force_n"]), force
-                        )
                         record["deepest_penetration_m"] = min(
                             float(record["deepest_penetration_m"]), float(point[8])
                         )
@@ -3110,8 +3298,6 @@ def _rollout(
                         str(plans[index].stage["driver_joint"])
                     )
                     current_contact_ticks[index] += 1
-                    metric["force_samples"].append(summed_force)
-                    metric["peak_contact_force_n"] = max(float(metric["peak_contact_force_n"]), summed_force)
                     metric["maximum_continuous_contact_ticks"] = max(
                         int(metric["maximum_continuous_contact_ticks"]), current_contact_ticks[index]
                     )
@@ -3119,7 +3305,6 @@ def _rollout(
                     current_contact_ticks[index] = 0
 
             if writer is not None and tick % CAPTURE_EVERY == 0:
-                force = 0.0 if stage_index is None else float(stage_metrics[int(stage_index)]["peak_contact_force_n"])
                 target_world = None
                 if stage_index is not None:
                     active_plan = plans[int(stage_index)]
@@ -3150,7 +3335,7 @@ def _rollout(
                                 else "PHYSICAL"
                             )
                         )
-                        + f" | phase={phase} | stage={stage_index} | peak contact={force:.2f} N",
+                        + f" | phase={phase} | stage={stage_index}",
                         phase,
                         target_world,
                     )
@@ -3161,13 +3346,11 @@ def _rollout(
         summarized = []
         diagnostics = []
         for metric in stage_metrics:
-            samples = metric.pop("force_samples")
             ticks = int(metric.pop("maximum_continuous_contact_ticks"))
             # The offending pairs are diagnostics, not acceptance metrics: they
-            # must stay out of `contacts` so the second-run comparison keeps
-            # comparing the same measured fields it always did.
+            # stay out of `contacts`, whose stable fields describe target-contact
+            # evidence consumed by the delivery verifier.
             pairs = metric.pop("unexpected_contact_pairs")
-            metric["mean_contact_force_n"] = float(np.mean(samples)) if samples else 0.0
             metric["continuous_contact_s"] = ticks * DT
             summarized.append(metric)
             diagnostics.append(
@@ -3281,6 +3464,7 @@ def _rollout(
             "undeclared_object_joints": undeclared_object_joints,
             "robot_command_schedule_sha256": _canonical_hash(commands),
             "robot_tracking": robot_tracking,
+            "video_encoding": video_encoding,
         }
     finally:
         if writer is not None:
@@ -3679,9 +3863,19 @@ def run(
         "passive_return_after_release_retreat": all(
             not command.get("active_passive_joints")
             for command in commands
-            if command["phase"] in {"contact_release", "retreat"}
+            if command["phase"]
+            in {"contact_release", "retreat", "release_retreat_settle"}
             and command.get("stage") is not None
             and plans[int(command["stage"])].stage.get("release_before_phase")
+        ),
+        "release_retreat_has_nonzero_settle": all(
+            any(
+                command["phase"] == "release_retreat_settle"
+                and command.get("stage") == stage_index
+                for command in commands
+            )
+            for stage_index, item in enumerate(plans)
+            if item.stage.get("release_before_phase") is not None
         ),
         "release_passive_swept_clearance": all(
             any(
@@ -3723,15 +3917,6 @@ def run(
             for item in motion.values()
         ),
         "target_contact_positive": all(item["target_contact_observations"] > 0 for item in physical["contacts"]),
-        "target_contact_force_minimum": all(
-            item["mean_contact_force_n"] >= float(task["acceptance"]["minimum_contact_force_n"])
-            for item in physical["contacts"]
-        ),
-        "target_contact_force_maximum": all(
-            item["interaction"] == "explicit_ideal_feasibility"
-            or item["peak_contact_force_n"] <= float(task["acceptance"]["maximum_peak_force_n"])
-            for item in physical["contacts"]
-        ),
         "target_contact_duration": all(
             item["continuous_contact_s"] >= float(task["acceptance"].get("minimum_continuous_contact_s", 0.0))
             for item in physical["contacts"]
