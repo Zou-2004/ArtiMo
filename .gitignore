@@ -4,6 +4,7 @@ __pycache__/
 outputs/
 validation_outputs/
 logs/
+.artimo-runs/
 *.mp4
 !assets/videos/**/*.mp4
 *.blend

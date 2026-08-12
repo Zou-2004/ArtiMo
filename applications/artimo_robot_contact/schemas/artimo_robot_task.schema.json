@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://artimo.local/schemas/agent-contact-task-v2.json",
+  "title": "Asset-agnostic ArtiMo robot-contact task",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "task_id",
+    "task_description",
+    "inputs",
+    "output_dir",
+    "acceptance"
+  ],
+  "properties": {
+    "schema_version": {"const": 2},
+    "task_id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._-]*$"
+    },
+    "task_description": {"type": "string", "minLength": 1},
+    "inputs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["urdf", "plan", "robot_urdf"],
+      "properties": {
+        "urdf": {"type": "string", "minLength": 1},
+        "plan": {"type": "string", "minLength": 1},
+        "trajectory": {"type": "string", "minLength": 1},
+        "physics_urdf": {"type": "string", "minLength": 1},
+        "robot_urdf": {"type": "string", "minLength": 1},
+        "supporting_files": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1},
+          "uniqueItems": true
+        }
+      }
+    },
+    "output_dir": {"type": "string", "minLength": 1},
+    "acceptance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "require_zero_fixed_constraints",
+        "require_second_run",
+        "minimum_joint_motion_ratio",
+        "minimum_contact_force_n",
+        "maximum_peak_force_n",
+        "visual_review_fps"
+      ],
+      "properties": {
+        "require_zero_fixed_constraints": {
+          "const": false,
+          "description": "The invariant benchmark permits disclosed ideal fixed grasp constraints for open_then_close stages; maintain_width pushes still create none."
+        },
+        "require_second_run": {"type": "boolean"},
+        "minimum_joint_motion_ratio": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "minimum_contact_force_n": {"type": "number", "minimum": 0},
+        "maximum_peak_force_n": {"type": "number", "exclusiveMinimum": 0},
+        "minimum_continuous_contact_s": {"type": "number", "minimum": 0},
+        "visual_review_fps": {"type": "number", "minimum": 5},
+        "retain_debug_on_success": {"type": "boolean"}
+      }
+    }
+  }
+}

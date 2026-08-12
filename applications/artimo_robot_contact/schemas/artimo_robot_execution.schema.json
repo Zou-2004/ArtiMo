@@ -1,0 +1,414 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://artimo.local/schemas/contact-execution-v2.json",
+  "title": "Asset-agnostic robot-contact execution plan",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "scene", "robot", "control_execution", "stages", "causal_rules", "seeds"],
+  "properties": {
+    "schema_version": {"const": 2},
+    "physics_urdf": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Optional collision-only URDF generated for this execution under .artimo-runs/<task_id>/. The source task URDF remains authoritative for the mechanism."
+    },
+    "scene": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["object_base_translation_m", "object_base_rotation_xyzw"],
+      "properties": {
+        "object_base_translation_m": {"$ref": "#/$defs/vec3"},
+        "object_base_rotation_xyzw": {"$ref": "#/$defs/quat"},
+        "ground_clearance_m": {"type": "number", "minimum": 0},
+        "support_surface": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["center_m", "half_extents_m"],
+          "properties": {
+            "center_m": {"$ref": "#/$defs/vec3"},
+            "half_extents_m": {"$ref": "#/$defs/positive_vec3"}
+          }
+        }
+      }
+    },
+    "robot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "base_translation_m",
+        "base_rotation_xyzw",
+        "arm_joint_names",
+        "finger_joint_names",
+        "end_effector_link",
+        "home_joint_positions"
+      ],
+      "properties": {
+        "base_translation_m": {"$ref": "#/$defs/vec3"},
+        "base_rotation_xyzw": {"$ref": "#/$defs/quat"},
+        "arm_joint_names": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1},
+          "minItems": 1,
+          "uniqueItems": true
+        },
+        "finger_joint_names": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1},
+          "minItems": 1,
+          "uniqueItems": true
+        },
+        "end_effector_link": {"type": "string", "minLength": 1},
+        "home_joint_positions": {
+          "type": "array",
+          "items": {"type": "number"},
+          "minItems": 1
+        },
+        "base_support_height_m": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Height of the physical plinth under the robot. Its collision footprint is derived from the grounded robot base link AABB, and it participates in placement, swept-clearance, rollout contact, and rendering."
+        }
+      }
+    },
+    "stages": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "source_phase",
+          "source_control_index",
+          "interaction",
+          "driver_joint",
+          "contact_link",
+          "contact_pose_link",
+          "target_joint_position",
+          "allowed_robot_contact_links",
+          "precontact_offset_m",
+          "finger_opening_m",
+          "contact_acquisition"
+        ],
+        "properties": {
+          "id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]*$"},
+          "source_phase": {"type": "string", "minLength": 1},
+          "source_control_index": {"type": "integer", "minimum": 0},
+          "contact_sequence": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9._-]*$",
+            "description": "Adjacent robot-contact stages with the same value form one uninterrupted grasp. The harness approaches once, preserves contact between stages, and retreats only after the final stage."
+          },
+          "release_before_phase": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Optional explicit release boundary. The harness retains the grasp through this stage and any intervening plan phases, then opens the fingers and removes a disclosed ideal attachment immediately before the named later plan phase."
+          },
+          "interaction": {
+            "enum": ["physical_push", "explicit_ideal_feasibility"],
+            "description": "Invariant benchmark policy: physical_push for maintain_width controls; disclosed explicit_ideal_feasibility for open_then_close grasps. Frictional force-closure tuning is outside this benchmark."
+          },
+          "driver_joint": {"type": "string", "minLength": 1},
+          "contact_link": {"type": "string", "minLength": 1},
+          "contact_pose_link": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["translation_m", "rotation_xyzw"],
+            "properties": {
+              "translation_m": {"$ref": "#/$defs/vec3"},
+              "rotation_xyzw": {"$ref": "#/$defs/quat"}
+            }
+          },
+          "target_joint_position": {"type": "number"},
+          "command_joint_position": {"type": "number"},
+          "allowed_robot_contact_links": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1},
+            "minItems": 1,
+            "uniqueItems": true
+          },
+          "precontact_offset_m": {
+            "type": "number",
+            "exclusiveMinimum": 0,
+            "description": "Non-negative distance from the grasp target farther into free space along contact-pose local +Z. Robot approach moves in local -Z."
+          },
+          "grasp_depth_m": {
+            "type": "number",
+            "minimum": 0,
+            "description": "Final manipulation standoff of the Panda grasptarget from the contacted surface along outward contact local +Z. This remains after approach and is not approach clearance; validate it from measured per-finger target gaps. precontact_offset_m is the separate transient free-space distance. The generic harness maps contact-frame +Z to Panda-grasptarget -Z.",
+            "default": 0.0
+          },
+          "robot_tool_contact_offset_eef_m": {
+            "$ref": "#/$defs/vec3",
+            "description": "Optional vector in the robot end-effector link frame from the EEF origin to the actual robot tool surface that must coincide with contact_pose_link. Use for maintain_width physical pushes such as one selected fingertip; the harness subtracts the rotated vector when solving the EEF origin. Omit for centered parallel-jaw grasps."
+          },
+          "finger_opening_m": {"type": "number", "minimum": 0},
+          "contact_acquisition": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "mode",
+              "approach_finger_opening_m",
+              "close_s",
+              "settle_s",
+              "release_s"
+            ],
+            "properties": {
+              "mode": {
+                "enum": ["open_then_close", "maintain_width"],
+                "description": "Agent-selected contact acquisition. Use open_then_close for a grasp that must surround the target before closing; use maintain_width when a pre-shaped or closed gripper is itself the pushing/pressing tool."
+              },
+              "approach_finger_opening_m": {
+                "type": "number",
+                "minimum": 0,
+                "description": "Finger joint position during transit and approach. For open_then_close it must exceed finger_opening_m; for maintain_width it must equal finger_opening_m."
+              },
+              "close_s": {
+                "type": "number",
+                "minimum": 0,
+                "description": "Time used to interpolate from approach_finger_opening_m to finger_opening_m while the arm holds the first contact pose. Must be positive for open_then_close and zero for maintain_width."
+              },
+              "settle_s": {
+                "type": "number",
+                "minimum": 0,
+                "description": "Time to hold the acquired contact before object manipulation begins."
+              },
+              "release_s": {
+                "type": "number",
+                "minimum": 0,
+                "description": "Time used to reopen at the final contact pose before retreat. Must be positive for open_then_close and zero for maintain_width."
+              }
+            }
+          },
+          "hold_s": {"type": "number", "minimum": 0},
+          "manipulation_sample_hold_s": {
+            "type": "number",
+            "exclusiveMinimum": 0,
+            "description": "Physical dwell for each of the 65 ordered object-path samples. Increase it to execute the same plan path more slowly without changing any object endpoint or replaying object motion."
+          },
+          "approach_waypoints_link_m": {
+            "type": "array",
+            "description": "Ordered via-points for the transit into the precontact pose, expressed in the contacted link frame. Use these to route the wrist around an intervening link instead of straight through it.",
+            "items": {"$ref": "#/$defs/vec3"}
+          },
+          "transit_waypoints_world": {
+            "type": "array",
+            "description": "Ordered world-frame end-effector poses used only while transiting from the preceding released retreat endpoint (or home for the first stage) to this stage's approach. Use geometry-derived poses to route around obstacles moved by earlier plan stages; these poses are not replayed during this stage's retreat.",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["translation_m", "rotation_xyzw"],
+              "properties": {
+                "translation_m": {"$ref": "#/$defs/vec3"},
+                "rotation_xyzw": {"$ref": "#/$defs/quat"}
+              }
+            }
+          },
+          "release_retreat_waypoints_world": {
+            "type": "array",
+            "minItems": 1,
+            "description": "Agent-planned end-effector poses executed after opening the fingers and before release_before_phase begins. They must place the whole robot outside the released mechanism's swept volume.",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["translation_m", "rotation_xyzw"],
+              "properties": {
+                "translation_m": {"$ref": "#/$defs/vec3"},
+                "rotation_xyzw": {"$ref": "#/$defs/quat"}
+              }
+            }
+          },
+          "minimum_release_swept_clearance_m": {
+            "type": "number",
+            "exclusiveMinimum": 0,
+            "description": "Required whole-robot separation from every object link while moving through release_retreat_waypoints_world and while the declared passive-return joints sweep to rest."
+          },
+          "forbidden_contact_links": {
+            "type": "array",
+            "description": "Object links the robot must stay clear of while approaching this stage. Checked at planning time against the whole swept path, so a candidate that would strike them is rejected before any rollout.",
+            "items": {"type": "string", "minLength": 1},
+            "uniqueItems": true
+          },
+          "minimum_swept_clearance_m": {
+            "type": "number",
+            "minimum": 0,
+            "description": "Required separation from forbidden_contact_links along the approach and manipulation path."
+          }
+        },
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "contact_acquisition": {
+                  "properties": {"mode": {"const": "open_then_close"}},
+                  "required": ["mode"]
+                }
+              },
+              "required": ["contact_acquisition"]
+            },
+            "then": {"properties": {"interaction": {"const": "explicit_ideal_feasibility"}}}
+          },
+          {
+            "if": {
+              "properties": {
+                "contact_acquisition": {
+                  "properties": {"mode": {"const": "maintain_width"}},
+                  "required": ["mode"]
+                }
+              },
+              "required": ["contact_acquisition"]
+            },
+            "then": {"properties": {"interaction": {"const": "physical_push"}}}
+          }
+        ]
+      }
+    },
+    "control_execution": {
+      "type": "array",
+      "minItems": 1,
+      "description": "Exhaustive, auditable ownership of every plan timeline control. Ownership is per control rather than per phase because one phase may combine a passive return with a different internally actuated motion.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["source_phase", "source_control_index", "motion_owner"],
+        "properties": {
+          "source_phase": {"type": "string", "minLength": 1},
+          "source_control_index": {"type": "integer", "minimum": 0},
+          "motion_owner": {
+            "enum": ["robot_contact", "internal_mechanism", "passive_return", "hold"]
+          },
+          "stage_id": {"type": "string", "minLength": 1},
+          "causal_rule_id": {"type": "string", "minLength": 1},
+          "energy_source": {
+            "enum": ["stored_energy", "gravity", "internal_actuator"],
+            "description": "Physical source that performs an internal-mechanism control after the robot trigger. Desired motion or a phase name is not an energy source."
+          },
+          "justification": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Required human-auditable reason for any internal mechanism; it must describe the trigger/transmission rather than merely restate the desired motion."
+          }
+        },
+        "allOf": [
+          {
+            "if": {"properties": {"motion_owner": {"const": "robot_contact"}}},
+            "then": {"required": ["stage_id"]}
+          },
+          {
+            "if": {"properties": {"motion_owner": {"const": "internal_mechanism"}}},
+            "then": {"required": ["causal_rule_id", "energy_source", "justification"]}
+          }
+        ]
+      }
+    },
+    "causal_rules": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "trigger_stage", "source_effect_phase", "minimum_displacement", "minimum_force_n", "minimum_dwell_s", "effects"],
+        "properties": {
+          "id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]*$"},
+          "trigger_stage": {"type": "string", "minLength": 1},
+          "source_effect_phase": {"type": "string", "minLength": 1},
+          "minimum_displacement": {"type": "number", "minimum": 0},
+          "minimum_force_n": {"type": "number", "minimum": 0},
+          "minimum_dwell_s": {"type": "number", "minimum": 0},
+          "minimum_clearance_m": {"type": "number", "minimum": 0},
+          "latch": {"type": "boolean"},
+          "effects": {"$ref": "#/$defs/effects"},
+          "release": {
+            "type": "object",
+            "description": "Second, later object-side phase reached when the measured driver returns toward rest. Models a plan phase such as a lid closing after a pedal is released; without it a latched effect could never return.",
+            "additionalProperties": false,
+            "required": ["source_effect_phase", "maximum_driver_displacement", "effects"],
+            "properties": {
+              "source_effect_phase": {"type": "string", "minLength": 1},
+              "maximum_driver_displacement": {"type": "number", "minimum": 0},
+              "minimum_dwell_s": {"type": "number", "minimum": 0},
+              "effects": {"$ref": "#/$defs/effects"}
+            }
+          }
+        }
+      }
+    },
+    "passive_joints": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["joint", "rest_position", "maximum_force_or_torque", "position_gain"],
+        "properties": {
+          "joint": {"type": "string", "minLength": 1},
+          "rest_position": {"type": "number"},
+          "maximum_force_or_torque": {"type": "number", "minimum": 0},
+          "position_gain": {"type": "number", "exclusiveMinimum": 0}
+        }
+      }
+    },
+    "camera": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "eye_m": {"$ref": "#/$defs/vec3"},
+        "target_m": {"$ref": "#/$defs/vec3"},
+        "fov_deg": {"type": "number", "exclusiveMinimum": 0, "exclusiveMaximum": 180}
+      }
+    },
+    "seeds": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {"type": "integer"}
+    },
+    "settle_s": {
+      "type": "number",
+      "minimum": 0,
+      "description": "Seconds the robot holds at home after the last stage. Must be long enough for any declared causal release to reach its plan endpoint."
+    },
+    "ik": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Bounded initial-contact IK search budget. Dense manipulation always follows the nearest local joint-space branch; pose tolerances and joint-step rejection are not task parameters.",
+      "properties": {
+        "random_restarts": {"type": "integer", "minimum": 1, "maximum": 2048},
+        "max_iterations": {"type": "integer", "minimum": 1, "maximum": 20000}
+      }
+    }
+  },
+  "$defs": {
+    "effects": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["source_control_index", "joint", "target", "maximum_force_or_torque", "tolerance"],
+        "properties": {
+          "source_control_index": {"type": "integer", "minimum": 0},
+          "joint": {"type": "string", "minLength": 1},
+          "target": {"type": "number"},
+          "maximum_force_or_torque": {"type": "number", "exclusiveMinimum": 0},
+          "tolerance": {"type": "number", "exclusiveMinimum": 0}
+        }
+      }
+    },
+    "vec3": {
+      "type": "array",
+      "items": {"type": "number"},
+      "minItems": 3,
+      "maxItems": 3
+    },
+    "positive_vec3": {
+      "type": "array",
+      "items": {"type": "number", "exclusiveMinimum": 0},
+      "minItems": 3,
+      "maxItems": 3
+    },
+    "quat": {
+      "type": "array",
+      "items": {"type": "number"},
+      "minItems": 4,
+      "maxItems": 4
+    }
+  }
+}
