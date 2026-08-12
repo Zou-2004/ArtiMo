@@ -31,7 +31,7 @@ import pybullet as p
 
 APP_ROOT = Path(__file__).resolve().parent
 REPO = APP_ROOT.parents[1]
-sys.path.insert(0, str(REPO / "tools"))
+sys.path.insert(0, str(APP_ROOT))
 
 import run_artimo_physics as ph  # noqa: E402
 from artimo_ik import BulletIK, set_fingers, set_robot_arm  # noqa: E402

@@ -24,7 +24,7 @@ from render_artimo_grasp_orientation_candidates import _candidate_summary
 
 APP_ROOT = Path(__file__).resolve().parent
 REPO = APP_ROOT.parents[1]
-SCENE_RENDERER = REPO / "tools" / "visualize_artimo_scene.py"
+SCENE_RENDERER = APP_ROOT / "visualize_artimo_scene.py"
 
 
 def _sha256(path: Path) -> str:

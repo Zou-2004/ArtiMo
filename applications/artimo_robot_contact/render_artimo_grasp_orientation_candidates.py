@@ -23,7 +23,7 @@ import numpy as np
 
 APP_ROOT = Path(__file__).resolve().parent
 REPO = APP_ROOT.parents[1]
-SCENE_RENDERER = REPO / "tools" / "visualize_artimo_scene.py"
+SCENE_RENDERER = APP_ROOT / "visualize_artimo_scene.py"
 DEFAULT_ROLL_DEGREES = (-180.0, -135.0, -90.0, -45.0, 0.0, 45.0, 90.0, 135.0)
 
 
