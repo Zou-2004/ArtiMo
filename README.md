@@ -119,91 +119,34 @@ python tools/run_plan.py \
 
 ## Application: URDF + plan to a physical robot rollout
 
-The `artimo-robot-contact` application converts one articulated-object URDF and
-one ArtiMo `plan.json` into a causal Panda/PyBullet rollout. It uses the same
-asset-independent tools for every object: visual contact selection, bounded IK
-and whole-robot collision checking, physical execution, a byte-identical hidden
-negative control, a clean second run, and video review.
+### 1. Install
 
-Install only the application dependencies in a Python 3.10 environment. FFmpeg
-must also be on `PATH`.
+Use Python 3.10 and make sure `ffmpeg` and `ffprobe` are on `PATH`.
 
 ```bash
 python3.10 -m venv venv
 source venv/bin/activate
 pip install -r applications/artimo_robot_contact/requirements.txt
-
 ffmpeg -version
 ffprobe -version
 ```
 
-Keep the object URDF and every mesh/material/texture it references inside this
-repository checkout. The application includes its Panda URDF and meshes, so a
-separate ArticuBot installation is not required. The minimum command is:
+### 2. Run the complete workflow
+
+From the repository root, run this command. Replace only the two input paths:
 
 ```bash
 python applications/artimo_robot_contact/run_artimo_robot_pipeline.py \
   --urdf path/to/object/mobility.urdf \
   --plan path/to/animation/plan.json \
-  --prepare-only
+  --agent-command 'codex exec --sandbox workspace-write --ask-for-approval never -'
 ```
 
-This prints the paths of a frozen, agent-neutral `prompt.md` and
-`input-lock.json` below `.artimo-runs/`. The prompt does not name or depend on a
-particular agent product. It is written in English and tells the agent to read
-the application-local documentation bundle under
-`applications/artimo_robot_contact/docs/`. These files are separate from the
-repository-level `docs/`, which documents the main ArtiMo method.
-
-To use any interactive agent:
-
-1. Open the repository root as its writable workspace.
-2. Give it the generated `prompt.md` verbatim.
-3. Allow shell execution and image inspection; the agent must be able to read
-   every required Markdown file in `applications/artimo_robot_contact/docs/`.
-4. Let it finish the three-file output. Do not reuse another task's
-   `.artimo-runs/` evidence.
-
-For any CLI agent that reads a prompt from standard input, the application can
-launch it and verify the result in one command:
-
-```bash
-python applications/artimo_robot_contact/run_artimo_robot_pipeline.py \
-  --urdf path/to/object/mobility.urdf \
-  --plan path/to/animation/plan.json \
-  --agent-command 'your-agent-cli run --read-prompt-from-stdin'
-```
-
-The quoted command is split into arguments without a shell, and the exact
-frozen prompt is written to its standard input. Agent-specific model, login,
-sandbox, or reasoning settings belong in that command or the agent's own
-configuration; they are deliberately absent from the task schema and prompt.
-
-`task-id`, task description, Panda path, and output path have deterministic
-defaults. Override them only when useful:
-
-```bash
-python applications/artimo_robot_contact/run_artimo_robot_pipeline.py \
-  --task-id kettle13-open-lid \
-  --task-description "Press the button and open the lid." \
-  --urdf inputs/electric_kettle13/mobility.urdf \
-  --plan inputs/electric_kettle13/plan.json \
-  --out outputs/robot_contact/kettle13-open-lid
-```
-
-`trajectory.jsonl` is optional. It is never replayed as animation; when supplied,
-only its first `joint_angles` row initializes non-zero object joints. Without
-it, the rollout starts from the URDF default zero joint state:
-
-```bash
-python applications/artimo_robot_contact/run_artimo_robot_pipeline.py \
-  --urdf path/to/object/mobility.urdf \
-  --plan path/to/animation/plan.json \
-  --trajectory path/to/animation/trajectory.jsonl
-```
-
-For a lock/prompt smoke test that does not launch an agent or physics, use
-`--prepare-only`. A completed application output contains exactly:
+This is the full pipeline: it freezes the inputs, gives the English application
+prompt to the agent, performs visual contact selection, collision-aware IK and
+placement, causal PyBullet rollout, hidden negative control, clean second run,
+video review, and delivery verification. The final directory is printed when
+the command finishes and contains exactly:
 
 ```text
 outputs/robot_contact/<task-id>/
@@ -212,11 +155,30 @@ outputs/robot_contact/<task-id>/
   result.json
 ```
 
-Search evidence remains under `.artimo-runs/` and is not part of the published
-delivery. The public video contains causal physics only: the object plan is not
-replayed, object joints are not reset after initialization, and the hidden
-negative run uses the same serialized robot commands with only nominated target
-contact disabled.
+The object URDF and every mesh/material/texture it references must be inside
+this repository checkout. The Panda URDF and meshes are already included. The
+agent reads the English instructions in
+`applications/artimo_robot_contact/docs/`; the repository-level `docs/` belongs
+to the main ArtiMo method and is not used as this application's workflow.
+
+To use a different CLI agent, replace only the value of `--agent-command` with
+a command that reads the prompt from standard input.
+
+### Optional inputs and preparation
+
+`trajectory.jsonl` is optional. It is never replayed as animation; when supplied,
+only its first `joint_angles` row initializes non-zero object joints. To use it,
+add this argument to the complete command above:
+
+```bash
+--trajectory path/to/animation/trajectory.jsonl
+```
+
+Without it, the rollout starts from the URDF default zero joint state.
+
+Use `--prepare-only` instead of `--agent-command` only when you want to generate
+and inspect the frozen English `prompt.md` and `input-lock.json` without running
+the agent, physics, or video export.
 
 ## Repository Layout
 
