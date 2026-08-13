@@ -19,6 +19,7 @@ from solve_artimo_placement import (
     _gated_orientation_options,
     _manipulation_block_stage_ids,
     _matches_lateral_refinement_seed,
+    _tier_ik_budget,
 )
 
 
@@ -27,6 +28,21 @@ def _sha256(path: Path) -> str:
 
 
 class OrientationPriorityTest(unittest.TestCase):
+    def test_screening_ik_budgets_do_not_inherit_dense_restarts(self) -> None:
+        execution_ik = {"random_restarts": 96, "max_iterations": 2000}
+        self.assertEqual(_tier_ik_budget(execution_ik, "coarse"), (4, 500))
+        self.assertEqual(_tier_ik_budget(execution_ik, "sparse"), (12, 1000))
+        self.assertEqual(_tier_ik_budget(execution_ik, "dense"), (96, 2000))
+        self.assertEqual(
+            _tier_ik_budget(
+                execution_ik,
+                "coarse",
+                random_restarts_override=6,
+                max_iterations_override=700,
+            ),
+            (6, 700),
+        )
+
     def test_adaptive_dense_path_refines_only_large_pose_steps(self) -> None:
         constant = _adaptive_driver_path(
             0.0,

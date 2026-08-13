@@ -339,7 +339,12 @@ precontact pose is a shared-harness regression, not a contact/placement variable
    17-sample continuous-IK pass with joint-step checks. Rank survivors by the
    worst manipulation block; only the configured top-K (default five) may run
    adaptive dense manipulation sampling and the complete generic trajectory
-   planner. Adaptive sampling bisects intervals whose contacted Cartesian pose
+   planner. The screening solver budget is tiered too: coarse defaults to four
+   random restarts and 500 iterations, sparse to twelve restarts and 1000
+   iterations, while dense alone inherits the execution's full IK budget.
+   Placement data may lower or raise the two screening budgets, but neither is
+   allowed to exceed the final execution budget. Adaptive sampling bisects
+   intervals whose contacted Cartesian pose
    changes too far; it is only a precheck and never replaces final full-path IK
    and swept collision. If all centered candidates fail final dense validation,
    apply the same funnel to bounded lateral rows at the single best centerline

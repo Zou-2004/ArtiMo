@@ -546,6 +546,50 @@ def discover_contact_points(
         p.disconnect(client)
 
 
+def _tier_ik_budget(
+    ik_config: dict[str, Any],
+    validation_tier: str,
+    *,
+    random_restarts_override: int | None = None,
+    max_iterations_override: int | None = None,
+) -> tuple[int, int]:
+    """Return a bounded IK budget appropriate for one validation tier.
+
+    Search screening must not silently inherit the expensive final-validation
+    budget from execution data.  Overrides are supplied by placement data; the
+    defaults deliberately reserve the full execution budget for dense proof.
+    """
+    if validation_tier not in {"coarse", "sparse", "dense"}:
+        raise ValueError(f"Unknown placement validation tier {validation_tier!r}")
+    final_restarts = int(ik_config.get("random_restarts", 96))
+    final_iterations = int(ik_config.get("max_iterations", 2000))
+    default_restarts = {
+        "coarse": min(final_restarts, 4),
+        "sparse": min(final_restarts, 12),
+        "dense": final_restarts,
+    }[validation_tier]
+    default_iterations = {
+        "coarse": min(final_iterations, 500),
+        "sparse": min(final_iterations, 1000),
+        "dense": final_iterations,
+    }[validation_tier]
+    restarts = (
+        default_restarts
+        if random_restarts_override is None
+        else int(random_restarts_override)
+    )
+    iterations = (
+        default_iterations
+        if max_iterations_override is None
+        else int(max_iterations_override)
+    )
+    if restarts < 0:
+        raise ValueError("IK random restart budget must be nonnegative")
+    if iterations <= 0:
+        raise ValueError("IK iteration budget must be positive")
+    return min(restarts, final_restarts), min(iterations, final_iterations)
+
+
 def _score_candidate(
     simulation_urdf: Path,
     robot_urdf: Path,
@@ -559,6 +603,8 @@ def _score_candidate(
     validation_tier: str = "dense",
     run_full_path_confirmation: bool = True,
     maximum_screening_joint_step_rad: float = 0.5,
+    ik_random_restarts: int | None = None,
+    ik_max_iterations: int | None = None,
 ) -> dict[str, Any]:
     """Return tiered reachability and clearance evidence for one placement.
 
@@ -590,6 +636,12 @@ def _score_candidate(
         eef = robot_links[spec["end_effector_link"]]
         home = np.asarray(spec["home_joint_positions"], dtype=np.float64)
         ik_config = grounded.get("ik", {})
+        tier_random_restarts, tier_max_iterations = _tier_ik_budget(
+            ik_config,
+            validation_tier,
+            random_restarts_override=ik_random_restarts,
+            max_iterations_override=ik_max_iterations,
+        )
 
         stage_reports: list[dict[str, Any]] = []
         feasible = True
@@ -620,8 +672,8 @@ def _score_candidate(
                 robot_body, arm, eef, fingers, opening,
                 {
                     "random_seed": int(grounded["seeds"].get("ik", 0)) + stage_index,
-                    "random_restarts": int(ik_config.get("random_restarts", 96)),
-                    "max_iterations": int(ik_config.get("max_iterations", 2000)),
+                    "random_restarts": tier_random_restarts,
+                    "max_iterations": tier_max_iterations,
                     "position_tolerance_m": float(ik_config.get("position_tolerance_m", 0.001)),
                     "orientation_tolerance_deg": float(ik_config.get("orientation_tolerance_deg", 1.0)),
                     "max_joint_step_rad": float(ik_config.get("max_joint_step_rad", 1.2)),
@@ -887,6 +939,8 @@ def _score_candidate(
                 "samples_solved": solved,
                 "samples_required": required_samples,
                 "validation_tier": validation_tier,
+                "ik_random_restarts": tier_random_restarts,
+                "ik_max_iterations": tier_max_iterations,
                 "maximum_ik_position_error_m": round(worst_error, 6),
                 "maximum_ik_orientation_error_deg": round(
                     math.degrees(worst_orientation_error), 6
@@ -1291,6 +1345,10 @@ def solve(config: dict[str, Any], task: dict[str, Any]) -> dict[str, Any]:
     coarse_samples = int(config.get("coarse_keyframe_samples", 5))
     sparse_samples = int(config.get("sparse_path_samples", 17))
     dense_top_k = int(config.get("dense_top_k", 5))
+    coarse_ik_restarts = int(config.get("coarse_ik_random_restarts", 4))
+    sparse_ik_restarts = int(config.get("sparse_ik_random_restarts", 12))
+    coarse_ik_iterations = int(config.get("coarse_ik_max_iterations", 500))
+    sparse_ik_iterations = int(config.get("sparse_ik_max_iterations", 1000))
     if coarse_samples < 3:
         raise ValueError("coarse_keyframe_samples must be at least 3")
     if sparse_samples <= coarse_samples:
@@ -1301,6 +1359,10 @@ def solve(config: dict[str, Any], task: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("path_samples must be at least sparse_path_samples")
     if dense_top_k <= 0:
         raise ValueError("dense_top_k must be positive")
+    if coarse_ik_restarts < 0 or sparse_ik_restarts < 0:
+        raise ValueError("screening IK restart budgets must be nonnegative")
+    if coarse_ik_iterations <= 0 or sparse_ik_iterations <= 0:
+        raise ValueError("screening IK iteration budgets must be positive")
     allowed_penetration = float(config.get("allowed_body_penetration_m", 0.002))
     # How close an allowed contact link must come to the driven link for the grasp
     # to count as real rather than a near miss.
@@ -1540,6 +1602,8 @@ def solve(config: dict[str, Any], task: dict[str, Any]) -> dict[str, Any]:
                         maximum_grasp_gap,
                         validation_tier="coarse",
                         run_full_path_confirmation=False,
+                        ik_random_restarts=coarse_ik_restarts,
+                        ik_max_iterations=coarse_ik_iterations,
                     )
                 except Exception as exc:
                     attempts.append({
@@ -1606,6 +1670,8 @@ def solve(config: dict[str, Any], task: dict[str, Any]) -> dict[str, Any]:
         tier: str,
         sample_count: int,
         full_path: bool,
+        ik_restarts: int | None = None,
+        ik_iterations: int | None = None,
     ) -> list[dict[str, Any]]:
         passed: list[dict[str, Any]] = []
         for position, record in enumerate(records, start=1):
@@ -1620,6 +1686,8 @@ def solve(config: dict[str, Any], task: dict[str, Any]) -> dict[str, Any]:
                 maximum_grasp_gap,
                 validation_tier=tier,
                 run_full_path_confirmation=full_path,
+                ik_random_restarts=ik_restarts,
+                ik_max_iterations=ik_iterations,
             )
             record["latest_validation_tier"] = tier
             record["stages"] = report["stages"]
@@ -1651,6 +1719,8 @@ def solve(config: dict[str, Any], task: dict[str, Any]) -> dict[str, Any]:
             tier="sparse",
             sample_count=sparse_samples,
             full_path=False,
+            ik_restarts=sparse_ik_restarts,
+            ik_iterations=sparse_ik_iterations,
         )
         dense_shortlist = _dense_shortlist(sparse_survivors, dense_top_k)
         return refine_records(
@@ -1731,6 +1801,10 @@ def solve(config: dict[str, Any], task: dict[str, Any]) -> dict[str, Any]:
             "sparse_path_samples": sparse_samples,
             "adaptive_dense_max_samples": dense_samples,
             "dense_top_k": dense_top_k,
+            "coarse_ik_random_restarts": coarse_ik_restarts,
+            "sparse_ik_random_restarts": sparse_ik_restarts,
+            "coarse_ik_max_iterations": coarse_ik_iterations,
+            "sparse_ik_max_iterations": sparse_ik_iterations,
             "allowed_body_penetration_m": allowed_penetration,
             "maximum_grasp_gap_m": maximum_grasp_gap,
             "candidates_evaluated": len(attempts),
