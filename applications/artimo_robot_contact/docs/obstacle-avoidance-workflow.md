@@ -27,8 +27,11 @@ the direct inter-stage transit clear in the already moved scene.
    inspector, and the four separate immutable views for every grasp-orientation
    candidate. Record `valid` or `invalid` for every candidate; a visually
    invalid roll is hard-excluded before placement, IK ranking, or transit.
-2. Freeze the first feasible centerline placement. Use a lateral placement only
-   when every centered distance fails the full multi-stage path.
+2. In the kinematic shadow world, merge uninterrupted contacts into
+   manipulation blocks and jointly score every visual-valid contact combination
+   at every centered base. Freeze the globally selected common centerline base,
+   not the first block's preferred base. Use a lateral placement only when every
+   centered distance fails the full multi-block path.
 3. Let the planner test the direct released-retreat-to-approach transit. If it
    clears the moved scene, keep it; do not add waypoints.
 4. If the direct transit is blocked, run the cheap geometry proposer once:

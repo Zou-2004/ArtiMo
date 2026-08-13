@@ -22,6 +22,7 @@ def main() -> int:
         Path(request["simulation_urdf"]),
         Path(request["robot_urdf"]),
         {name: float(value) for name, value in request["initial"].items()},
+        request["object_plan"],
         [float(value) for value in request["transit_start"]],
         [float(value) for value in request["transit_end"]],
     )

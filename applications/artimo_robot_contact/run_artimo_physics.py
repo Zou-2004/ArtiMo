@@ -796,9 +796,9 @@ def _validate_contact_sequences(
             )
         if require_release_route and float(
             stage.get("minimum_release_swept_clearance_m", 0.0)
-        ) <= 0.0:
+        ) < 0.0:
             raise ValueError(
-                f"Stage {stage['id']!r} release_before_phase requires positive "
+                f"Stage {stage['id']!r} release_before_phase requires nonnegative "
                 "minimum_release_swept_clearance_m"
             )
 
@@ -1214,6 +1214,19 @@ def _plan_stages(
         plans: list[StagePlan] = []
         reference = home.copy()
         for stage_index, stage in enumerate(execution["stages"]):
+            if object_plan is not None:
+                # Planning happens in a kinematic shadow world.  Project every
+                # authoritative control that precedes this robot control,
+                # including internal mechanisms, passive returns, and earlier
+                # controls in the same phase.  Otherwise a later manipulation
+                # block is scored against the initial asset geometry instead of
+                # the geometry it will actually encounter at runtime.
+                current = _object_joint_state_before_control(
+                    object_plan,
+                    initial,
+                    str(stage["source_phase"]),
+                    int(stage["source_control_index"]),
+                )
             stage_entry_reference = reference.copy()
             continues_from_previous = (
                 stage_index > 0
@@ -3561,28 +3574,54 @@ def _passive_driver_is_enabled(
     )
 
 
+def _object_joint_state_before_control(
+    plan: dict[str, Any],
+    initial: dict[str, float],
+    stop_phase: str,
+    stop_control_index: int,
+) -> dict[str, float]:
+    """Project plan endpoints before one exact timeline control.
+
+    This is the shadow-world state used by whole-task placement.  It includes
+    controls from earlier phases and earlier controls in ``stop_phase``, but it
+    intentionally excludes the nominated control itself.
+    """
+    if stop_control_index < 0:
+        raise ValueError("stop_control_index must be non-negative")
+    state = {str(name): float(value) for name, value in initial.items()}
+    for phase in plan.get("timeline", []):
+        phase_name = str(phase["name"])
+        controls = list(phase.get("controls", []))
+        if phase_name == str(stop_phase):
+            if stop_control_index > len(controls):
+                raise ValueError(
+                    f"Control index {stop_control_index} is outside phase "
+                    f"{stop_phase!r} with {len(controls)} controls"
+                )
+            controls = controls[:stop_control_index]
+            for control in controls:
+                joint = str(control.get("joint", ""))
+                target = artimo_plan.control_target(control)
+                if joint and target is not None:
+                    state[joint] = float(target)
+            return state
+        for control in controls:
+            joint = str(control.get("joint", ""))
+            target = artimo_plan.control_target(control)
+            if joint and target is not None:
+                state[joint] = float(target)
+    raise ValueError(f"Unknown phase {stop_phase!r} in plan timeline")
+
+
 def _object_joint_state_before_phase(
     plan: dict[str, Any],
     initial: dict[str, float],
     stop_before_phase: str,
 ) -> dict[str, float]:
     """Project every authoritative plan endpoint before a timeline boundary."""
-    state = {str(name): float(value) for name, value in initial.items()}
-    found = False
-    for phase in plan.get("timeline", []):
-        if str(phase["name"]) == str(stop_before_phase):
-            found = True
-            break
-        for control in phase.get("controls", []):
-            joint = str(control.get("joint", ""))
-            target = artimo_plan.control_target(control)
-            if joint and target is not None:
-                state[joint] = float(target)
-    if not found:
-        raise ValueError(
-            f"Unknown release boundary phase {stop_before_phase!r} in plan timeline"
-        )
-    return state
+    return _object_joint_state_before_control(
+        plan, initial, stop_before_phase, 0
+    )
 
 
 def _object_joint_transitions_from_phase(

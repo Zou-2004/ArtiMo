@@ -186,6 +186,7 @@ def _evaluate_candidate(
     simulation_urdf: Path,
     robot_urdf: Path,
     initial: dict[str, float],
+    object_plan: dict[str, Any],
     transit_start: list[float],
     transit_end: list[float],
 ) -> dict[str, Any]:
@@ -206,6 +207,7 @@ def _evaluate_candidate(
             candidate_execution,
             initial,
             validate_release_clearance=False,
+            object_plan=object_plan,
         )
     except Exception as exc:
         return {
@@ -284,6 +286,7 @@ def solve(
     ph._require_matching_mechanism(source_urdf, simulation_urdf)
     robot_urdf = ph._resolve(task["inputs"]["robot_urdf"])
     initial = ph.task_initial_joint_values(task)
+    object_plan = ph._read_json(ph._resolve(task["inputs"]["plan"]))
     grounded = ph._ground_execution_scene(
         simulation_urdf, robot_urdf, copy.deepcopy(execution), initial
     )["execution"]
@@ -296,6 +299,7 @@ def solve(
                 simulation_urdf,
                 robot_urdf,
                 initial,
+                object_plan,
                 config["transit_endpoints_world_m"]["start"],
                 config["transit_endpoints_world_m"]["end"],
             )
@@ -322,6 +326,7 @@ def solve(
                             "simulation_urdf": str(simulation_urdf),
                             "robot_urdf": str(robot_urdf),
                             "initial": initial,
+                            "object_plan": object_plan,
                             "transit_start": config["transit_endpoints_world_m"]["start"],
                             "transit_end": config["transit_endpoints_world_m"]["end"],
                         },

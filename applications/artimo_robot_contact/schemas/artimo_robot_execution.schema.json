@@ -220,8 +220,8 @@
           },
           "minimum_release_swept_clearance_m": {
             "type": "number",
-            "exclusiveMinimum": 0,
-            "description": "Required whole-robot separation from every object link while moving through release_retreat_waypoints_world and while the declared passive-return joints sweep to rest."
+            "minimum": 0,
+            "description": "Required whole-robot separation from every object link while moving through release_retreat_waypoints_world and while the declared passive-return joints sweep to rest. Zero means exact non-penetration with no hidden positive margin."
           },
           "forbidden_contact_links": {
             "type": "array",

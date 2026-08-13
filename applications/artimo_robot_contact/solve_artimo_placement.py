@@ -7,11 +7,13 @@ for reach failures. An arm reaching around a moving link or standing inside its
 swept volume produces IK residuals and body-vs-object overlap that are placement
 failures.
 
-The search is asset-agnostic.  It reads the driver joint, its path, and the
-contacted link from the ArtiMo plan and the execution stages, then scores candidate
-(object pose, robot base pose) pairs on whether *every* sample of *every* stage's
-driver path admits a collision-free IK solution.  Nothing here knows an asset name;
-bounds and seeds are inputs and every rejected candidate is reported.
+The search is asset-agnostic.  It merges uninterrupted contacts into
+manipulation blocks, projects the authoritative future object state into a
+kinematic shadow world, and jointly scores candidate base poses plus one
+visual-valid contact choice per independent block.  A candidate is accepted only
+when every sample of every block admits a continuous collision-free solution.
+Nothing here knows an asset name; bounds and seeds are inputs and every rejected
+candidate is reported.
 """
 
 from __future__ import annotations
@@ -131,8 +133,9 @@ def _gated_orientation_options(
 
     Candidate files are immutable evidence from the no-IK render pass.  Only
     their reviewed stage rotations are projected onto the placement template;
-    base position remains a placement variable.  The all-priority-1 choice is
-    evaluated across the complete placement grid before any fallback.
+    base position remains a placement variable.  Priority orders deterministic
+    evaluation and breaks exact geometric ties; it never commits a contact
+    choice before all manipulation blocks have been scored together.
     """
     stages_by_id = {str(stage["id"]): index for index, stage in enumerate(template["stages"])}
     groups = list(gate["placement_candidate_groups"])
@@ -224,6 +227,74 @@ def _tilted_approach(
 def _driver_path(start: float, target: float, samples: int) -> np.ndarray:
     u = np.linspace(0.0, 1.0, samples)
     return start + (target - start) * (3.0 * u * u - 2.0 * u * u * u)
+
+
+def _adaptive_driver_path(
+    start: float,
+    target: float,
+    pose_at_value: Any,
+    *,
+    initial_samples: int = 5,
+    maximum_samples: int = 65,
+    maximum_position_step_m: float = 0.01,
+    maximum_rotation_step_deg: float = 4.0,
+) -> np.ndarray:
+    """Adapt object samples to Cartesian contact-pose curvature.
+
+    Search tiers use fixed sparse fractions.  Only shortlisted candidates call
+    this helper.  It begins with five representative states and recursively
+    bisects a segment when the contacted pose moves too far in translation or
+    rotation.  The final generic trajectory planner still performs its own
+    strict dense IK and swept-collision certification afterward.
+    """
+    initial_samples = max(2, int(initial_samples))
+    maximum_samples = max(initial_samples, int(maximum_samples))
+    rotation_limit = math.radians(float(maximum_rotation_step_deg))
+    fractions = list(np.linspace(0.0, 1.0, initial_samples))
+    pose_cache: dict[float, tuple[np.ndarray, np.ndarray]] = {}
+
+    def value_at(fraction: float) -> float:
+        smooth = 3.0 * fraction * fraction - 2.0 * fraction * fraction * fraction
+        return float(start + (target - start) * smooth)
+
+    def pose(fraction: float) -> tuple[np.ndarray, np.ndarray]:
+        key = round(float(fraction), 15)
+        if key not in pose_cache:
+            position, rotation = pose_at_value(value_at(float(fraction)))
+            pose_cache[key] = (
+                np.asarray(position, dtype=np.float64),
+                np.asarray(rotation, dtype=np.float64),
+            )
+        return pose_cache[key]
+
+    while len(fractions) < maximum_samples:
+        additions: list[float] = []
+        for left, right in zip(fractions[:-1], fractions[1:]):
+            left_position, left_rotation = pose(left)
+            right_position, right_rotation = pose(right)
+            position_step = float(np.linalg.norm(right_position - left_position))
+            dot = float(
+                np.clip(
+                    abs(np.dot(left_rotation, right_rotation))
+                    / max(
+                        np.linalg.norm(left_rotation) * np.linalg.norm(right_rotation),
+                        1e-12,
+                    ),
+                    -1.0,
+                    1.0,
+                )
+            )
+            rotation_step = 2.0 * math.acos(dot)
+            if (
+                position_step > float(maximum_position_step_m)
+                or rotation_step > rotation_limit
+            ):
+                additions.append(0.5 * (left + right))
+        if not additions:
+            break
+        available = maximum_samples - len(fractions)
+        fractions = sorted(set(fractions + additions[:available]))
+    return np.asarray([value_at(fraction) for fraction in fractions], dtype=np.float64)
 
 
 def _contact_facing_base_pose(
@@ -480,16 +551,23 @@ def _score_candidate(
     robot_urdf: Path,
     execution: dict[str, Any],
     initial: dict[str, float],
+    object_plan: dict[str, Any],
     samples: int,
     allowed_penetration_m: float,
     maximum_grasp_gap_m: float = 0.006,
+    *,
+    validation_tier: str = "dense",
+    run_full_path_confirmation: bool = True,
+    maximum_screening_joint_step_rad: float = 0.5,
 ) -> dict[str, Any]:
-    """Return reachability and clearance evidence for one full placement.
+    """Return tiered reachability and clearance evidence for one placement.
 
-    Every stage is swept over its whole driver path.  A candidate only counts as
-    feasible if the arm can hold the contact pose at each sample without any body
-    link other than the nominated contact links overlapping the object.
+    ``coarse`` and ``sparse`` are rejection-only search tiers.  ``dense`` uses
+    adaptive manipulation samples and may run the strict full-path planner.
+    Only that last form can authorize a runnable placement execution.
     """
+    if validation_tier not in {"coarse", "sparse", "dense"}:
+        raise ValueError(f"Unknown placement validation tier {validation_tier!r}")
     grounding = ph._ground_execution_scene(simulation_urdf, robot_urdf, execution, initial)
     grounded = grounding.pop("execution")
     client = p.connect(p.DIRECT)
@@ -518,6 +596,13 @@ def _score_candidate(
         current = dict(initial)
         reference = home.copy()
         for stage_index, stage in enumerate(grounded["stages"]):
+            current = ph._object_joint_state_before_control(
+                object_plan,
+                initial,
+                str(stage["source_phase"]),
+                int(stage["source_control_index"]),
+            )
+            object_state_before = dict(current)
             continues_from_previous = (
                 stage_index > 0
                 and ph._same_contact_sequence(grounded["stages"][stage_index - 1], stage)
@@ -558,13 +643,34 @@ def _score_candidate(
             target = float(
                 stage.get("command_joint_position", stage["target_joint_position"])
             )
-            path = _driver_path(
-                start,
-                target,
-                samples,
-            )
+            if validation_tier == "dense":
+                def pose_at_value(value: float) -> tuple[list[float], list[float]]:
+                    p.resetJointState(
+                        object_body, driver, float(value), physicsClientId=client
+                    )
+                    return ph._target_pose(
+                        object_body,
+                        contact_link,
+                        stage["contact_pose_link"],
+                        float(stage.get("grasp_depth_m", 0.0)),
+                        client,
+                        stage.get("robot_tool_contact_offset_eef_m"),
+                    )
+
+                path = _adaptive_driver_path(
+                    start,
+                    target,
+                    pose_at_value,
+                    maximum_samples=samples,
+                )
+            else:
+                path = _driver_path(start, target, samples)
+            required_samples = int(len(path))
             solved = 0
             worst_error = 0.0
+            worst_orientation_error = 0.0
+            maximum_adjacent_joint_step = 0.0
+            minimum_joint_limit_margin = float("inf")
             deepest = 0.0
             grasp_reach_limit = 0.05
             worst_gap_by_link = {
@@ -598,11 +704,39 @@ def _score_candidate(
                     client,
                     stage.get("robot_tool_contact_offset_eef_m"),
                 )
-                answer = solver.solve(position, rotation, reference, enforce_step=False)
+                if validation_tier == "coarse" or solved == 0:
+                    answer = solver.solve(
+                        position, rotation, reference, enforce_step=False
+                    )
+                else:
+                    answer = solver.solve_continuous(position, rotation, reference)
                 if not answer["success"]:
                     break
+                previous_reference = reference.copy()
                 reference = np.asarray(answer["q"], dtype=np.float64)
                 worst_error = max(worst_error, float(answer["position_error_m"]))
+                worst_orientation_error = max(
+                    worst_orientation_error,
+                    float(answer["orientation_error_rad"]),
+                )
+                maximum_adjacent_joint_step = max(
+                    maximum_adjacent_joint_step,
+                    float(np.max(np.abs(reference - previous_reference))),
+                )
+                minimum_joint_limit_margin = min(
+                    minimum_joint_limit_margin,
+                    float(
+                        answer.get(
+                            "minimum_joint_limit_margin_rad",
+                            np.min(
+                                np.minimum(
+                                    reference - solver.arm_lower,
+                                    solver.arm_upper - reference,
+                                )
+                            ),
+                        )
+                    ),
+                )
                 set_robot_arm(robot_body, arm, reference, client)
                 p.performCollisionDetection(physicsClientId=client)
                 # The gripper must actually reach the driven link.  Without this
@@ -715,7 +849,7 @@ def _score_candidate(
             # target throughout the path. One nearby finger and one finger
             # centimetres away is a miss, even though the EEF IK is perfect.
             grasped = (
-                solved == samples
+                solved == required_samples
                 and required_near_links > 0
                 and near_link_count >= required_near_links
             )
@@ -723,18 +857,51 @@ def _score_candidate(
                 minimum_forbidden_clearance is None
                 or minimum_forbidden_clearance >= required_clearance
             )
+            pose_residual_passed = (
+                worst_error <= 0.004
+                and worst_orientation_error <= math.radians(2.0)
+            )
+            joint_limit_passed = minimum_joint_limit_margin > 1e-4
+            continuity_passed = (
+                validation_tier == "coarse"
+                or maximum_adjacent_joint_step
+                <= float(maximum_screening_joint_step_rad)
+            )
             stage_ok = (
-                solved == samples
+                solved == required_samples
                 and deepest >= -abs(allowed_penetration_m)
                 and grasped
                 and clearance_passed
+                and pose_residual_passed
+                and joint_limit_passed
+                and continuity_passed
             )
             feasible = feasible and stage_ok
             stage_reports.append({
                 "stage_id": stage["id"],
+                "object_state_before": object_state_before,
+                "object_state_after": {
+                    **object_state_before,
+                    str(stage["driver_joint"]): float(target),
+                },
                 "samples_solved": solved,
-                "samples_required": samples,
+                "samples_required": required_samples,
+                "validation_tier": validation_tier,
                 "maximum_ik_position_error_m": round(worst_error, 6),
+                "maximum_ik_orientation_error_deg": round(
+                    math.degrees(worst_orientation_error), 6
+                ),
+                "maximum_adjacent_joint_step_rad": round(
+                    maximum_adjacent_joint_step, 6
+                ),
+                "minimum_joint_limit_margin_rad": (
+                    None
+                    if not math.isfinite(minimum_joint_limit_margin)
+                    else round(minimum_joint_limit_margin, 6)
+                ),
+                "pose_residual_passed": bool(pose_residual_passed),
+                "joint_limit_passed": bool(joint_limit_passed),
+                "continuity_passed": bool(continuity_passed),
                 "deepest_body_penetration_m": round(deepest, 5),
                 "target_link_gap_by_allowed_robot_link_m": {
                     name: round(gap, 5) for name, gap in sorted(normalized_gaps.items())
@@ -773,7 +940,8 @@ def _score_candidate(
         # transit, and the final return home with the appropriate finger width.
         # Run this dense confirmation only for otherwise feasible candidates so
         # placement search remains bounded.
-        if feasible:
+        screening_passed = bool(feasible)
+        if feasible and run_full_path_confirmation:
             try:
                 # World-frame release waypoints are solved only after the robot
                 # base is fixed.  A waypoint produced for an earlier stance is
@@ -790,6 +958,7 @@ def _score_candidate(
                     placement_execution,
                     initial,
                     validate_release_clearance=False,
+                    object_plan=object_plan,
                 )
             except Exception as exc:
                 feasible = False
@@ -841,7 +1010,13 @@ def _score_candidate(
             output_stage.pop("release_retreat_waypoints_world", None)
         return {
             "feasible": bool(feasible),
+            "screening_passed": screening_passed,
+            "validation_tier": validation_tier,
+            "full_path_confirmation_ran": bool(run_full_path_confirmation),
             "stages": stage_reports,
+            "manipulation_blocks": _summarize_manipulation_blocks(
+                grounded["stages"], stage_reports
+            ),
             "grounding": grounding,
             "execution": output_execution,
         }
@@ -849,18 +1024,238 @@ def _score_candidate(
         p.disconnect(client)
 
 
+def _manipulation_block_stage_ids(
+    stages: list[dict[str, Any]],
+) -> list[list[str]]:
+    """Merge adjacent stages that preserve one uninterrupted contact."""
+    blocks: list[list[str]] = []
+    previous: dict[str, Any] | None = None
+    for stage in stages:
+        stage_id = str(stage["id"])
+        if (
+            blocks
+            and previous is not None
+            and stage.get("contact_sequence") is not None
+            and stage.get("contact_sequence")
+            == previous.get("contact_sequence")
+        ):
+            blocks[-1].append(stage_id)
+        else:
+            blocks.append([stage_id])
+        previous = stage
+    return blocks
+
+
+def _summarize_manipulation_blocks(
+    stages: list[dict[str, Any]], stage_reports: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Expose whole-block feasibility and the shadow states used to score it."""
+    reports = {str(item["stage_id"]): item for item in stage_reports}
+    stage_defs = {str(item["id"]): item for item in stages}
+    summaries: list[dict[str, Any]] = []
+    for block_index, stage_ids in enumerate(_manipulation_block_stage_ids(stages)):
+        rows = [reports[stage_id] for stage_id in stage_ids]
+        sequence = stage_defs[stage_ids[0]].get("contact_sequence")
+        summaries.append(
+            {
+                "block_id": f"block_{block_index}",
+                "contact_sequence": sequence,
+                "stage_ids": stage_ids,
+                "object_state_before": rows[0].get("object_state_before", {}),
+                "object_state_after": rows[-1].get("object_state_after", {}),
+                "feasible": all(bool(row.get("feasible")) for row in rows),
+                "minimum_sample_completion_ratio": min(
+                    int(row.get("samples_solved", 0))
+                    / max(int(row.get("samples_required", 1)), 1)
+                    for row in rows
+                ),
+                "target_actually_gripped": all(
+                    bool(row.get("target_actually_gripped")) for row in rows
+                ),
+                "deepest_body_penetration_m": min(
+                    float(row.get("deepest_body_penetration_m", 0.0))
+                    for row in rows
+                ),
+                "maximum_target_link_gap_m": max(
+                    float(row.get("maximum_target_link_gap_m", 1.0))
+                    for row in rows
+                ),
+                "maximum_ik_position_error_m": max(
+                    float(row.get("maximum_ik_position_error_m", 1.0))
+                    for row in rows
+                ),
+            }
+        )
+    return summaries
+
+
 def _candidate_rank(report: dict[str, Any]) -> tuple:
-    """Order candidates so the most complete, least-penetrating one wins."""
-    stages = report["stages"]
-    solved = sum(int(s["samples_solved"]) for s in stages)
-    required = sum(int(s["samples_required"]) for s in stages)
-    deepest = min([float(s["deepest_body_penetration_m"]) for s in stages], default=0.0)
-    error = max([float(s["maximum_ik_position_error_m"]) for s in stages], default=1.0)
-    gap = max([float(s.get("maximum_target_link_gap_m", 1.0)) for s in stages], default=1.0)
-    gripped = all(bool(s.get("target_actually_gripped")) for s in stages)
-    # Gripping the target comes first: a candidate that touches nothing collides
-    # with nothing, and would otherwise rank above one that really does the task.
-    return (-gripped, -(solved == required), -solved / max(required, 1), gap, -deepest, error)
+    """Rank by the worst manipulation block before aggregate quality.
+
+    A base that is excellent for the first block and unusable for a later block
+    must rank below a balanced base.  Visual priority remains only a final
+    tie-break among already visual-valid candidates.
+    """
+    blocks = report.get("manipulation_blocks")
+    if not isinstance(blocks, list) or not blocks:
+        blocks = [
+            {
+                "feasible": bool(stage.get("feasible", False)),
+                "minimum_sample_completion_ratio": int(stage.get("samples_solved", 0))
+                / max(int(stage.get("samples_required", 1)), 1),
+                "target_actually_gripped": bool(stage.get("target_actually_gripped")),
+                "deepest_body_penetration_m": float(
+                    stage.get("deepest_body_penetration_m", 0.0)
+                ),
+                "maximum_target_link_gap_m": float(
+                    stage.get("maximum_target_link_gap_m", 1.0)
+                ),
+                "maximum_ik_position_error_m": float(
+                    stage.get("maximum_ik_position_error_m", 1.0)
+                ),
+            }
+            for stage in report["stages"]
+        ]
+
+    def block_rank(block: dict[str, Any]) -> tuple:
+        return (
+            not bool(block.get("feasible", False)),
+            not bool(block.get("target_actually_gripped", False)),
+            1.0 - float(block.get("minimum_sample_completion_ratio", 0.0)),
+            max(0.0, -float(block.get("deepest_body_penetration_m", 0.0))),
+            float(block.get("maximum_target_link_gap_m", 1.0)),
+            float(block.get("maximum_ik_position_error_m", 1.0)),
+        )
+
+    worst_block = max(
+        (block_rank(block) for block in blocks),
+        default=(True, True, 1.0, 1.0, 1.0, 1.0),
+    )
+    all_blocks_feasible = all(bool(block.get("feasible")) for block in blocks)
+    visual_penalty = sum(
+        max(0, int(priority) - 1)
+        for priority in report.get("orientation_visual_priorities", [])
+    )
+    lateral_cost = abs(float(report.get("contact_facing_lateral_offset_m") or 0.0))
+    return (
+        not all_blocks_feasible,
+        worst_block,
+        lateral_cost,
+        visual_penalty,
+    )
+
+
+def _best_centerline_attempt(
+    attempts: list[dict[str, Any]], candidate_ids: list[str] | None = None
+) -> dict[str, Any] | None:
+    """Return the closest-to-feasible whole-task centerline row.
+
+    Rejected rows without a numerical stage report cannot seed a lateral
+    refinement.  ``min`` is stable, so an exact score tie preserves the
+    declared centerline-distance order.
+    """
+    eligible = [
+        attempt
+        for attempt in attempts
+        if attempt.get("placement_mode") == "contact_facing"
+        and abs(float(attempt.get("contact_facing_lateral_offset_m", 0.0))) <= 1e-12
+        and (
+            candidate_ids is None
+            or list(attempt.get("orientation_candidate_ids", []))
+            == list(candidate_ids)
+        )
+        and isinstance(attempt.get("stages"), list)
+        and attempt["stages"]
+        and attempt.get("contact_facing_distance_m") is not None
+    ]
+    return min(eligible, key=_candidate_rank) if eligible else None
+
+
+def _matches_lateral_refinement_seed(
+    placement_values: tuple[Any, ...], seed: dict[str, Any]
+) -> bool:
+    """Whether a lateral row keeps every non-lateral centerline variable fixed."""
+    oyaw, rz, distance, yaw_offset, _ = placement_values
+    seed_base = seed.get("robot_base_m", [None, None, None])
+    return (
+        math.isclose(float(oyaw), float(seed["object_yaw_deg"]), abs_tol=1e-12)
+        and len(seed_base) == 3
+        and math.isclose(float(rz), float(seed_base[2]), abs_tol=1e-12)
+        and math.isclose(
+            float(distance), float(seed["contact_facing_distance_m"]), abs_tol=1e-12
+        )
+        and math.isclose(
+            float(yaw_offset),
+            float(seed.get("contact_facing_yaw_offset_deg", 0.0)),
+            abs_tol=1e-12,
+        )
+    )
+
+
+def _coarse_survivors(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return only rows that may spend the sparse-IK budget."""
+    return [record for record in records if record.get("coarse_screening_passed")]
+
+
+def _dense_shortlist(
+    sparse_survivors: list[dict[str, Any]], top_k: int
+) -> list[dict[str, Any]]:
+    """Cost-order the bounded set allowed to spend dense planning work."""
+    if int(top_k) <= 0:
+        raise ValueError("dense top-k must be positive")
+    return sorted(sparse_survivors, key=_candidate_rank)[: int(top_k)]
+
+
+def _feasible_region_summary(attempts: list[dict[str, Any]]) -> dict[str, Any]:
+    """Summarize per-block regions and their whole-task intersection."""
+    block_regions: dict[str, set[tuple[float, float, float, float]]] = {}
+    task_region: set[tuple[float, float, float, float]] = set()
+    choices_by_base: dict[
+        tuple[float, float, float, float], set[tuple[str, ...]]
+    ] = {}
+    for attempt in attempts:
+        base = attempt.get("robot_base_m")
+        if not isinstance(base, list) or len(base) != 3:
+            continue
+        key = (
+            round(float(base[0]), 9),
+            round(float(base[1]), 9),
+            round(float(base[2]), 9),
+            round(float(attempt.get("robot_yaw_deg", 0.0)), 9),
+        )
+        for block in attempt.get("manipulation_blocks", []):
+            if bool(block.get("feasible")):
+                block_regions.setdefault(str(block["block_id"]), set()).add(key)
+        if bool(attempt.get("feasible")):
+            task_region.add(key)
+            choices_by_base.setdefault(key, set()).add(
+                tuple(
+                    str(value)
+                    for value in attempt.get("orientation_candidate_ids", [])
+                )
+            )
+
+    def row(key: tuple[float, float, float, float]) -> dict[str, Any]:
+        return {
+            "robot_base_m": list(key[:3]),
+            "robot_yaw_deg": key[3],
+        }
+
+    return {
+        "block_feasible_base_regions": {
+            block_id: [row(key) for key in sorted(keys)]
+            for block_id, keys in sorted(block_regions.items())
+        },
+        "whole_task_feasible_base_region": [
+            {
+                **row(key),
+                "orientation_candidate_combinations": [
+                    list(choice) for choice in sorted(choices_by_base.get(key, set()))
+                ],
+            }
+            for key in sorted(task_region)
+        ],
+    }
 
 
 def solve(config: dict[str, Any], task: dict[str, Any]) -> dict[str, Any]:
@@ -892,7 +1287,20 @@ def solve(config: dict[str, Any], task: dict[str, Any]) -> dict[str, Any]:
     plan = ph._read_json(ph._resolve(inputs["plan"]))
 
     bounds = config["bounds"]
-    samples = int(config.get("path_samples", 13))
+    dense_samples = int(config.get("path_samples", 65))
+    coarse_samples = int(config.get("coarse_keyframe_samples", 5))
+    sparse_samples = int(config.get("sparse_path_samples", 17))
+    dense_top_k = int(config.get("dense_top_k", 5))
+    if coarse_samples < 3:
+        raise ValueError("coarse_keyframe_samples must be at least 3")
+    if sparse_samples <= coarse_samples:
+        raise ValueError(
+            "sparse_path_samples must exceed coarse_keyframe_samples"
+        )
+    if dense_samples < sparse_samples:
+        raise ValueError("path_samples must be at least sparse_path_samples")
+    if dense_top_k <= 0:
+        raise ValueError("dense_top_k must be positive")
     allowed_penetration = float(config.get("allowed_body_penetration_m", 0.002))
     # How close an allowed contact link must come to the driven link for the grasp
     # to count as real rather than a near miss.
@@ -967,16 +1375,17 @@ def solve(config: dict[str, Any], task: dict[str, Any]) -> dict[str, Any]:
     declared_point = list(template["stages"][0]["contact_pose_link"]["translation_m"])
 
     attempts: list[dict[str, Any]] = []
-    best: dict[str, Any] | None = None
     index = -1
     if placement_mode == "contact_facing":
-        placement_count = (
+        centered_placement_count = (
             len(object_yaws)
             * len(robot_z)
             * len(distances)
             * len(yaw_offsets)
-            * len(lateral_offsets)
         )
+        # After the complete centerline batch, lateral refinement is evaluated
+        # only at its single closest-to-feasible row.
+        placement_count = centered_placement_count + max(0, len(lateral_offsets) - 1)
     else:
         placement_count = len(object_yaws) * len(robot_x) * len(robot_y) * len(robot_z) * len(robot_yaws)
     contacts_per_placement = (
@@ -986,10 +1395,11 @@ def solve(config: dict[str, Any], task: dict[str, Any]) -> dict[str, Any]:
     all_discovered: list[dict[str, Any]] = []
     if placement_mode == "contact_facing":
         # Search the physically interpretable centerline first: all declared
-        # normal distances are attempted with zero lateral offset.  Only if none
-        # works do we add the bounded left/right offsets.  This prevents an
-        # arbitrary off-center stance from becoming the default merely because
-        # it happened to appear first in a Cartesian product.
+        # normal distances are attempted with zero lateral offset.  The refined
+        # Cartesian rows remain in deterministic order, but the loop below
+        # evaluates only those sharing the closest-to-feasible centerline row.
+        # This prevents both arbitrary off-center defaults and an unnecessary
+        # distance-by-lateral Cartesian explosion.
         centered = list(
             itertools.product(object_yaws, robot_z, distances, yaw_offsets, [0.0])
         )
@@ -1007,18 +1417,46 @@ def solve(config: dict[str, Any], task: dict[str, Any]) -> dict[str, Any]:
         coarse_placements = list(
             itertools.product(object_yaws, robot_z, robot_x, robot_y, robot_yaws)
         )
-    # Exhaust every permitted placement for the best visual orientation before
-    # invoking IK for a lower-priority roll. This makes fallback lazy at the
-    # only base pose that matters: the one being evaluated by full placement.
+    # Whole-task planning treats base and per-block contact choices jointly.
+    # Every visual-valid combination is scored at the same base before moving
+    # on, so a visually preferred first-block grasp cannot commit the base while
+    # making a later block unreachable.
     ordered_search = (
         (orientation_option, placement_values)
-        for orientation_option in orientation_options
         for placement_values in coarse_placements
+        for orientation_option in orientation_options
     )
+    lateral_refinement_seed: dict[str, Any] | None = None
+    centered_search_feasible: bool | None = None
     for orientation_option, placement_values in ordered_search:
         if placement_mode == "contact_facing":
             oyaw, rz, distance, yaw_offset, lateral_offset = placement_values
             explicit_pose = None
+            if abs(float(lateral_offset)) > 1e-12:
+                if centered_search_feasible is None:
+                    centered_rows = [
+                        attempt
+                        for attempt in attempts
+                        if abs(
+                            float(
+                                attempt.get(
+                                    "contact_facing_lateral_offset_m", 0.0
+                                )
+                            )
+                        )
+                        <= 1e-12
+                        and isinstance(attempt.get("stages"), list)
+                    ]
+                    # Lateral rows receive only the cheap five-keyframe screen
+                    # at this point.  Sparse/dense lateral work remains dormant
+                    # unless the complete centerline funnel later proves that
+                    # no centered candidate is fully feasible.
+                    centered_search_feasible = False
+                    lateral_refinement_seed = _best_centerline_attempt(centered_rows)
+                if lateral_refinement_seed is None or not _matches_lateral_refinement_seed(
+                    placement_values, lateral_refinement_seed
+                ):
+                    continue
         else:
             oyaw, rz, rx, ry, ryaw = placement_values
             distance = None
@@ -1092,8 +1530,16 @@ def solve(config: dict[str, Any], task: dict[str, Any]) -> dict[str, Any]:
                         plan, candidate, require_release_route=False
                     )
                     report = _score_candidate(
-                        simulation_urdf, robot_urdf, candidate, initial, samples,
-                        allowed_penetration, maximum_grasp_gap,
+                        simulation_urdf,
+                        robot_urdf,
+                        candidate,
+                        initial,
+                        plan,
+                        coarse_samples,
+                        allowed_penetration,
+                        maximum_grasp_gap,
+                        validation_tier="coarse",
+                        run_full_path_confirmation=False,
                     )
                 except Exception as exc:
                     attempts.append({
@@ -1102,6 +1548,7 @@ def solve(config: dict[str, Any], task: dict[str, Any]) -> dict[str, Any]:
                         "placement_mode": placement_mode,
                         "contact_facing_distance_m": distance,
                         "contact_facing_lateral_offset_m": lateral_offset,
+                        "contact_facing_yaw_offset_deg": yaw_offset,
                         "approach_tilt_deg": tilt, "approach_spin_deg": spin,
                         "approach_roll_deg": roll,
                         "orientation_candidate_ids": list(
@@ -1119,6 +1566,7 @@ def solve(config: dict[str, Any], task: dict[str, Any]) -> dict[str, Any]:
                     "placement_mode": placement_mode,
                     "contact_facing_distance_m": distance,
                     "contact_facing_lateral_offset_m": lateral_offset,
+                    "contact_facing_yaw_offset_deg": yaw_offset,
                     "contact_frame_world": frame,
                     "approach_tilt_deg": tilt, "approach_spin_deg": spin,
                     "approach_roll_deg": roll,
@@ -1129,12 +1577,18 @@ def solve(config: dict[str, Any], task: dict[str, Any]) -> dict[str, Any]:
                         orientation_option["visual_priorities"]
                     ),
                     "contact_point_link_m": point,
-                    "feasible": report["feasible"], "stages": report["stages"],
+                    # Coarse/sparse passes are rejection filters, never final
+                    # placement acceptance.  Only dense full-path confirmation
+                    # may set this public field true.
+                    "feasible": False,
+                    "coarse_screening_passed": bool(report["screening_passed"]),
+                    "latest_validation_tier": "coarse",
+                    "stages": report["stages"],
+                    "manipulation_blocks": report["manipulation_blocks"],
+                    "_candidate_execution": candidate,
+                    "_grounding": report["grounding"],
                 }
                 attempts.append(record)
-                scored = {**record, "execution": report["execution"], "grounding": report["grounding"]}
-                if best is None or _candidate_rank(scored) < _candidate_rank(best):
-                    best = scored
                 print(
                     f"[{index + 1}/~{total}] obj_yaw={oyaw:3.0f} base=({rx:+.2f},{ry:+.2f},{rz:.2f}) "
                     f"yaw={ryaw:+.0f} "
@@ -1142,19 +1596,107 @@ def solve(config: dict[str, Any], task: dict[str, Any]) -> dict[str, Any]:
                     f"pt={point} -> "
                     f"solved={[s['samples_solved'] for s in report['stages']]} "
                     f"pen={[s['deepest_body_penetration_m'] for s in report['stages']]} "
-                    f"{'FEASIBLE' if report['feasible'] else ''}",
+                    f"{'COARSE_PASS' if report['screening_passed'] else ''}",
                     flush=True,
                 )
-                if report["feasible"] and config.get("stop_on_first_feasible", True):
-                    break
-            if best is not None and best["feasible"] and config.get("stop_on_first_feasible", True):
-                break
-        if best is not None and best["feasible"] and config.get("stop_on_first_feasible", True):
-            break
+
+    def refine_records(
+        records: list[dict[str, Any]],
+        *,
+        tier: str,
+        sample_count: int,
+        full_path: bool,
+    ) -> list[dict[str, Any]]:
+        passed: list[dict[str, Any]] = []
+        for position, record in enumerate(records, start=1):
+            report = _score_candidate(
+                simulation_urdf,
+                robot_urdf,
+                record["_candidate_execution"],
+                initial,
+                plan,
+                sample_count,
+                allowed_penetration,
+                maximum_grasp_gap,
+                validation_tier=tier,
+                run_full_path_confirmation=full_path,
+            )
+            record["latest_validation_tier"] = tier
+            record["stages"] = report["stages"]
+            record["manipulation_blocks"] = report["manipulation_blocks"]
+            record[f"{tier}_screening_passed"] = bool(
+                report["screening_passed"]
+            )
+            if full_path:
+                record["dense_full_path_confirmation_ran"] = True
+                record["feasible"] = bool(report["feasible"])
+                record["_output_execution"] = report["execution"]
+            if report["feasible"]:
+                passed.append(record)
+            print(
+                f"[{tier} {position}/{len(records)}] "
+                f"base={record['robot_base_m']} "
+                f"orientation={'/'.join(record['orientation_candidate_ids'])} "
+                f"solved={[stage['samples_solved'] for stage in report['stages']]} "
+                f"required={[stage['samples_required'] for stage in report['stages']]} "
+                f"{'PASS' if report['feasible'] else 'REJECT'}",
+                flush=True,
+            )
+        return passed
+
+    def run_funnel(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        coarse_survivor_rows = _coarse_survivors(records)
+        sparse_survivors = refine_records(
+            coarse_survivor_rows,
+            tier="sparse",
+            sample_count=sparse_samples,
+            full_path=False,
+        )
+        dense_shortlist = _dense_shortlist(sparse_survivors, dense_top_k)
+        return refine_records(
+            dense_shortlist,
+            tier="dense",
+            sample_count=dense_samples,
+            full_path=True,
+        )
+
+    centerline_records = [
+        record
+        for record in attempts
+        if abs(float(record.get("contact_facing_lateral_offset_m") or 0.0))
+        <= 1e-12
+    ] if placement_mode == "contact_facing" else list(attempts)
+    final_feasible = run_funnel(centerline_records)
+    if placement_mode == "contact_facing" and not final_feasible:
+        lateral_records = [
+            record
+            for record in attempts
+            if abs(float(record.get("contact_facing_lateral_offset_m") or 0.0))
+            > 1e-12
+        ]
+        final_feasible = run_funnel(lateral_records)
+
+    dense_evaluated = [
+        record
+        for record in attempts
+        if record.get("dense_full_path_confirmation_ran")
+    ]
+    ranked_pool = final_feasible or dense_evaluated or attempts
+    best = min(ranked_pool, key=_candidate_rank) if ranked_pool else None
     discovered = all_discovered
+    feasible_regions = _feasible_region_summary(attempts)
 
     if best is None:
         raise RuntimeError("No placement candidate could be evaluated; check bounds and template")
+    best_execution = best.get("_output_execution") if best["feasible"] else None
+    public_attempts = [
+        {
+            key: value
+            for key, value in record.items()
+            if not key.startswith("_")
+        }
+        for record in attempts
+    ]
     return {
         "schema_version": 1,
         "feasible": bool(best["feasible"]),
@@ -1177,20 +1719,36 @@ def solve(config: dict[str, Any], task: dict[str, Any]) -> dict[str, Any]:
             ),
             "contact_point_link_m": best["contact_point_link_m"],
             "stages": best["stages"],
+            "manipulation_blocks": best.get("manipulation_blocks", []),
         },
         # Never emit a runnable execution from a merely "best available"
         # placement.  Every coarse sample and the dense 65-point planner must
         # pass first; otherwise only rejection diagnostics are returned.
-        "execution": best["execution"] if best["feasible"] else None,
+        "execution": best_execution,
         "search": {
             "orientation_gate": orientation_gate,
-            "path_samples": samples,
+            "coarse_keyframe_samples": coarse_samples,
+            "sparse_path_samples": sparse_samples,
+            "adaptive_dense_max_samples": dense_samples,
+            "dense_top_k": dense_top_k,
             "allowed_body_penetration_m": allowed_penetration,
             "maximum_grasp_gap_m": maximum_grasp_gap,
             "candidates_evaluated": len(attempts),
+            "coarse_candidates_passed": sum(
+                bool(record.get("coarse_screening_passed")) for record in attempts
+            ),
+            "sparse_candidates_evaluated": sum(
+                "sparse_screening_passed" in record for record in attempts
+            ),
+            "dense_candidates_evaluated": len(dense_evaluated),
             "discovered_contact_points": discovered,
             "bounds": bounds,
-            "attempts": attempts,
+            "attempts": public_attempts,
+            "lateral_refinement_seed": lateral_refinement_seed,
+            "selection_policy": (
+                "coarse_5_keyframes__sparse_continuous_ik__top_k_adaptive_dense_full_path"
+            ),
+            **feasible_regions,
         },
     }
 

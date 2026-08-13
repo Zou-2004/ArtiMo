@@ -65,6 +65,55 @@ def _plan(with_release: bool = False) -> dict:
 
 
 class PlanContactAuthorityTest(unittest.TestCase):
+    def test_shadow_state_includes_internal_motion_before_later_contact(self) -> None:
+        plan = {
+            "timeline": [
+                {
+                    "name": "open_door",
+                    "controls": [
+                        {"joint": "door", "mode": "joint_position", "q_target_rad": 1.5}
+                    ],
+                },
+                {
+                    "name": "unlatch_tray",
+                    "controls": [
+                        {"joint": "latch", "mode": "joint_position", "q_target_rad": 0.2},
+                        {"joint": "light", "mode": "hold_position"},
+                    ],
+                },
+                {
+                    "name": "pull_tray",
+                    "controls": [
+                        {"joint": "tray", "mode": "joint_position", "q_target_rad": -0.3}
+                    ],
+                },
+            ]
+        }
+        state = physics._object_joint_state_before_control(
+            plan,
+            {"door": 0.0, "latch": 0.0, "tray": 0.0},
+            "pull_tray",
+            0,
+        )
+        self.assertEqual(state, {"door": 1.5, "latch": 0.2, "tray": 0.0})
+
+    def test_shadow_state_respects_control_index_inside_phase(self) -> None:
+        plan = {
+            "timeline": [
+                {
+                    "name": "compound",
+                    "controls": [
+                        {"joint": "a", "mode": "joint_position", "q_target_rad": 1.0},
+                        {"joint": "b", "mode": "joint_position", "q_target_rad": 2.0},
+                    ],
+                }
+            ]
+        }
+        state = physics._object_joint_state_before_control(
+            plan, {"a": 0.0, "b": 0.0}, "compound", 1
+        )
+        self.assertEqual(state, {"a": 1.0, "b": 0.0})
+
     def test_rejects_contact_link_change_without_plan_release(self) -> None:
         stages = [
             _stage("turn", "turn_handle", "handle_joint", "handle", "grasp"),
@@ -86,6 +135,22 @@ class PlanContactAuthorityTest(unittest.TestCase):
             _stage("open", "open_door", "door_joint", "panel", "second"),
         ]
         physics._validate_contact_sequences(stages, _plan(with_release=True), require_release_route=False)
+
+    def test_zero_release_clearance_means_exact_nonpenetration(self) -> None:
+        stage = _stage(
+            "turn", "turn_handle", "handle_joint", "handle", "grasp"
+        )
+        stage["release_before_phase"] = "release_handle"
+        stage["release_retreat_waypoints_world"] = [
+            {
+                "translation_m": [0.1, 0.0, 0.0],
+                "rotation_xyzw": [0.0, 0.0, 0.0, 1.0],
+            }
+        ]
+        stage["minimum_release_swept_clearance_m"] = 0.0
+        physics._validate_contact_sequences(
+            [stage], _plan(with_release=True), require_release_route=True
+        )
 
 
 if __name__ == "__main__":

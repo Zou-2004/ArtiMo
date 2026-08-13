@@ -44,10 +44,15 @@ variables. Keep object orientation and facing construction fixed while
 tuning distance/lateral reach unless the declared contact surface itself was
 wrong. Keep search bounds and rejected candidates in debug evidence.
 
-Use one consolidated candidate batch per variable class. Freeze the selected
-contact point and orientation before placement, freeze the first feasible
-centerline distance, and permit one lateral batch only when all centered
-distances fail. Do not repeatedly invoke the planner for individual candidates,
+Use one consolidated candidate batch per variable class. The visual pass freezes
+only the hard-valid contact set; it does not choose one grasp before placement.
+Merge uninterrupted contacts into manipulation blocks, project every future
+plan state, and jointly score base plus one visual-valid contact candidate per
+block by the worst block. Select a centerline row only after this whole-task
+batch, and permit one lateral batch only when all centered rows fail. When they
+all fail, freeze the single closest-to-feasible whole-task centerline row and
+test the declared symmetric lateral offsets only at that distance; never
+multiply every failed distance by the lateral batch. Do not repeatedly invoke the planner for individual candidates,
 replay the complete object motion merely to score a wrist roll, or cycle back to
 a frozen class after trying later classes. If the bounded batches cannot produce
 a valid path, record the exact failed clearance/IK gate as a generic gap.
@@ -73,9 +78,9 @@ visual-valid or visual-invalid with a reason, then apply the manifest through
 are not low-ranked candidates: the visual pass runs no IK, and invalid rolls are
 absent before placement. IK, target contact geometry, and whole-arm clearance
 may reject only the visual-valid set. Rank that set first by visual semantics
-with unique contiguous priorities. Give the best roll its complete bounded
-placement search and dense path validation. Probe the next priority only when
-every placement for the current choice fails. Do not use a default/template
+with unique contiguous priorities, but use priority only as a deterministic
+tie-break after joint whole-task geometry. Preserve all valid candidates for the
+base-and-block contact combination search. Do not use a default/template
 Panda base plus five sparse driver samples as a preliminary gate. Require
 two-sided target contact for an `open_then_close` grasp; do not require it for a
 `maintain_width` physical push, whose actual contact/dwell is measured
@@ -222,8 +227,10 @@ Read the diagnostics before choosing a repair:
   Declare `release_before_phase` no later than the earliest dependent moving
   phase, run
   `applications/artimo_robot_contact/solve_artimo_release_clearance.py`, copy the chosen world-frame retreat
-  waypoint into `release_retreat_waypoints_world`, and require a positive
-  `minimum_release_swept_clearance_m`. The solver route must replace, not follow,
+  waypoint into `release_retreat_waypoints_world`, and require the declared
+  nonnegative `minimum_release_swept_clearance_m`. A task may declare zero when
+  exact non-penetration is sufficient; no hidden positive margin may override
+  it. The solver route must replace, not follow,
   the default link-relative withdrawal and must start at the release command;
   validate and execute its exact dense joint path rather than an endpoint chord.
   Verify that release, retreat, and the nonzero safe-endpoint settle finish

@@ -78,6 +78,7 @@ def solve(task_path: Path, execution_path: Path) -> dict[str, Any]:
         # Placement fixes the base first; this solver is responsible for
         # replacing any stale world-frame release waypoint from an older base.
         validate_release_clearance=False,
+        object_plan=plan,
     )
     release_indices = [
         index

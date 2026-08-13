@@ -172,9 +172,12 @@ kinematic-free parallel-jaw proxy and must prove that it ran no IK. Visual-
 invalid rolls are removed before placement and never enter an IK call,
 trajectory, transit, or rollout. Give every visual-valid roll a unique
 contiguous visual priority starting at 1. The decision gate itself runs no IK.
-Placement gives the priority-1 roll its complete bounded base search and dense
-path validation first; a lower-priority roll receives its first IK call only
-after every allowed placement for all preceding rolls fails. A sparse
+Placement retains every visual-valid roll for joint whole-task search. It
+combines one candidate per independent manipulation block with each bounded base,
+projects the authoritative future object state before every block, and ranks the
+result by its worst block. Visual priority is only a deterministic tie-break
+after geometric feasibility; it may not commit the first block before later
+blocks are checked. A sparse
 template-base orientation IK pass is not acceptance evidence. `open_then_close` candidates
 also require bilateral contact, while `maintain_width` physical pushes prove
 actual contact/dwell in rollout. One decision covers every consecutive

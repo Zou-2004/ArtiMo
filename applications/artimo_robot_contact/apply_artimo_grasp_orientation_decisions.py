@@ -5,9 +5,10 @@ The renderer emits separate immutable images for every candidate and view.  An
 agent records a decision and visual priority for every roll.  This tool verifies
 that all exact images were reviewed, removes every visual-invalid candidate,
 and records the remaining priority order without running IK.  Full-path IK is
-deferred to placement, where the real robot base is known; placement tries the
-best visual choice completely before considering the next.  Nothing here knows
-an asset or task name.
+deferred to placement, where the real robot base is known; placement jointly
+scores every visual-valid contact choice across all manipulation blocks.  The
+visual priority is only a deterministic tie-break after whole-task geometric
+feasibility.  Nothing here knows an asset or task name.
 """
 from __future__ import annotations
 
@@ -216,7 +217,7 @@ def apply_decisions(
         "visual_priority_candidate_ids": [str(item["id"]) for item in visual_valid],
         "numerically_evaluated_candidate_ids": [],
         "numerical_probe_policy": (
-            "deferred_to_full_placement_at_actual_robot_base"
+            "deferred_to_joint_whole_task_placement_at_actual_robot_bases"
         ),
         "interaction": interaction,
         "bilateral_contact_required": require_bilateral_contact,
@@ -239,7 +240,7 @@ def apply_decisions(
                 "numerically_evaluated_candidate_ids": [],
                 "numerical_probe_policy": (
                     "continuous_contact_inherits_acquisition_orientation_and_arm_"
-                    "reference; full placement validates the complete sequence"
+                    "reference; joint whole-task placement validates the complete sequence"
                 ),
             }
         )

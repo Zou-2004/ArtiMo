@@ -5,8 +5,8 @@ The contact point and approach normal remain fixed.  Each candidate rotates the
 declared contact frame only about its local +Z surface-normal axis, then reuses
 ``visualize_artimo_scene.py`` to show the object and a kinematic-free parallel-
 jaw proxy. This pass and the decision tool never run IK. After visual decisions,
-the placement solver evaluates visual-valid rolls lazily at actual candidate
-robot bases, completing the full placement search for one roll before the next.
+the placement solver retains every visual-valid roll and jointly scores the
+base plus one contact choice per manipulation block.
 """
 from __future__ import annotations
 
@@ -344,8 +344,10 @@ def main() -> int:
             "visual-valid roll a unique contiguous visual_priority starting at 1, "
             "with the single best visual choice ranked first. A visual-invalid roll "
             "is a hard exclusion and cannot enter placement, trajectory, transit, "
-            "or rollout. Full-path placement runs lazily in visual priority order "
-            "at actual candidate robot bases and stops at the first feasible roll. Apply decisions "
+            "or rollout. Full-path placement jointly scores every visual-valid "
+            "contact choice for all manipulation blocks at actual candidate robot "
+            "bases; visual priority is only a deterministic tie-break after "
+            "whole-task geometric feasibility. Apply decisions "
             "only through "
             "applications/artimo_robot_contact/apply_artimo_grasp_orientation_decisions.py."
         ),

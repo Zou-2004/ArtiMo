@@ -44,9 +44,10 @@ These generic helpers exist; use them instead of inventing a private script:
   reviewed image hashes, one `valid`/`invalid` visual decision for every roll,
   and a unique contiguous visual priority for every visual-valid roll. It
   hard-excludes every visual-invalid roll and records their visual-priority
-  order without running IK. The placement solver evaluates each visual-valid
-  roll only at actual candidate Panda bases, completing the full placement
-  search for the best visual roll before trying the next. It includes
+  order without running IK. The placement solver retains every visual-valid
+  roll as a contact candidate and jointly evaluates one choice per manipulation
+  block at actual candidate Panda bases. Visual priority only breaks an exact
+  whole-task geometric tie. It includes
   bilateral-contact checks for `open_then_close` grasps and emits
   the only execution and chained orientation gate allowed to enter placement.
   Use it once per independent grasp acquisition in plan order. One application
@@ -55,7 +56,11 @@ These generic helpers exist; use them instead of inventing a private script:
   placement validate the inherited arm branch over the complete sequence.
 - `applications/artimo_robot_contact/solve_artimo_placement.py` scores bounded object/robot-base,
   wrist-orientation, and contact candidates over every sample of every declared
-  robot stage. In `contact_facing` mode it anchors the stance on the target
+  robot stage. It first merges uninterrupted contact stages into manipulation
+  blocks and projects `plan.json` endpoints into a kinematic shadow world before
+  each block, including internal mechanisms and passive returns between robot
+  contacts. It reports each block's feasible base region and accepts only their
+  whole-task intersection. In `contact_facing` mode it anchors the stance on the target
   contact link's initial collision-AABB center, uses the declared contact frame
   only for the outward direction, fixes yaw toward the link center, searches
   distance on the centerline first, and tries bounded tangent offsets only if
@@ -234,6 +239,11 @@ precontact pose is a shared-harness regression, not a contact/placement variable
    evidence in `justification`. If
    those facts cannot be established from the supplied plan, task semantics,
    and visible mechanism, keep it as robot work or report ambiguous ownership.
+   A `joint_position` control that repeats a joint endpoint already completed by
+   an earlier control, produces no new object displacement, and is followed by
+   a hold is endpoint retention, not a new manipulation. Classify it as `hold`;
+   never release and reacquire merely because the repeated endpoint appears as
+   another timeline control.
    When a plan drives one effect joint to a second endpoint after the control
    returns toward rest — a lid closing once a pedal is released — express that
    as the same rule's `release`, gated on measured driver return. A latched
@@ -318,9 +328,22 @@ precontact pose is a shared-harness regression, not a contact/placement variable
    The render report must state `visual_render_ik_was_run: false` and contain no
    numerical summaries. Run
    `applications/artimo_robot_contact/apply_artimo_grasp_orientation_decisions.py`; that step runs no IK and
-   passes only the visual-valid priority list to placement. Placement evaluates
-   the complete bounded base search and dense path for priority 1. Only if no
-   placement is feasible may it invoke IK for priority 2, and so on. Never use
+   passes only the visual-valid priority list to placement. Placement retains
+   every visual-valid candidate, forms the joint candidate combinations across
+   independent manipulation blocks, and evaluates each bounded base against the
+   complete task. It selects by the worst block first; visual priority is only a
+   deterministic tie-break. Placement is coarse-to-fine. Evaluate every
+   base/contact combination first at five representative manipulation states
+   (start, quarter, midpoint, three-quarter, endpoint). Only those that pass
+   pose residual, joint-limit, grasp-geometry, and collision gates receive a
+   17-sample continuous-IK pass with joint-step checks. Rank survivors by the
+   worst manipulation block; only the configured top-K (default five) may run
+   adaptive dense manipulation sampling and the complete generic trajectory
+   planner. Adaptive sampling bisects intervals whose contacted Cartesian pose
+   changes too far; it is only a precheck and never replaces final full-path IK
+   and swept collision. If all centered candidates fail final dense validation,
+   apply the same funnel to bounded lateral rows at the single best centerline
+   distance. Never use
    the template/default Panda base plus a sparse five-point IK probe as an
    orientation gate: placement has not fixed that base, and its later dense
    path would duplicate the calculation. Bilateral contact is additionally
@@ -405,16 +428,32 @@ precontact pose is a shared-harness regression, not a contact/placement variable
    support. Increasing mechanism or spring force is not a clearance repair.
    Once the contact surface is validated, write bounded placement-search data
    and run `applications/artimo_robot_contact/solve_artimo_placement.py`. Start with `contact_facing` mode.
+   Before evaluating a base, merge adjacent stages sharing one uninterrupted
+   `contact_sequence` into one manipulation block. Project all authoritative
+   plan controls before each block into a kinematic shadow world, so a later
+   tray/button/contact is evaluated with every earlier door, lid, latch,
+   internal mechanism, and passive return at its planned state. Keep every
+   visual-valid contact candidate for each independent block. Search the joint
+   tuple `(base, block_0_contact, ..., block_N_contact)` and rank it by its worst
+   block; never freeze the first block's grasp or base independently. The
+   placement report records `manipulation_blocks`,
+   `block_feasible_base_regions`, and `whole_task_feasible_base_region` so an
+   empty fixed-base intersection is an explicit measured result.
    Ground the object once and keep its orientation fixed for a placement trial.
    Use the selected contact link's initial collision-AABB center as the stance
    anchor and the contact frame's local +Z only as its outward direction. The
    robot starts on that centerline, its yaw always faces the link center, and
    the first search varies only `contact_facing_distance_m` (plus pedestal
-   height when required). Fix the first distance that makes the complete
-   manipulation path feasible; only if every centered distance fails may the
-   search try bounded `contact_facing_lateral_offset_m` values. A lateral
-   refinement moves along the surface tangent but still faces the same link
-   center. Never independently sweep base x/y/yaw or repeatedly rotate the
+   height when required). Evaluate the full common feasible-base region for all
+   blocks and choose its best whole-task row; only if every centered distance fails may the
+   search try bounded `contact_facing_lateral_offset_m` values. Rank the complete
+   failed centerline rows with the same target-grasp, IK-completeness, collision,
+   and residual score used for placement; freeze the single closest-to-feasible
+   centerline row, and run the one symmetric lateral batch only at that row's
+   distance and other non-lateral coordinates. Do not form a Cartesian product
+   of every failed distance with every lateral offset. A lateral refinement
+   moves along the surface tangent but still faces the same link center. Never
+   independently sweep base x/y/yaw or repeatedly rotate the
    object to repair reachability. All prior plan endpoints remain applied, and
    home-to-approach, approach, all 65 manipulation samples, and the applicable
    retreat path must clear every moving object link for the complete robot and
