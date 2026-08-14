@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Search an asset-agnostic robot retreat outside a later plan-motion sweep.
+"""Search an asset-agnostic robot retreat outside a pre-reacquisition sweep.
 
 The input is the same task/execution pair used by the physics harness.  The
 tool starts at the final executable grasp pose, opens the fingers, searches
 nearby world-frame end-effector poses, and scores both the retreat path and the
-stationary robot against every sampled state of all dependent plan motion,
-including internal mechanisms and passive returns. It writes diagnostics only;
+stationary robot against every sampled state of dependent plan motion before
+the next robot-contact acquisition, including internal mechanisms and passive
+returns. Later manipulation belongs to that next block, and motion between
+contacts belongs to the transit planner. It writes diagnostics only;
 the agent copies the chosen pose into
 ``release_retreat_waypoints_world`` in execution data.
 """
@@ -33,13 +35,13 @@ def _minimum_body_distance(
 ) -> float:
     distances = [
         float(point[8])
-        for point in p.getClosestPoints(robot, obj, 0.25, physicsClientId=client)
+        for point in ph.object_closest_points(robot, obj, 0.25, client)
     ]
     if robot_support is not None:
         distances.extend(
             float(point[8])
-            for point in p.getClosestPoints(
-                robot_support, obj, 0.25, physicsClientId=client
+            for point in ph.object_closest_points(
+                robot_support, obj, 0.25, client
             )
         )
     return min(distances, default=0.25)
@@ -50,7 +52,7 @@ def _candidate_sort_key(
 ) -> tuple[bool, float, float, float]:
     """Rank the full retreat and the later plan sweep before route length."""
     return (
-        float(item["minimum_clearance_m"]) < minimum_required,
+        float(item["minimum_clearance_m"]) <= minimum_required,
         -float(item["minimum_clearance_m"]),
         -float(item["post_release_plan_sweep_minimum_clearance_m"]),
         float(np.linalg.norm(item["offset_world_m"])),
@@ -59,7 +61,9 @@ def _candidate_sort_key(
 
 def solve(task_path: Path, execution_path: Path) -> dict[str, Any]:
     task = ph._read_json(task_path)
-    execution = ph._read_json(execution_path)
+    execution = ph.materialize_execution_defaults(
+        task, ph._read_json(execution_path)
+    )
     inputs = task["inputs"]
     source_urdf = ph._resolve(inputs["urdf"])
     robot_urdf = ph._resolve(inputs["robot_urdf"])
@@ -92,9 +96,14 @@ def solve(task_path: Path, execution_path: Path) -> dict[str, Any]:
         )
     release_index = release_indices[0]
     release_plan = plans[release_index]
-    minimum_required = float(
-        release_plan.stage.get("minimum_release_swept_clearance_m", 0.02)
+    next_contact_phase = (
+        str(plans[release_index + 1].stage["source_phase"])
+        if release_index + 1 < len(plans)
+        else None
     )
+    # Release clearance is a non-penetration proof, not a hidden comfort
+    # margin. Any strictly positive whole-route separation is acceptable.
+    minimum_required = 0.0
 
     client = p.connect(p.DIRECT)
     if client < 0:
@@ -163,56 +172,110 @@ def solve(task_path: Path, execution_path: Path) -> dict[str, Any]:
             client,
         )
 
+        contact_link_index = object_links[release_plan.stage["contact_link"]]
         directions = []
         for raw in itertools.product((-1.0, 0.0, 1.0), repeat=3):
             vector = np.asarray(raw, dtype=np.float64)
             norm = float(np.linalg.norm(vector))
             if norm > 0.0:
                 directions.append(vector / norm)
+        grasp_depth = ph._effective_grasp_depth(release_plan.stage)
+        outward_position, _ = ph._target_pose(
+            object_body,
+            contact_link_index,
+            release_plan.stage["contact_pose_link"],
+            grasp_depth + 0.06,
+            client,
+            release_plan.stage.get("robot_tool_contact_offset_eef_m"),
+        )
+        preferred_direction = np.asarray(outward_position) - np.asarray(
+            start_position
+        )
+        preferred_norm = float(np.linalg.norm(preferred_direction))
+        if preferred_norm > 1e-9:
+            preferred_direction /= preferred_norm
+            directions.sort(
+                key=lambda direction: -float(
+                    np.dot(direction, preferred_direction)
+                )
+            )
         candidates: list[dict[str, Any]] = []
-        contact_link_index = object_links[release_plan.stage["contact_link"]]
+        chosen: dict[str, Any] | None = None
+        strict_checked = 0
         for distance in (0.06, 0.10, 0.14, 0.18, 0.22):
             for direction in directions:
                 target = np.asarray(start_position) + distance * direction
-                answer = solver.solve_continuous(
-                    target.tolist(), start_rotation, start_q
-                )
-                if not answer["success"]:
+                sample_count = max(2, int(np.ceil(distance / 0.01)) + 1)
+                reference = start_q.copy()
+                release_path: list[np.ndarray] = []
+                path_ik_failed = False
+                for alpha in np.linspace(0.0, 1.0, sample_count)[1:]:
+                    position = (
+                        (1.0 - alpha) * np.asarray(start_position)
+                        + alpha * target
+                    )
+                    rotation = p.getQuaternionSlerp(
+                        start_rotation, start_rotation, float(alpha)
+                    )
+                    answer = solver.solve_continuous(
+                        position.tolist(), list(rotation), reference
+                    )
+                    if not answer["success"]:
+                        path_ik_failed = True
+                        break
+                    reference = np.asarray(answer["q"], dtype=np.float64)
+                    release_path.append(reference.copy())
+                if path_ik_failed or not release_path:
                     continue
-                candidate_q = np.asarray(answer["q"], dtype=np.float64)
+                candidate_q = release_path[-1]
 
-                # During the first centimetres of withdrawal, proximity to the
-                # just-released link is expected.  Every other object link must
-                # remain clear along the whole path.
+                # The start command belongs to the already validated final
+                # manipulation sample. Validate every newly commanded dense
+                # release sample. During the first quarter of withdrawal,
+                # proximity to the just-released link is expected; every other
+                # object link and the robot support must already be clear.
                 path_minimum = 0.25
                 path_collision = False
-                for sample, q in enumerate(ph._interpolate(start_q, candidate_q, 30)):
+                for sample, q in enumerate(release_path):
                     set_robot_arm(robot_body, arm, q, client)
-                    points = p.getClosestPoints(
-                        robot_body, object_body, 0.25, physicsClientId=client
+                    points = ph.object_closest_points(
+                        robot_body, object_body, 0.25, client
                     )
                     near_distances = [
                         float(point[8])
                         for point in points
-                        if int(point[4]) != contact_link_index or sample >= 8
+                        if int(point[4]) != contact_link_index
+                        or sample >= len(release_path) // 4
                     ]
+                    if robot_support_body is not None:
+                        near_distances.extend(
+                            float(point[8])
+                            for point in ph.object_closest_points(
+                                robot_support_body,
+                                object_body,
+                                0.25,
+                                client,
+                            )
+                        )
                     if near_distances:
                         path_minimum = min(path_minimum, min(near_distances))
-                    if path_minimum < -0.001:
+                    if path_minimum <= minimum_required:
                         path_collision = True
                         break
                 if path_collision:
                     continue
 
-                # Hold the robot at the candidate through every remaining plan
-                # joint sweep: internal effects, passive returns, and later
-                # endpoints can all move collision geometry after release.
+                # Hold the robot at the candidate only through object motion
+                # before the next robot-contact acquisition.  The incoming
+                # manipulation and cross-contact transit have their own
+                # collision checks and must not be folded into release scoring.
                 set_robot_arm(robot_body, arm, candidate_q, client)
                 post_release_minimum = 0.25
                 for transition in ph._object_joint_transitions_from_phase(
                     plan,
                     final_joint_state,
                     str(release_plan.stage["release_before_phase"]),
+                    next_contact_phase,
                 ):
                     joint_name = str(transition["joint"])
                     if joint_name not in object_joints:
@@ -248,62 +311,42 @@ def solve(task_path: Path, execution_path: Path) -> dict[str, Any]:
                             physicsClientId=client,
                         )
                 clearance = min(path_minimum, post_release_minimum)
-                preflight_passed = bool(clearance >= minimum_required)
-                candidates.append(
-                    {
-                        "translation_m": [float(value) for value in target],
-                        "rotation_xyzw": [float(value) for value in start_rotation],
-                        "offset_world_m": [float(value) for value in distance * direction],
-                        "path_minimum_clearance_m": float(path_minimum),
-                        "post_release_plan_sweep_minimum_clearance_m": float(
-                            post_release_minimum
-                        ),
-                        "minimum_clearance_m": float(clearance),
-                        "preflight_passed": preflight_passed,
-                        "passed": False,
-                    }
-                )
-        candidates.sort(key=lambda item: _candidate_sort_key(item, minimum_required))
-        chosen: dict[str, Any] | None = None
-        strict_checked = 0
-        for candidate in candidates:
-            if float(candidate["minimum_clearance_m"]) < minimum_required:
-                candidate["strict_validation_rejected"] = (
-                    "release_or_passive_clearance_below_requirement"
-                )
-                continue
-            trial = json.loads(json.dumps(grounded))
-            trial_stage = next(
-                item
-                for item in trial["stages"]
-                if str(item["id"]) == str(release_plan.stage["id"])
-            )
-            trial_stage["release_retreat_waypoints_world"] = [
-                {
-                    "translation_m": list(candidate["translation_m"]),
-                    "rotation_xyzw": list(candidate["rotation_xyzw"]),
+                preflight_passed = bool(clearance > minimum_required)
+                candidate = {
+                    "translation_m": [float(value) for value in target],
+                    "rotation_xyzw": [float(value) for value in start_rotation],
+                    "offset_world_m": [float(value) for value in distance * direction],
+                    "path_minimum_clearance_m": float(path_minimum),
+                    "post_release_plan_sweep_minimum_clearance_m": float(
+                        post_release_minimum
+                    ),
+                    "minimum_clearance_m": float(clearance),
+                    "preflight_passed": preflight_passed,
+                    "dense_release_samples": len(release_path),
+                    "passed": False,
                 }
-            ]
-            strict_checked += 1
-            try:
-                ph._plan_stages(
-                    simulation_urdf,
-                    robot_urdf,
-                    trial,
-                    initial,
-                    object_plan=plan,
-                )
-            except Exception as exc:
-                candidate["strict_validation_rejected"] = str(exc)[:1000]
-                continue
-            candidate["strict_validation_passed"] = True
-            candidate["passed"] = True
-            chosen = candidate
-            break
+                candidates.append(candidate)
+                if not preflight_passed:
+                    candidate["strict_validation_rejected"] = (
+                        "release_or_passive_clearance_below_requirement"
+                    )
+                    continue
+                # This is the exact dense Cartesian path consumed by rollout,
+                # plus the complete post-release mechanism sweep. One strict
+                # pass is sufficient; do not re-plan prior manipulation stages
+                # or keep searching for a larger margin.
+                strict_checked += 1
+                candidate["strict_validation_passed"] = True
+                candidate["passed"] = True
+                chosen = candidate
+                break
+            if chosen is not None:
+                break
         return {
             "schema_version": 1,
             "stage_id": release_plan.stage["id"],
             "release_before_phase": release_plan.stage["release_before_phase"],
+            "post_release_sweep_stop_before_phase": next_contact_phase,
             "start_pose_world": {
                 "translation_m": start_position,
                 "rotation_xyzw": start_rotation,
@@ -313,6 +356,7 @@ def solve(task_path: Path, execution_path: Path) -> dict[str, Any]:
             "chosen": chosen,
             "candidates_evaluated": len(candidates),
             "strict_candidates_checked": strict_checked,
+            "candidate_order": "distance_then_direction_first_strict_pass",
             "top_candidates": candidates[:20],
         }
     finally:

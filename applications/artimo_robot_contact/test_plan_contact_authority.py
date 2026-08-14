@@ -119,7 +119,7 @@ class PlanContactAuthorityTest(unittest.TestCase):
             _stage("turn", "turn_handle", "handle_joint", "handle", "grasp"),
             _stage("open", "open_door", "door_joint", "panel", None),
         ]
-        with self.assertRaisesRegex(ValueError, "no control_release.*same contact_link"):
+        with self.assertRaisesRegex(ValueError, "requires release and retreat"):
             physics._validate_contact_sequences(stages, _plan(), require_release_route=False)
 
     def test_accepts_continued_handle_grasp_across_changed_driver_joint(self) -> None:
@@ -134,9 +134,10 @@ class PlanContactAuthorityTest(unittest.TestCase):
             _stage("turn", "turn_handle", "handle_joint", "handle", "first"),
             _stage("open", "open_door", "door_joint", "panel", "second"),
         ]
+        stages[0]["release_before_phase"] = "release_handle"
         physics._validate_contact_sequences(stages, _plan(with_release=True), require_release_route=False)
 
-    def test_zero_release_clearance_means_exact_nonpenetration(self) -> None:
+    def test_release_clearance_certificate_must_be_strictly_positive(self) -> None:
         stage = _stage(
             "turn", "turn_handle", "handle_joint", "handle", "grasp"
         )
@@ -148,6 +149,11 @@ class PlanContactAuthorityTest(unittest.TestCase):
             }
         ]
         stage["minimum_release_swept_clearance_m"] = 0.0
+        with self.assertRaisesRegex(ValueError, "strictly positive measured"):
+            physics._validate_contact_sequences(
+                [stage], _plan(with_release=True), require_release_route=True
+            )
+        stage["minimum_release_swept_clearance_m"] = 1e-9
         physics._validate_contact_sequences(
             [stage], _plan(with_release=True), require_release_route=True
         )

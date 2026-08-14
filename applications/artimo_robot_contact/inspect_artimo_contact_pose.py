@@ -21,6 +21,8 @@ import numpy as np
 import pybullet as p
 from PIL import Image, ImageDraw, ImageFont
 
+import run_artimo_physics as ph
+
 
 APP_ROOT = Path(__file__).resolve().parent
 REPO_ROOT = APP_ROOT.parents[1]
@@ -182,8 +184,11 @@ def _render_view(
 
 
 def inspect(args: argparse.Namespace) -> dict[str, Any]:
-    urdf = _resolve(args.urdf)
-    trajectory = _resolve(args.trajectory) if args.trajectory else None
+    task = ph._read_json(_resolve(args.task_spec))
+    source_urdf = ph._resolve(task["inputs"]["urdf"])
+    urdf = ph.resolve_simulation_urdf(task, {}, source_urdf)
+    trajectory_value = task["inputs"].get("trajectory")
+    trajectory = ph._resolve(trajectory_value) if trajectory_value else None
     out = args.out.expanduser().resolve()
     out.mkdir(parents=True, exist_ok=True)
     client = p.connect(p.DIRECT)
@@ -228,7 +233,14 @@ def inspect(args: argparse.Namespace) -> dict[str, Any]:
         target_link = links[args.contact_link]
         link_position, link_rotation = _link_pose(body, target_link, client)
         local_point = [float(value) for value in args.point_link_m]
-        local_rotation = _quat([float(value) for value in args.rotation_link_xyzw])
+        local_rotation, contact_frame = ph._canonical_contact_rotation_xyzw(
+            task,
+            {
+                "contact_link": args.contact_link,
+                "contact_pose_link": {"translation_m": local_point},
+            },
+            0.0,
+        )
         world_point, world_rotation = p.multiplyTransforms(
             link_position,
             link_rotation,
@@ -237,10 +249,13 @@ def inspect(args: argparse.Namespace) -> dict[str, Any]:
             physicsClientId=client,
         )
         outward_world = list(p.rotateVector(world_rotation, [0.0, 0.0, 1.0]))
-        grasp_depth = float(args.grasp_depth_m)
+        grasp_depth_adjustment = float(args.grasp_depth_m)
+        grasp_depth = (
+            ph.PANDA_CENTERED_GRASP_BASELINE_M + grasp_depth_adjustment
+        )
         precontact_offset = float(args.precontact_offset_m)
-        if grasp_depth < 0.0 or precontact_offset < 0.0:
-            raise ValueError("grasp depth and precontact offset must be non-negative")
+        if precontact_offset < 0.0:
+            raise ValueError("precontact offset must be non-negative")
         grasp_target_world = [
             world_point[axis] + outward_world[axis] * grasp_depth
             for axis in range(3)
@@ -302,7 +317,7 @@ def inspect(args: argparse.Namespace) -> dict[str, Any]:
         if target is not None:
             _marker(target["closest_surface_point_world_m"], 0.006, [0.1, 0.45, 1.0, 1.0], client)
         _marker(grasp_target_world, 0.006, [0.05, 0.85, 0.9, 1.0], client)
-        sample_limit = max(0.08, grasp_depth + precontact_offset)
+        sample_limit = max(0.08, max(0.0, grasp_depth) + precontact_offset)
         for distance in np.linspace(0.02, sample_limit, 4):
             position = [
                 world_point[axis] + outward_world[axis] * float(distance)
@@ -332,12 +347,19 @@ def inspect(args: argparse.Namespace) -> dict[str, Any]:
             "contact_link": args.contact_link,
             "declared_point_link_m": local_point,
             "declared_rotation_link_xyzw": local_rotation,
+            "contact_frame_source": contact_frame["source"],
+            "contact_frame_surface_normal_link": contact_frame["surface_normal_link"],
+            "contact_frame_principal_tangent_link": contact_frame[
+                "principal_tangent_link"
+            ],
             "point_world_m": list(world_point),
             "surface_outward_axis_link": [0.0, 0.0, 1.0],
             "surface_outward_axis_world": outward_world,
             "panda_grasptarget_forward_world": [-value for value in outward_world],
             "robot_approach_direction_world": [-value for value in outward_world],
-            "grasp_depth_m": grasp_depth,
+            "grasp_depth_m": grasp_depth_adjustment,
+            "effective_robot_contact_offset_m": grasp_depth,
+            "centered_grasp_zero_baseline_m": ph.PANDA_CENTERED_GRASP_BASELINE_M,
             "precontact_offset_m": precontact_offset,
             "grasp_target_world_m": grasp_target_world,
             "precontact_world_m": precontact_world,
@@ -376,12 +398,15 @@ def inspect(args: argparse.Namespace) -> dict[str, Any]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--urdf", type=Path, required=True)
-    parser.add_argument("--trajectory", type=Path)
+    parser.add_argument("--task-spec", type=Path, required=True)
     parser.add_argument("--contact-link", required=True)
     parser.add_argument("--point-link-m", type=float, nargs=3, required=True)
-    parser.add_argument("--rotation-link-xyzw", type=float, nargs=4, default=[0.0, 0.0, 0.0, 1.0])
-    parser.add_argument("--grasp-depth-m", type=float, default=0.0)
+    parser.add_argument(
+        "--grasp-depth-m",
+        type=float,
+        default=0.0,
+        help="Signed adjustment around Panda's -0.015 m centered-grasp baseline.",
+    )
     parser.add_argument("--precontact-offset-m", type=float, default=0.08)
     parser.add_argument("--object-base-translation-m", type=float, nargs=3, default=[0.0, 0.0, 0.0])
     parser.add_argument("--object-base-rotation-xyzw", type=float, nargs=4, default=[0.0, 0.0, 0.0, 1.0])

@@ -34,6 +34,14 @@ the direct inter-stage transit clear in the already moved scene.
    centered distance fails the full multi-block path.
 3. Let the planner test the direct released-retreat-to-approach transit. If it
    clears the moved scene, keep it; do not add waypoints.
+   If direct interpolation and the configured MotionGen/Bullet planner fail, inspect
+   the exact collision pair. When every clearance failure is confined to
+   `transit_in` and its object link belongs to the subtree of a joint completed
+   by an earlier plan-owned stage, classify it as
+   `prior_plan_moved_link_blocks_transit`. Preserve the selected dense candidate
+   solely as route-solver input instead of discarding it. Approach,
+   manipulation, release, static-body, and continuous-contact collisions are
+   not eligible for this recovery.
 4. If the direct transit is blocked, run the cheap geometry proposer once:
 
    ```bash
@@ -63,14 +71,14 @@ the direct inter-stage transit clear in the already moved scene.
      --out ROUTE_SOLVE --jobs 4
    ```
 
-   Every candidate receives an immutable execution copy in an isolated
-   PyBullet process. The solver checks waypoint IK, joint limits, approach and
-   manipulation, the whole scheduled transit, and every prior object endpoint.
-   Straight joint interpolation is tried first for each waypoint segment. If an
-   elbow or wrist still crosses the obstacle, deterministic joint-space
-   RRT-Connect supplies a collision-free segment with bounded adjacent steps.
-   The exact resulting joint path is stored as `StagePlan.transit_in` and later
-   consumed byte-identically by the rollout scheduler.
+   The solver checks waypoint IK, joint limits, approach and manipulation, the
+   whole scheduled transit, and every prior object endpoint. Straight joint
+   interpolation is tried first for each waypoint segment. With cuRobo selected,
+   one persistent GPU worker supplies collision-aware MotionGen graph/trajectory
+   paths with bounded adjacent steps; `--jobs` is intentionally not used to
+   multiply CUDA workers. PyBullet verifies exact link clearance. In Bullet mode
+   (or explicit fallback), deterministic CPU RRT-Connect supplies the segment.
+   The accepted path is stored as `StagePlan.transit_in` and consumed by rollout.
 7. Accept only `ROUTE_SOLVE/execution.json` when `transit.json` reports a chosen
    feasible route. The rank is maximum whole-robot clearance, then minimum EEF
    polyline length, then stable candidate id. Re-run scene visualization on the
@@ -92,6 +100,6 @@ only after evidence capture.
 
 If every emitted route fails, retain all candidate reports and name the exact
 gate: unreachable waypoint, joint-limit branch, forbidden-link penetration, or
-RRT exhaustion. Repair only the earlier allowed execution-data class. Do not
+MotionGen failure/status, or applicable CPU-RRT exhaustion. Repair only the earlier allowed execution-data class. Do not
 add an asset-specific route, disable collisions, enlarge the allowed contact
 set, or repeatedly invent unbounded waypoint coordinates.

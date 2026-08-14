@@ -48,9 +48,10 @@ def apply_decisions(
         raise ValueError("Orientation report must use schema_version 4")
     if report.get("visual_render_ik_was_run") is not False:
         raise ValueError("Visual orientation report must prove that IK was not run")
-    if int(decisions.get("schema_version", 0)) != 2:
+    if int(decisions.get("schema_version", 0)) != 4:
         raise ValueError(
-            "Visual decisions must use schema_version 2 with visual_priority; "
+            "Visual decisions must use schema_version 4 with angle-only "
+            "classification; "
             "rerender legacy orientation reports"
         )
     if decisions.get("report_sha256") != _sha256(report_path):
@@ -87,6 +88,7 @@ def apply_decisions(
         )
     if not isinstance(rows, list):
         raise ValueError("Visual decisions decisions[] is required")
+    interaction = str(report.get("interaction", "explicit_ideal_feasibility"))
     by_id = {str(item.get("id")): item for item in candidates}
     decision_by_id: dict[str, dict[str, Any]] = {}
     for row in rows:
@@ -106,16 +108,30 @@ def apply_decisions(
         if not isinstance(reason, str) or len(reason.strip()) < 8:
             raise ValueError(f"{candidate_id}.reason must explain the visual decision")
         priority = row.get("visual_priority")
+        angle_status = row.get("angle_status")
+        if angle_status not in {"valid", "invalid"}:
+            raise ValueError(
+                f"{candidate_id}.angle_status must be 'valid' or 'invalid'"
+            )
         if status == "valid":
+            if angle_status != "valid":
+                raise ValueError(
+                    f"{candidate_id} cannot be visual-valid when angle_status is invalid"
+                )
             if isinstance(priority, bool) or not isinstance(priority, int) or priority < 1:
                 raise ValueError(
                     f"{candidate_id}.visual_priority must be a positive integer "
                     "for every visual-valid roll"
                 )
-        elif priority is not None:
-            raise ValueError(
-                f"{candidate_id}.visual_priority must be null for a visual-invalid roll"
-            )
+        else:
+            if priority is not None:
+                raise ValueError(
+                    f"{candidate_id}.visual_priority must be null for a visual-invalid roll"
+                )
+            if angle_status == "valid":
+                raise ValueError(
+                    f"{candidate_id}.visual_status and angle_status must agree"
+                )
         expected_images = by_id[candidate_id].get("orientation_images")
         if not isinstance(expected_images, dict) or len(expected_images) != 4:
             raise ValueError(f"{candidate_id} does not declare four separate views")
@@ -161,7 +177,6 @@ def apply_decisions(
     output = output.expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
     chosen = visual_valid[0]
-    interaction = str(report.get("interaction", "explicit_ideal_feasibility"))
     require_bilateral_contact = interaction == "explicit_ideal_feasibility"
     for candidate in visual_valid:
         candidate_execution = Path(candidate["execution"]).expanduser().resolve()
@@ -221,6 +236,14 @@ def apply_decisions(
         ),
         "interaction": interaction,
         "bilateral_contact_required": require_bilateral_contact,
+        "agent_decision_scope": "wrist_angle_only",
+        "grasp_depth_owner": "application_rule_based_dense_search",
+        "nominal_contact_geometry_frozen_by_visual_gate": False,
+        "selected_angle_status": str(
+            decision_by_id[str(chosen["id"])]["angle_status"]
+        ),
+        "contact_offset_under_review": report["contact_offset_under_review"],
+        "maximum_target_gap_m": float(report["maximum_target_gap_m"]),
         "contact_sequence": report.get("contact_sequence"),
         "covered_stage_ids": list(covered_stage_ids),
         "selected_visual_reason": decision_by_id[str(chosen["id"])]["reason"],

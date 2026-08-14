@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Derive a physics URDF whose collision geometry matches declared proxies.
+"""Build a diagnostic collision proxy below ``.artimo-runs``.
 
 Source collision meshes are often loaded by PyBullet as a single convex hull per
 ``<collision>`` tag.  For a concave part -- a bin lid, a door frame, a handle
@@ -7,10 +7,10 @@ recess -- that hull fills the concavity and manufactures contacts that the real
 geometry does not have, which makes an otherwise correct contact candidate look
 like a collision.
 
-This tool rewrites only collision geometry, from a declarative proxy spec.  It
-never touches visual geometry, joint origins, axes, or limits, so the mechanism
-the ArtiMo plan describes is preserved exactly.  It contains no asset registry:
-every link name, mode, and bound comes from the spec file.
+This is not part of the default planning or rollout path. Convex decomposition
+is an approximation and must be compared against source-mesh evidence before it
+is used for debugging. The tool rewrites only collision geometry and never
+touches visual geometry, joint origins, axes, or limits.
 """
 
 from __future__ import annotations
@@ -231,7 +231,15 @@ def build(spec_path: Path, output_urdf: Path) -> dict[str, Any]:
             for element in collision.iter("mesh")
             if element.attrib.get("filename")
         ]
-        for collision in existing:
+        mesh_collisions = [
+            collision
+            for collision in existing
+            if collision.find("geometry/mesh") is not None
+        ]
+        # Primitive collision tags already have exact Bullet semantics.  Keep
+        # them byte-for-byte and replace only mesh tags; otherwise a mixed
+        # mesh/box link would silently lose its box during normalization.
+        for collision in mesh_collisions:
             link.remove(collision)
 
         if mode == "convex_decomposition":

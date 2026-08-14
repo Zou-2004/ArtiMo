@@ -27,6 +27,39 @@ complete physical-plus-negative-control rollout only through
 launchers are `applications/artimo_robot_contact/run_artimo_robot_pipeline.py`
 and `applications/artimo_robot_contact/run_agent_task.py`.
 
+## Application-owned execution defaults
+
+Do not author a contact quaternion, Panda model fields, plan projection,
+contact sequence/release boundary, forbidden-link list, passive-return gains,
+GPU backend, IK budget, sparse/dense budget, or base-search matrix. Before any
+schema validation or numerical work, the application materializes those fields
+from the robot installation, `plan.json`, URDF collision geometry, and fixed
+harness policy. A supplied value is ignored rather than treated as tuning.
+
+For each robot-owned control, task-local input is limited to ownership, a stage
+id, interaction (`explicit_ideal_feasibility` grasp or `physical_push`), the
+contact link, the link-local contact-point translation, optional final finger
+opening, and the visually selected wrist roll. For a physical push only,
+the selected robot tool surface may also be declared. The application projects
+the source phase/control, driver joint, target, uninterrupted
+`contact_sequence`, release boundary and passive return directly from
+`plan.json`.
+
+The application derives roll zero from the collision-surface outward normal at
+the declared point and the contacted link's longest principal tangent. It then
+generates exactly `contact_roll_deg = 0/45/90/135/180`. The cached
+`contact_pose_link.rotation_xyzw` and `contact_frame_source` are machine output;
+never type or edit them. A fresh agent may classify the four separate renders,
+but cannot redefine their common base frame. All object links except the
+declared contact link are automatically forbidden. Centered Panda grasps
+automatically allow exactly the two finger contact links.
+
+Placement likewise ignores task-authored numerical search settings. It always
+uses the installed GPU backend when available, a complete 5 cm contact-facing
+grid, lateral coverage equal to at least the widest horizontal object-link
+extent, the fixed Panda working-distance range, all visual-valid rolls, a
+17-sample sparse pass, and an adaptive 65-to-129-sample dense Top-K pass.
+
 These generic helpers exist; use them instead of inventing a private script:
 
 - `applications/artimo_robot_contact/inspect_artimo_contact_pose.py` renders and measures one candidate
@@ -40,6 +73,21 @@ These generic helpers exist; use them instead of inventing a private script:
   comparison sheet or tiled card. A kinematic-free parallel-jaw proxy is cyan
   and magenta in isolated views. Open every file and classify every roll before
   freezing orientation; the renderer intentionally never auto-selects one.
+  The four no-IK images place the gripper at the exact declared contact pose.
+  For every roll the agent judges `angle_status` and whether the target is
+  visibly between opposed jaws. The agent never supplies `grasp_depth_m`.
+  Placement resets any supplied value, then searches the application-owned
+  shallow-to-deep depth lattice. Dense acceptance requires both finger links
+  within the target-gap bound at every path sample and rejects every other
+  robot/object collision. Rollout independently requires sustained real
+  bilateral target-link contact, opposed contact normals, settled fingers and
+  sufficient closure before creating the disclosed stabilizing constraint.
+  Failure truncates the rollout at acquisition; no manipulation command runs.
+  `required_opposed_contact_visible=true` is a hard assertion that both closed
+  jaw surfaces visibly meet opposite sides of the declared `contact_link`, not
+  merely that the link lies somewhere between separated fingers. If either side
+  retains a visible gap, adjust depth/contact offset or opening and rerender;
+  the candidate is not eligible for placement.
 - `applications/artimo_robot_contact/apply_artimo_grasp_orientation_decisions.py` validates the exact four
   reviewed image hashes, one `valid`/`invalid` visual decision for every roll,
   and a unique contiguous visual priority for every visual-valid roll. It
@@ -72,8 +120,10 @@ These generic helpers exist; use them instead of inventing a private script:
   support remain forbidden against the target. Run it before accepting a fixed placement;
   do not replace it with endpoint-only IK checks.
 - `applications/artimo_robot_contact/solve_artimo_release_clearance.py` searches a post-release end-effector
-  retreat and scores the complete robot/support against every later
-  plan-declared mechanism-motion and passive-return sweep. Use it whenever
+  retreat and scores the complete robot/support against plan-declared
+  mechanism-motion and passive-return sweeps only until the next robot-contact
+  acquisition. Later manipulation belongs to that next block, while movement
+  between different contacts belongs exclusively to transit planning. Use it whenever
   robot contact triggers later moving geometry or a spring return follows;
   copy only its chosen pose and measured clearance into execution data. A
   solver-authored release route replaces the default link-relative retreat: it
@@ -91,24 +141,21 @@ These generic helpers exist; use them instead of inventing a private script:
   example.
 - `applications/artimo_robot_contact/solve_artimo_transit_clearance.py` evaluates one immutable batch of
   geometry-derived one- or two-waypoint routes between different robot-contact
-  stages in isolated candidate processes. It tries direct interpolation and
-  then bounded deterministic joint-space RRT for a blocked segment, serializes
-  the exact resulting joint path, ranks complete-robot swept clearance first
-  and end-effector polyline length second, then emits only the frozen feasible
-  execution. Use it after placement is fixed when a direct inter-stage transit
-  intersects geometry moved earlier.
-- `applications/artimo_robot_contact/build_artimo_collision_proxy.py` derives a physics URDF from a
-  declarative proxy spec, replacing only collision geometry. Source collision
-  meshes load as one convex hull per tag, which fills concavities and
-  manufactures contacts; convex decomposition removes that artifact. Read the
-  source URDF directly from the supplied asset/data tree. Write the proxy spec,
-  derived URDF, meshes, and report only below `.artimo-runs/<task>/`, then pass
-  that derived URDF as the root `physics_urdf` field in execution data. Do not
-  modify the immutable task spec to add it. Read asset URDFs only from the
-  supplied asset/data tree and write derived artifacts only to the current
-  task's debug tree. The harness restricts an execution proxy to that task's own
-  debug tree and refuses one whose joints, axes, limits, or parents differ from
-  the source.
+  stages. With `planning_ik_backend.name = "curobo"`, one persistent worker
+  uses GPU MotionGen (graph search plus trajectory optimization) for every
+  blocked joint segment and GPU collision geometry for the moved scene; it does
+  not launch one CUDA model per candidate. PyBullet then verifies the complete
+  returned path against exact selected links. CPU RRT exists only for explicit
+  Bullet mode or `allow_bullet_fallback: true`. The solver ranks complete-robot
+  swept clearance first and end-effector polyline length second, then emits only
+  the frozen feasible execution. Use it after placement is fixed when a direct
+  inter-stage transit intersects geometry moved earlier.
+- `applications/artimo_robot_contact/build_artimo_collision_proxy.py` is a
+  diagnostic-only tool. Its convex decomposition is not equivalent to the
+  source mesh and must never be selected automatically for sparse, dense,
+  transit, release, or rollout. Ordinary GPU collision receives the source
+  meshes directly. The agent must not create a proxy spec or set `physics_urdf`
+  in execution data.
 - `applications/artimo_robot_contact/review_artimo_video.py` measures the visual-QA booleans from the
   published video and the rollout traces. Never hand-write those values.
 - `applications/artimo_robot_contact/artimo_plan.py` is the one parser for plan targets and ordering. The
@@ -164,6 +211,15 @@ copy that row by hand into release-clearance input or physics execution. The
 requirement to retain a complete video despite later diagnostic failures begins
 only after placement has emitted a feasible `execution.json`.
 
+In cuRobo mode, sparse base candidates are coalesced into bounded multi-base GPU
+batches and solved by one persistent worker with one `solve_batch_env` call per
+batch. Each flattened pose retains its own robot-base frame and exact source-mesh
+collision world; results are restored to deterministic candidate order.
+Dense candidates are already cost-ordered by whole-task sparse evidence and are
+therefore evaluated strictly one at a time. Stop immediately after the first
+fully feasible dense candidate; do not speculatively launch later candidates or
+spend time ranking additional feasible rows.
+
 The Panda is always a stiff trajectory executor, not an actuator-limit
 experiment. The shared harness fixes every arm joint to 1000 N maximum motor
 force, force scale 1.0, and position gain 1.0; the finger servo force is fixed
@@ -205,16 +261,17 @@ precontact pose is a shared-harness regression, not a contact/placement variable
    "effect", or "settle" is not evidence of an internal actuator. The schema,
    simulator, and verifier reject missing, duplicate, or contradictory owners.
    Every `robot_contact` phase becomes a contact stage. `plan.json` is the only
-   authority for contact release boundaries; never read `causal.json` to split,
-   replace, or reorder robot actions. When consecutive robot-owned controls have
-   no intervening plan `control_release`, they must use one uninterrupted grasp
-   and one `contact_sequence`, including when the controlled joint or moving
-   parent link changes. The contact link, link-local pose, finger opening,
-   interaction, and allowed robot links remain identical while the robot
-   continuously follows each plan-owned joint path. Do not release merely
-   because a phase or driver joint changed. A different contact link is allowed
-   only after an explicit plan-semantic release boundary such as a declared
-   `control_release` or passive return. At a same-sequence phase boundary,
+   authority for object motion and ordering; never read `causal.json` to split,
+   replace, or reorder robot actions. Consecutive robot-owned controls on the
+   same contact link with no intervening plan `control_release` use one
+   uninterrupted grasp and one `contact_sequence`, including when the
+   controlled joint or moving parent link changes. The link-local pose, finger
+   opening, interaction, and allowed robot links remain identical while the
+   robot follows each path. Do not release merely because a phase or driver
+   joint changed. When the next robot-owned control requires a different
+   physical contact link, the application automatically releases, solves a
+   retreat, and reacquires before that next phase, even if the object-only plan
+   has no standalone release phase. At a same-sequence phase boundary,
    inherit the exact final
    arm joint vector as the next stage's sample zero; never rerun IK for the
    unchanged pose. Never replace required
@@ -261,14 +318,14 @@ precontact pose is a shared-harness regression, not a contact/placement variable
    `open_then_close`, declare a larger approach opening and bounded close/settle/
    release durations. The shared schema fixes every
    `open_then_close` stage to the disclosed `explicit_ideal_feasibility`
-   interaction: after physical acquisition it stays attached until the explicit
-   release boundary, so frictional slip is not a search variable. Physical
-   acquisition is neither proximity nor one-finger contact: every declared
-   `allowed_robot_contact_links` member must simultaneously contact the target
-   link before the ideal constraint may be created. The closed-aperture
-   PyBullet contact probe must pass for a visually valid roll. If either finger
-   retains a positive gap, reduce `grasp_depth_m`, rerender, and repeat the
-   visual/physical gate; never compensate by accepting a wrong roll. For
+   interaction: after visually approved closure it stays attached until the
+   explicit release boundary, so frictional slip is not a search variable. The
+   closed-aperture agent-reviewed no-IK contact-offset gate is the acquisition
+   proof and must pass for a visually valid
+   roll. If either finger visibly retains a positive gap or penetrates too far,
+   repair the task-local contact offset, rerender all four rolls, and repeat the
+   visual gate; never compensate by accepting a wrong roll. Numerical contact
+   confirmation is deferred to the dense shortlist and final rollout. For
    `maintain_width`, keep approach and manipulation widths equal, set
    close/release time to zero, and use the schema-fixed `physical_push`
    interaction. A small button may need one real finger surface rather than the
@@ -285,9 +342,9 @@ precontact pose is a shared-harness regression, not a contact/placement variable
    interaction primitives and causal rules defined by the execution schema.
    Set `settle_s` long enough for any declared release to reach its endpoint;
    the default tail is one second and will cut off a slower return.
-   If diagnostics require a collision proxy, keep the original task URDF
-   unchanged, build the derived URDF under `.artimo-runs/<task>/`, and record its
-   repository-relative path only as root `physics_urdf` in execution data.
+   Collision meshes require no repair decision. Use the locked source collision
+   meshes; never ask the agent to author a proxy spec or `physics_urdf` and
+   never silently substitute a convex decomposition.
 5. **Search deterministically.** Search contact point/orientation and robot
    trajectory parameters in bounded, seeded grids. Before placement, enumerate
    the semantic control features visible in every survey
@@ -301,9 +358,11 @@ precontact pose is a shared-harness regression, not a contact/placement variable
    candidate table, score them with static surface inspection plus dense
    kinematic/swept-clearance checks, select one, and freeze its link-local pose.
    Once the contact point, outward normal, and grasp depth are fixed, run
-   `applications/artimo_robot_contact/render_artimo_grasp_orientation_candidates.py`. Use its default eight
-   45-degree-spaced rolls unless object symmetry justifies a smaller declared
-   batch. Treat independent contact acquisitions separately. Consecutive
+   `applications/artimo_robot_contact/render_artimo_grasp_orientation_candidates.py`. Use its default five
+   45-degree-spaced robot-IK rolls (`0/45/90/135/180`). Although 0 and 180
+   exchange the two fingers and are the same contact geometry, keep both because
+   their Panda wrist branches, limits, and swept collisions can differ. Treat
+   independent contact acquisitions separately. Consecutive
    stages sharing one `contact_sequence` are one acquisition: render only its
    first stage, propagate the chosen roll to every member, and never re-probe a
    later member from home. Open all four separate
@@ -319,8 +378,9 @@ precontact pose is a shared-harness regression, not a contact/placement variable
    does not visibly sweep the surrounding housing. Because changing from a
    centered grasptarget to a nominated tool surface changes the rendered
    geometry, any earlier centered-gripper visual decisions are stale: rerender
-   the full eight-roll visual-only batch before allowing any roll into IK.
-   Record `valid` or `invalid` plus a concrete reason for every roll in the
+    the full five-roll visual-only batch before allowing any roll into IK.
+   Record angle status first, contact-offset status second, and final `valid`
+   or `invalid` plus a concrete reason for every roll in the
    emitted decision template. Give every visual-valid roll a unique contiguous
    `visual_priority` starting at 1; rank the single best semantic and geometric
    visual choice first. A wrong visual angle is a hard exclusion even if its IK
@@ -332,23 +392,38 @@ precontact pose is a shared-harness regression, not a contact/placement variable
    every visual-valid candidate, forms the joint candidate combinations across
    independent manipulation blocks, and evaluates each bounded base against the
    complete task. It selects by the worst block first; visual priority is only a
-   deterministic tie-break. Placement is coarse-to-fine. Evaluate every
-   base/contact combination first at five representative manipulation states
-   (start, quarter, midpoint, three-quarter, endpoint). Only those that pass
-   pose residual, joint-limit, grasp-geometry, and collision gates receive a
-   17-sample continuous-IK pass with joint-step checks. Rank survivors by the
-   worst manipulation block; only the configured top-K (default five) may run
+   deterministic tie-break. Placement is sparse-to-dense. After hard-excluding
+   visual-invalid orientations, form the complete Cartesian product of every
+   declared base/contact bound, including every contact-facing distance and
+   lateral offset. Evaluate every matrix cell directly with a 17-sample
+   continuous-IK pass. cuRobo performs IK, joint continuity, Panda
+   self-collision, and conservative non-target environment collision on GPU.
+   This collision screen runs for every sparse matrix cell, not only the later
+   Top-K. For every complete GPU path, record per-sample signed environment
+   clearance and rank collision-free survivors by their worst whole-path
+   clearance before IK residual or stance tie-breaks.
+   The manipulation continuity bound applies only between manipulation samples
+   and across an uninterrupted `contact_sequence`. Never compare an independent
+   acquisition's first grasp IK directly with home or a prior retreat and reject
+   it as a manipulation discontinuity; that entry is an approach/transit path
+   handled later by direct interpolation and cuRobo MotionGen (or explicit
+   Bullet-mode bounded RRT). Record the raw entry step as
+   a diagnostic only.
+   The visual angle/offset gate is authoritative for nominal target-contact
+   geometry during this full matrix pass, so sparse cells do not repeat
+   PyBullet finger-gap or exact contact queries in sparse or dense. Rank survivors by the worst
+   manipulation block; only the configured top-K (default five) may run
    adaptive dense manipulation sampling and the complete generic trajectory
-   planner. The screening solver budget is tiered too: coarse defaults to four
-   random restarts and 500 iterations, sparse to twelve restarts and 1000
-   iterations, while dense alone inherits the execution's full IK budget.
-   Placement data may lower or raise the two screening budgets, but neither is
-   allowed to exceed the final execution budget. Adaptive sampling bisects
+   planner. Top-K limits final-trajectory work; it must
+   never limit which sparse cells receive GPU collision detection. Sparse
+   defaults to twelve restarts and 1000 iterations, while dense
+   alone inherits the execution's full IK budget. Placement data may lower or
+   raise the sparse screening budget, but it is not allowed to exceed the final
+   execution budget. Adaptive sampling bisects
    intervals whose contacted Cartesian pose
    changes too far; it is only a precheck and never replaces final full-path IK
-   and swept collision. If all centered candidates fail final dense validation,
-   apply the same funnel to bounded lateral rows at the single best centerline
-   distance. Never use
+   and swept collision. Never reduce the declared distance-by-lateral matrix to
+   one centerline seed; that can hide a feasible off-center combination. Never use
    the template/default Panda base plus a sparse five-point IK probe as an
    orientation gate: placement has not fixed that base, and its later dense
    path would duplicate the calculation. Bilateral contact is additionally
@@ -368,19 +443,64 @@ precontact pose is a shared-harness regression, not a contact/placement variable
    participate in any IK call, placement, trajectory, transit, or physical rollout.
    Do not launch a new solver command for each candidate and do not replay the
    full object motion as a visible trial. After the pose is frozen, use one
-   centerline-distance batch and at most one lateral-offset batch. If those
-   bounded batches fail, report the measured generic gap instead of opening new
-   ad-hoc search dimensions or returning to an already frozen variable class.
+   bounded GPU-batched full sparse matrix followed by an ordered dense Top-K
+   scan that stops at its first fully feasible row.
+   If those bounded batches fail, report the measured generic gap instead of
+   opening new ad-hoc search dimensions or returning to an already frozen
+   variable class.
    Persist only useful
    diagnostics: candidate pose, IK residual, swept-path clearance, target
    contact, and rejection reason. Do not run unrelated asset scans or
    move a calibrated value into Python.
+
+   On a CUDA machine, expose cuRobo to this single placement command through
+   task-local placement data; do not launch a separate process per candidate:
+
+   ```json
+   "planning_ik_backend": {
+     "name": "curobo",
+     "python_executable": "C:\\ProgramData\\miniforge3\\envs\\artimo-curobo\\python.exe",
+     "device": "cuda:0",
+     "num_seeds": 32,
+     "return_seeds": 8,
+     "cuda_graph": true,
+     "allow_bullet_fallback": false,
+     "motion_num_graph_seeds": 4,
+     "motion_num_trajopt_seeds": 4,
+     "motion_timeout_s": 10.0,
+     "motion_max_attempts": 6
+   }
+   ```
+
+   The persistent worker batches every pose in sparse and dense
+   manipulation paths, returns multiple IK solutions per pose, and selects one
+   whole-path joint branch under the tier's continuity bound. Dense uses the
+   final fixed 0.08-rad adjacent-joint bound. Only the configured dense Top-K
+   restores exact PyBullet grasp/contact-pair confirmation and the complete
+   final trajectory audit; broad collision screening and clearance ranking have
+   already run on GPU for every sparse cell. The selected backend is copied into
+   runnable execution data, so final dense IK and blocked transit also remain on
+   GPU. PyBullet remains the physical rollout engine and exact path verifier.
+   If cuRobo cannot form a complete branch, Bullet refinement/RRT is used only
+   when `allow_bullet_fallback` is explicitly true; the stage report records the
+   exact fallback reason and must never silently present it as GPU planning. The
+   CUDA default is false. Use `{"name":"bullet"}` only when CUDA is unavailable.
    For a push or button control, do not keep a single canonical wrist pose:
    derive the outward surface normal from the declared link-frame contact
    patch and test at least the four approach families (along ±local X, ±local
    Y, and ±local Z as available). Contact-pose local +Z is always the outward
-   normal; `grasp_depth_m` and `precontact_offset_m` are non-negative +Z
-   distances, and the robot approaches in local -Z. The harness, not task data,
+   normal. `precontact_offset_m` is a non-negative +Z approach distance, while
+   `grasp_depth_m` is a signed application-selected adjustment around the Panda
+   centered-grasp baseline. Because Panda `grasptarget` is at the fingertips,
+   the harness baseline includes a fixed 0.015 m inward useful-finger inset:
+   execution value `0` therefore produces an effective `-0.015 m` pose. This is
+   a robot-frame invariant and applies continuously—the effective offset is
+   `-0.015 m + grasp_depth_m`, not a branch that changes only
+   when the value equals zero. `maintain_width` tool/push offsets keep their
+   direct signed meaning. For centered grasps the rule-based solver evaluates
+   the fixed depth lattice shallow-to-deep and accepts the least intrusive
+   value that passes bilateral target-gap and forbidden-collision checks. The robot
+   approaches in local -Z. The harness, not task data,
    applies the fixed robot-frame conversion: Panda grasptarget +Z (palm to
    fingertips) aligns with contact-frame -Z (toward the surface). The agent
    chooses the surface, magnitudes, and wrist roll, never the offset sign or a
@@ -389,7 +509,7 @@ precontact pose is a shared-harness regression, not a contact/placement variable
    touching an indirect-effect link; orientation is execution data, not a
    reason to change the plan or add a new stage.
    If the centered gripper overlaps geometry around a small button, first
-   rerender left/right fingertip face-centroid previews for all eight rolls with
+   rerender left/right fingertip face-centroid previews for all four rolls with
    no IK and visually gate them using the one-tool push criterion above. Then
    derive a closed support set from the selected collision face for only those
    newly visual-valid roll/tool pairs:
@@ -399,14 +519,24 @@ precontact pose is a shared-harness regression, not a contact/placement variable
    `allowed_robot_contact_links` subsets and
    `robot_tool_contact_offset_eef_m`; visual-invalid rolls remain excluded from
    every IK call. Freeze the least-offset collision-free tool frame, rerender
-   the final immutable eight-roll batch, and apply the ordinary orientation
+   the final immutable five-roll batch, and apply the ordinary orientation
    gate before placement. The immutable candidate manifest must list every
    support point before the batch starts.
-   `precontact_offset_m` is transient and disappears at manipulation;
+   The visual offset gate is appearance evidence, not a requirement that the
+   proxy or real fingers already produce physical contact. It must show a
+   convincing opposed grasp: the feature lies inside the useful finger length,
+   both jaws visibly surround it, and the palm does not visibly drive into the
+   object. Numerical contact and collision evidence remains deferred to dense
+   validation and rollout. `precontact_offset_m` is transient and disappears at manipulation;
    `grasp_depth_m` remains in the final grasp. Never copy the approach distance
    into grasp depth. Accept a depth only when the placement report shows enough
    allowed gripper links within `maximum_grasp_gap_m` at every path sample and
    `target_actually_gripped: true` for every `open_then_close` stage.
+   When the authoritative plan ends in one or more contiguous
+   `hold_position` phases for the contacted driver, keep the acquired grasp at
+   the final manipulation endpoint through that terminal hold. Do not append or
+   collision-check an undeclared finger release, local-normal retreat, or
+   return-to-home segment; planning and rollout must end on the same command.
    Do not infer a grasp from a short approach impact. For `open_then_close`, the
    schedule must visibly and numerically show open transit/approach, stationary
    finger closure at the first contact pose, a settled two-sided contact, then
@@ -447,22 +577,43 @@ precontact pose is a shared-harness regression, not a contact/placement variable
    Ground the object once and keep its orientation fixed for a placement trial.
    Use the selected contact link's initial collision-AABB center as the stance
    anchor and the contact frame's local +Z only as its outward direction. The
-   robot starts on that centerline, its yaw always faces the link center, and
-   the first search varies only `contact_facing_distance_m` (plus pedestal
-   height when required). Evaluate the full common feasible-base region for all
-   blocks and choose its best whole-task row; only if every centered distance fails may the
-   search try bounded `contact_facing_lateral_offset_m` values. Rank the complete
-   failed centerline rows with the same target-grasp, IK-completeness, collision,
-   and residual score used for placement; freeze the single closest-to-feasible
-   centerline row, and run the one symmetric lateral batch only at that row's
-   distance and other non-lateral coordinates. Do not form a Cartesian product
-   of every failed distance with every lateral offset. A lateral refinement
+   robot yaw always faces the link center. Form one bounded sparse matrix across
+   every declared `contact_facing_distance_m`, every declared
+   `contact_facing_lateral_offset_m`, and every visual-valid orientation. This
+   sparse Cartesian product is the coverage pass; it must not stop after a
+   centerline row or defer lateral offsets until a timeout. Evaluate every
+   manipulation stage for every matrix cell, rank the complete rows, and run
+   dense exact validation only for the top-K sparse rows. A lateral coordinate
    moves along the surface tangent but still faces the same link center. Never
+   choose the lateral half-range by an arbitrary small constant: measure every
+   object's grounded per-link horizontal AABB span and make the declared
+   positive and negative lateral coverage at least the widest link span. Show a
+   top-view point-grid diagnostic before starting the matrix. Forward-distance
+   samples must cover the reachable near and far sides more broadly and at no
+   coarser spacing than the lateral grid; for a Panda, `0.35..1.10 m` at
+   `0.05 m` is the generic initial bounded coverage unless task-local scene
+   evidence justifies different explicit bounds. Keep the centerline even when
+   a symmetric step sequence does not land exactly on zero. Never
    independently sweep base x/y/yaw or repeatedly rotate the
    object to repair reachability. All prior plan endpoints remain applied, and
    home-to-approach, approach, all 65 manipulation samples, and the applicable
    retreat path must clear every moving object link for the complete robot and
-   support. Every stage must retain the declared target grasp geometry.
+   support. Sparse IK, robot self-collision, and non-target environment
+   collision run as one GPU batch using the object's actual collision meshes at
+   every sampled object state; whole-link AABBs are not acceptable GPU
+   substitutes. Persist each complete path's GPU signed-clearance vector and
+   use its minimum value in sparse ranking. The nominated target link is
+   excluded only from sparse
+   environment collision because its opposed nominal contact was already
+   frozen by the visual offset gate. Dense Top-K and final rollout restore exact
+   PyBullet contact-pair validation. Every stage must retain the declared target
+   grasp geometry.
+   A cuRobo row with no returned solution is not by itself collision evidence.
+   Report it as un-attributed GPU no-valid-solution unless the backend supplies
+   a collision pair. When PyBullet finds a pose-valid, pair-clear configuration
+   at the same sample, retry the GPU batch with a larger seed/return budget and
+   zero feasibility-screen collision buffer; do not describe that row as a
+   measured collision.
 
    World-frame release waypoints are valid only for the fixed base that created
    them. Placement must ignore/remove any stale
@@ -479,7 +630,13 @@ precontact pose is a shared-harness regression, not a contact/placement variable
    directly from that retreat endpoint to the next stage's precontact path.
    Changing contacts requires a new transit, but does not imply an intermediate
    home pose. When the direct transit intersects geometry moved by an earlier
-   stage, declare ordered `transit_waypoints_world` on the incoming stage. These
+   stage, the placement result must classify
+   `prior_plan_moved_link_blocks_transit` and preserve that dense candidate as
+   route-solver input; it is not an ordinary rejected placement and is not yet
+   runnable. The placement command automatically runs the single bounded route
+   proposal and clearance/RRT batch for the selected repair candidate. Only if
+   that batch fails may the candidate be rejected. On success, declare the
+   solver-emitted ordered `transit_waypoints_world` on the incoming stage. These
    poses apply only to that transit and must route around the measured obstacle;
    they are not replayed during retreat. The planner serializes the joint path
    through them and checks that exact path, and the rollout must execute the
@@ -515,7 +672,7 @@ precontact pose is a shared-harness regression, not a contact/placement variable
    Measure contacts, forces, joint travel, constraints, resets, clearances, and
    all ArtiMo-requested joint motions at every step. Dense IK is
    continuity-first: keep the current local joint branch, rank solutions by
-   minimum joint-space change, constrain each 65-sample continuation solve to
+   minimum joint-space change, constrain each dense continuation solve to
    the harness-fixed 0.08-rad neighbourhood of its preceding command, treat
    Cartesian residuals only as measurements, and interpolate every pair of
    commands. The trust region constructs a smooth trajectory; it is not a
@@ -563,11 +720,13 @@ precontact pose is a shared-harness regression, not a contact/placement variable
   only after measured displacement, target-contact dwell, and its clearance gate.
 - A public video contains only causal physics: drivers cannot precede contact,
   and effects cannot precede latch/enable.
-- Every `open_then_close` grasp uses one disclosed ideal fixed attachment after
-  physical acquisition and retains it until explicit release. This benchmark
-  tests contact-pose/IK trajectory feasibility, not frictional force closure.
-  Attachment requires simultaneous target contact from every declared allowed
-  robot contact link; one fingertip touching never creates it.
+- Every `open_then_close` grasp uses one disclosed ideal fixed attachment only
+  after the runtime bilateral-contact dwell gate passes, and retains it until
+  explicit release. This
+  benchmark tests contact-pose/IK trajectory feasibility, not frictional force
+  closure. Closure completes first; both finger links must simultaneously hold
+  the target from opposed sides with settled joint velocity before the
+  constraint is created and manipulation starts.
   `maintain_width` stages remain unconstrained physical pushes.
 - Handoff/release locks require byte-identical harness code; task variation belongs only in execution data and evidence.
 

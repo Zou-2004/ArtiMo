@@ -7,10 +7,37 @@
   "required": ["schema_version", "scene", "robot", "control_execution", "stages", "causal_rules", "seeds"],
   "properties": {
     "schema_version": {"const": 2},
-    "physics_urdf": {
-      "type": "string",
-      "minLength": 1,
-      "description": "Optional collision-only URDF generated for this execution under .artimo-runs/<task_id>/. The source task URDF remains authoritative for the mechanism."
+    "planning_ik_backend": {
+      "description": "Optional generic planning accelerator. cuRobo performs batch IK, self/world collision screening, and blocked-transit MotionGen on the GPU; PyBullet remains the final exact physics verifier.",
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name"],
+          "properties": {"name": {"const": "bullet"}}
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name", "python_executable"],
+          "properties": {
+            "name": {"const": "curobo"},
+            "python_executable": {"type": "string", "minLength": 1},
+            "device": {"type": "string", "minLength": 1},
+            "num_seeds": {"type": "integer", "minimum": 1},
+            "return_seeds": {"type": "integer", "minimum": 1},
+            "cuda_graph": {"type": "boolean"},
+            "self_collision": {"type": "boolean"},
+            "environment_collision": {"type": "boolean"},
+            "collision_sphere_buffer_m": {"type": "number", "minimum": 0},
+            "allow_bullet_fallback": {"type": "boolean"},
+            "motion_num_graph_seeds": {"type": "integer", "minimum": 1},
+            "motion_num_trajopt_seeds": {"type": "integer", "minimum": 1},
+            "motion_timeout_s": {"type": "number", "exclusiveMinimum": 0},
+            "motion_max_attempts": {"type": "integer", "minimum": 1}
+          }
+        }
+      ]
     },
     "scene": {
       "type": "object",
@@ -84,6 +111,8 @@
           "driver_joint",
           "contact_link",
           "contact_pose_link",
+          "contact_roll_deg",
+          "contact_frame_source",
           "target_joint_position",
           "allowed_robot_contact_links",
           "precontact_offset_m",
@@ -116,8 +145,20 @@
             "required": ["translation_m", "rotation_xyzw"],
             "properties": {
               "translation_m": {"$ref": "#/$defs/vec3"},
-              "rotation_xyzw": {"$ref": "#/$defs/quat"}
+              "rotation_xyzw": {
+                "$ref": "#/$defs/quat",
+                "description": "Application-owned cached contact rotation. It is regenerated from the collision-surface normal, the link's principal tangent, and contact_roll_deg before validation and use; agent-supplied values are ignored."
+              }
             }
+          },
+          "contact_roll_deg": {
+            "enum": [0.0, 45.0, 90.0, 135.0, 180.0],
+            "default": 0.0,
+            "description": "The only agent-selected orientation datum after visual review. The application owns the common roll-zero frame and permits exactly five robot-IK rolls. Although 0 and 180 have symmetric jaw geometry, they remain distinct Panda wrist branches."
+          },
+          "contact_frame_source": {
+            "const": "application_collision_surface_normal_and_principal_tangent",
+            "description": "Machine-emitted provenance proving that contact_pose_link.rotation_xyzw was not authored by the agent."
           },
           "target_joint_position": {"type": "number"},
           "command_joint_position": {"type": "number"},
@@ -125,7 +166,8 @@
             "type": "array",
             "items": {"type": "string", "minLength": 1},
             "minItems": 1,
-            "uniqueItems": true
+            "uniqueItems": true,
+            "description": "Application-owned for centered open_then_close grasps: all Panda finger contact links are inserted automatically. A physical_push may still nominate the one semantic tool surface."
           },
           "precontact_offset_m": {
             "type": "number",
@@ -134,8 +176,7 @@
           },
           "grasp_depth_m": {
             "type": "number",
-            "minimum": 0,
-            "description": "Final manipulation standoff of the Panda grasptarget from the contacted surface along outward contact local +Z. This remains after approach and is not approach clearance; validate it from measured per-finger target gaps. precontact_offset_m is the separate transient free-space distance. The generic harness maps contact-frame +Z to Panda-grasptarget -Z.",
+            "description": "Application-selected signed adjustment around the centered Panda grasp baseline along contact local +Z. For centered open_then_close, the placement solver ignores agent-supplied depth and searches a fixed shallow-to-deep lattice; value 0 includes the robot-defined 0.015 m inward useful-finger inset and produces an effective -0.015 m pose. Dense acceptance requires bilateral target proximity and no forbidden collision, and rollout independently requires sustained opposed two-finger contact before manipulation. maintain_width/tool-offset stages retain direct signed offset semantics. This remains after approach and is not approach clearance; precontact_offset_m is the separate positive transient free-space distance.",
             "default": 0.0
           },
           "robot_tool_contact_offset_eef_m": {
@@ -156,7 +197,7 @@
             "properties": {
               "mode": {
                 "enum": ["open_then_close", "maintain_width"],
-                "description": "Agent-selected contact acquisition. Use open_then_close for a grasp that must surround the target before closing; use maintain_width when a pre-shaped or closed gripper is itself the pushing/pressing tool."
+                "description": "Application-owned from interaction: explicit_ideal_feasibility becomes open_then_close and physical_push becomes maintain_width."
               },
               "approach_finger_opening_m": {
                 "type": "number",
@@ -220,12 +261,12 @@
           },
           "minimum_release_swept_clearance_m": {
             "type": "number",
-            "minimum": 0,
-            "description": "Required whole-robot separation from every object link while moving through release_retreat_waypoints_world and while the declared passive-return joints sweep to rest. Zero means exact non-penetration with no hidden positive margin."
+            "exclusiveMinimum": 0,
+            "description": "Measured minimum whole-robot separation from every object link while moving through release_retreat_waypoints_world and while the declared passive-return joints sweep to rest. Any strictly positive value passes; the application adds no hidden clearance threshold."
           },
           "forbidden_contact_links": {
             "type": "array",
-            "description": "Object links the robot must stay clear of while approaching this stage. Checked at planning time against the whole swept path, so a candidate that would strike them is rejected before any rollout.",
+            "description": "Application-owned enumeration of every object link except contact_link. Checked at planning time against the whole swept path; agent-supplied lists are ignored.",
             "items": {"type": "string", "minLength": 1},
             "uniqueItems": true
           },

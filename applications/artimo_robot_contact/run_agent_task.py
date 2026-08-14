@@ -47,6 +47,21 @@ def _pump(source: IO[str], destination: IO[str], mirror: IO[str]) -> None:
         mirror.flush()
 
 
+def _agent_text_stream_options() -> dict[str, object]:
+    """Return deterministic decoding for the Codex CLI text protocol.
+
+    Windows otherwise uses the active ANSI code page (commonly GBK). Codex
+    emits UTF-8, so one non-GBK byte can kill a pump thread, stop draining the
+    pipe, and deadlock the agent once the OS pipe buffer fills.
+    """
+    return {
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+        "bufsize": 1,
+    }
+
+
 def _source_guard_snapshot() -> dict[str, str]:
     """Hash executable/instruction sources without embedding legacy files in prompts."""
     roots = [APP_ROOT]
@@ -142,8 +157,7 @@ def main() -> int:
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
+            **_agent_text_stream_options(),
         )
         assert process.stdin is not None
         assert process.stdout is not None

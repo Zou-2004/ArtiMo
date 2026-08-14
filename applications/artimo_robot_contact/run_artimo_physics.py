@@ -15,8 +15,10 @@ import copy
 import hashlib
 import json
 import math
+import os
+import pkgutil
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -26,31 +28,87 @@ from PIL import Image, ImageDraw, ImageFont
 
 import artimo_plan
 import artimo_video
-from artimo_ik import BulletIK, link_world_pose, set_fingers, set_robot_arm
+from artimo_curobo import create_curobo_backend
+from artimo_ik import BulletIK, link_world_pose, quat_angle_rad, set_fingers, set_robot_arm
 
 
 APP_ROOT = Path(__file__).resolve().parent
 REPO_ROOT = APP_ROOT.parents[1]
 EXECUTION_SCHEMA = APP_ROOT / "schemas" / "artimo_robot_execution.schema.json"
 DT = 1.0 / 240.0
-VIDEO_FPS = 30
-CAPTURE_EVERY = 8
+# Panda ``panda_grasptarget`` is located at the fingertips (0.105 m from the
+# hand), while the useful opposed-contact region lies behind that frame. Make
+# execution depth zero a conservative 15 mm inward inset: deep enough to put a
+# compact control feature between the fingers without needlessly sweeping the
+# palm into nearby structure. This is a robot/gripper-frame invariant, not a
+# task/asset calibration. Signed execution depth remains a continuous
+# adjustment around this zero point.
+PANDA_CENTERED_GRASP_BASELINE_M = -0.015
+# Preserve simulation-time playback while reducing expensive PyBullet pixel
+# renders from 30 to 20 per second.  NVENC still encodes every emitted frame;
+# the lower capture rate removes one third of TinyRenderer calls without
+# lowering spatial resolution or changing physical timing.
+VIDEO_FPS = 20
+CAPTURE_EVERY = 12
 # A small, generic separation from the support surface prevents numerical
 # penetration while keeping the placement independent of asset identity.
 GROUND_CLEARANCE_M = 0.002
 # This benchmark evaluates contact-pose/IK feasibility rather than actuator
 # limits.  Keep one invariant stiff Panda servo for every asset so a new agent
 # cannot "repair" geometry by tuning torque or gravity sag.
-PANDA_ARM_FORCE_N = 1000.0
+PANDA_ARM_FORCE_N = 87.0
 PANDA_ARM_FORCE_SCALE = 1.0
-PANDA_ARM_POSITION_GAIN = 1.0
-PANDA_FINGER_FORCE_N = 200.0
+PANDA_ARM_POSITION_GAIN = 0.2
+PANDA_FINGER_FORCE_N = 20.0
+IDEAL_GRASP_CONSTRAINT_FORCE_N = 180.0
+IDEAL_GRASP_CONSTRAINT_ERP = 0.35
+IDEAL_GRASP_CONSTRAINT_STABILIZE_S = 0.15
+# A fixed constraint is only a post-acquisition stabilizer.  It may not be
+# created from elapsed schedule time alone: both application-owned finger links
+# must sustain opposed, low-velocity contact with the nominated object link.
+GRASP_ACQUISITION_DWELL_S = 0.05
+GRASP_CONTACT_NORMAL_MAXIMUM_DOT = -0.25
+GRASP_FINGER_MAXIMUM_SPEED_M_S = 0.01
+GRASP_MINIMUM_CLOSURE_FRACTION = 0.25
+DEFAULT_OBJECT_HOLD_FORCE_OR_TORQUE = 100.0
 OBJECT_JOINT_STABILITY_TOLERANCE_M_OR_RAD = 1e-4
 # A release retreat is a real motion segment, not a zero-time phase boundary.
 # Hold the solved safe endpoint long enough to produce multiple physics/video
 # samples before any dependent mechanism motion or passive return is enabled.
 # This is harness policy rather than a per-asset timing knob.
 RELEASE_RETREAT_SETTLE_S = 0.10
+
+# Application-owned Panda and planner defaults.  These values describe the
+# fixed robot/harness installed with this application; they are deliberately
+# not task knobs.  Object-specific execution data supplies only semantic
+# contact choices (link, point, interaction and visual roll/depth decisions).
+PANDA_ARM_JOINT_NAMES = [f"panda_joint{index}" for index in range(1, 8)]
+PANDA_FINGER_JOINT_NAMES = ["panda_finger_joint1", "panda_finger_joint2"]
+PANDA_END_EFFECTOR_LINK = "panda_grasptarget"
+PANDA_HOME_JOINT_POSITIONS = [
+    0.0,
+    -math.pi / 4.0,
+    0.0,
+    -3.0 * math.pi / 4.0,
+    0.0,
+    math.pi / 2.0,
+    math.pi / 4.0,
+]
+DEFAULT_CONTACT_ROLL_DEGREES = (0.0, 45.0, 90.0, 135.0, 180.0)
+DENSE_MANIPULATION_PATH_SAMPLES = 257
+DEFAULT_PRECONTACT_OFFSET_M = 0.10
+DEFAULT_FINAL_FINGER_OPENING_M = 0.0064
+DEFAULT_APPROACH_FINGER_OPENING_M = 0.04
+DEFAULT_CONTACT_CLOSE_S = 0.50
+DEFAULT_CONTACT_SETTLE_S = 0.30
+DEFAULT_CONTACT_RELEASE_S = 0.50
+DEFAULT_MANIPULATION_SAMPLE_HOLD_S = 0.05
+DEFAULT_IK_RANDOM_RESTARTS = 64
+DEFAULT_IK_MAX_ITERATIONS = 4000
+DEFAULT_SEARCH_SEED = 27024
+DEFAULT_PHYSICS_SEED = 1101
+DEFAULT_PASSIVE_RETURN_FORCE = 5.0
+DEFAULT_PASSIVE_RETURN_POSITION_GAIN = 0.5
 
 
 def _validate_execution_schema(execution: dict[str, Any]) -> None:
@@ -168,6 +226,245 @@ def _maps(body: int, client: int) -> tuple[dict[str, int], dict[str, int]]:
         joints[info[1].decode("utf-8")] = index
         links[info[12].decode("utf-8")] = index
     return joints, links
+
+
+@dataclass(frozen=True)
+class _StaticConcaveOverlay:
+    body: int
+    source_link_index: int
+    source_link_name: str
+
+
+# PyBullet imports a mesh attached to an articulated link as a convex collision
+# shape, even when that link is rigidly fixed to a fixed base.  That can fill a
+# doorway, cabinet opening, or handle recess with nonexistent solid volume.  A
+# static concave copy is therefore installed for mesh-only links in the fixed
+# base subtree.  The original link remains the visual/kinematic authority; only
+# its collision response is replaced.  Registry keys are overwritten on every
+# scene load because PyBullet reuses body ids after disconnect.
+_STATIC_CONCAVE_OVERLAYS: dict[
+    tuple[int, int], list[_StaticConcaveOverlay]
+] = {}
+
+
+def _fixed_base_subtree_links(object_urdf: Path) -> set[str]:
+    import xml.etree.ElementTree as ET
+
+    root = ET.parse(object_urdf).getroot()
+    link_names = {
+        str(link.get("name")) for link in root.findall("link") if link.get("name")
+    }
+    child_names = {
+        str(child.get("link"))
+        for joint in root.findall("joint")
+        for child in [joint.find("child")]
+        if child is not None and child.get("link")
+    }
+    roots = sorted(link_names - child_names)
+    if len(roots) != 1:
+        return set()
+    fixed = {roots[0]}
+    changed = True
+    while changed:
+        changed = False
+        for joint in root.findall("joint"):
+            if str(joint.get("type")) != "fixed":
+                continue
+            parent = joint.find("parent")
+            child = joint.find("child")
+            if parent is None or child is None:
+                continue
+            parent_name = str(parent.get("link"))
+            child_name = str(child.get("link"))
+            if parent_name in fixed and child_name not in fixed:
+                fixed.add(child_name)
+                changed = True
+    return fixed
+
+
+def _install_static_concave_overlays(
+    object_urdf: Path,
+    object_body: int,
+    client: int,
+) -> list[_StaticConcaveOverlay]:
+    """Replace convexified fixed-link meshes with static source trimeshes."""
+    _, links = _maps(object_body, client)
+    installed: list[_StaticConcaveOverlay] = []
+    for link_name in sorted(_fixed_base_subtree_links(object_urdf)):
+        if link_name not in links:
+            continue
+        link_index = int(links[link_name])
+        shapes = list(
+            p.getCollisionShapeData(
+                object_body, link_index, physicsClientId=client
+            )
+            or []
+        )
+        # Primitive shapes are already exact. Mixed links remain untouched so
+        # no primitive is accidentally removed or duplicated.
+        if not shapes or any(int(shape[2]) != p.GEOM_MESH for shape in shapes):
+            continue
+        link_position, link_rotation = link_world_pose(
+            object_body, link_index, client
+        )
+        pending: list[_StaticConcaveOverlay] = []
+        try:
+            for shape in shapes:
+                filename = (
+                    shape[4].decode("utf-8")
+                    if isinstance(shape[4], bytes)
+                    else str(shape[4])
+                )
+                mesh_path = Path(filename)
+                if not mesh_path.is_absolute():
+                    mesh_path = object_urdf.parent / mesh_path
+                if not mesh_path.is_file():
+                    raise FileNotFoundError(
+                        f"Static collision mesh does not exist: {mesh_path}"
+                    )
+                world_position, world_rotation = p.multiplyTransforms(
+                    link_position,
+                    link_rotation,
+                    list(shape[5]),
+                    list(shape[6]),
+                    physicsClientId=client,
+                )
+                collision_shape = p.createCollisionShape(
+                    p.GEOM_MESH,
+                    fileName=str(mesh_path.resolve()),
+                    meshScale=[float(value) for value in shape[3]],
+                    flags=p.GEOM_FORCE_CONCAVE_TRIMESH,
+                    physicsClientId=client,
+                )
+                overlay_body = p.createMultiBody(
+                    baseMass=0.0,
+                    baseCollisionShapeIndex=collision_shape,
+                    baseVisualShapeIndex=-1,
+                    basePosition=world_position,
+                    baseOrientation=world_rotation,
+                    physicsClientId=client,
+                )
+                pending.append(
+                    _StaticConcaveOverlay(
+                        body=int(overlay_body),
+                        source_link_index=link_index,
+                        source_link_name=link_name,
+                    )
+                )
+        except Exception:
+            for overlay in pending:
+                p.removeBody(overlay.body, physicsClientId=client)
+            raise
+        # Disable the convexified source only after every source mesh has a
+        # successful exact replacement.
+        p.setCollisionFilterGroupMask(
+            object_body,
+            link_index,
+            collisionFilterGroup=0,
+            collisionFilterMask=0,
+            physicsClientId=client,
+        )
+        installed.extend(pending)
+    _STATIC_CONCAVE_OVERLAYS[(int(client), int(object_body))] = installed
+    return installed
+
+
+def _overlay_rows(
+    body_a: int,
+    object_body: int,
+    client: int,
+    *,
+    distance: float | None,
+    link_index_a: int | None,
+    link_index_b: int | None,
+    contacts: bool,
+) -> list[tuple[Any, ...]]:
+    overlays = _STATIC_CONCAVE_OVERLAYS.get(
+        (int(client), int(object_body)), []
+    )
+    overlay_indices = {item.source_link_index for item in overlays}
+    rows: list[tuple[Any, ...]] = []
+    # An overlaid source link is intentionally absent from the original query;
+    # explicit closest-point calls ignore broadphase collision masks on some
+    # Bullet builds, so filtering only by masks is insufficient.
+    query_original = link_index_b is None or link_index_b not in overlay_indices
+    if query_original:
+        kwargs: dict[str, Any] = {"physicsClientId": client}
+        if link_index_a is not None:
+            kwargs["linkIndexA"] = int(link_index_a)
+        if link_index_b is not None:
+            kwargs["linkIndexB"] = int(link_index_b)
+        original = (
+            p.getContactPoints(body_a, object_body, **kwargs)
+            if contacts
+            else p.getClosestPoints(body_a, object_body, float(distance), **kwargs)
+        )
+        rows.extend(
+            tuple(point)
+            for point in original
+            if int(point[4]) not in overlay_indices
+        )
+    for overlay in overlays:
+        if (
+            link_index_b is not None
+            and overlay.source_link_index != int(link_index_b)
+        ):
+            continue
+        kwargs = {"physicsClientId": client}
+        if link_index_a is not None:
+            kwargs["linkIndexA"] = int(link_index_a)
+        overlay_points = (
+            p.getContactPoints(body_a, overlay.body, **kwargs)
+            if contacts
+            else p.getClosestPoints(
+                body_a, overlay.body, float(distance), **kwargs
+            )
+        )
+        for point in overlay_points:
+            normalized = list(point)
+            normalized[2] = int(object_body)
+            normalized[4] = int(overlay.source_link_index)
+            rows.append(tuple(normalized))
+    return rows
+
+
+def object_closest_points(
+    body_a: int,
+    object_body: int,
+    distance: float,
+    client: int,
+    *,
+    link_index_a: int | None = None,
+    link_index_b: int | None = None,
+) -> list[tuple[Any, ...]]:
+    return _overlay_rows(
+        body_a,
+        object_body,
+        client,
+        distance=float(distance),
+        link_index_a=link_index_a,
+        link_index_b=link_index_b,
+        contacts=False,
+    )
+
+
+def object_contact_points(
+    body_a: int,
+    object_body: int,
+    client: int,
+    *,
+    link_index_a: int | None = None,
+    link_index_b: int | None = None,
+) -> list[tuple[Any, ...]]:
+    return _overlay_rows(
+        body_a,
+        object_body,
+        client,
+        distance=None,
+        link_index_a=link_index_a,
+        link_index_b=link_index_b,
+        contacts=True,
+    )
 
 
 def _body_min_z(body: int, client: int) -> float:
@@ -348,6 +645,448 @@ def task_initial_joint_values(task: dict[str, Any]) -> dict[str, float]:
     if trajectory is None:
         return {}
     return _initial_joint_values(_read_jsonl(_resolve(str(trajectory))))
+
+
+def _matrix_to_quaternion_xyzw(rotation: np.ndarray) -> list[float]:
+    """Convert one proper 3x3 rotation matrix to a canonical XYZW quaternion."""
+    matrix = np.asarray(rotation, dtype=np.float64)
+    if matrix.shape != (3, 3):
+        raise ValueError("Expected a 3x3 rotation matrix")
+    trace = float(np.trace(matrix))
+    if trace > 0.0:
+        scale = math.sqrt(trace + 1.0) * 2.0
+        x = (matrix[2, 1] - matrix[1, 2]) / scale
+        y = (matrix[0, 2] - matrix[2, 0]) / scale
+        z = (matrix[1, 0] - matrix[0, 1]) / scale
+        w = 0.25 * scale
+    else:
+        diagonal = np.diag(matrix)
+        index = int(np.argmax(diagonal))
+        if index == 0:
+            scale = math.sqrt(1.0 + matrix[0, 0] - matrix[1, 1] - matrix[2, 2]) * 2.0
+            x = 0.25 * scale
+            y = (matrix[0, 1] + matrix[1, 0]) / scale
+            z = (matrix[0, 2] + matrix[2, 0]) / scale
+            w = (matrix[2, 1] - matrix[1, 2]) / scale
+        elif index == 1:
+            scale = math.sqrt(1.0 + matrix[1, 1] - matrix[0, 0] - matrix[2, 2]) * 2.0
+            x = (matrix[0, 1] + matrix[1, 0]) / scale
+            y = 0.25 * scale
+            z = (matrix[1, 2] + matrix[2, 1]) / scale
+            w = (matrix[0, 2] - matrix[2, 0]) / scale
+        else:
+            scale = math.sqrt(1.0 + matrix[2, 2] - matrix[0, 0] - matrix[1, 1]) * 2.0
+            x = (matrix[0, 2] + matrix[2, 0]) / scale
+            y = (matrix[1, 2] + matrix[2, 1]) / scale
+            z = 0.25 * scale
+            w = (matrix[1, 0] - matrix[0, 1]) / scale
+    quaternion = np.asarray([x, y, z, w], dtype=np.float64)
+    quaternion /= np.linalg.norm(quaternion)
+    # q and -q encode the same rotation.  Fix the sign so hashes and fresh
+    # agents cannot create two representations of one application-owned frame.
+    first = next((value for value in quaternion if abs(float(value)) > 1e-12), 1.0)
+    if first < 0.0:
+        quaternion *= -1.0
+    quaternion[np.abs(quaternion) < 1e-12] = 0.0
+    return [float(value) for value in quaternion]
+
+
+def _quaternion_multiply_xyzw(left: Iterable[float], right: Iterable[float]) -> list[float]:
+    lx, ly, lz, lw = _quat(left)
+    rx, ry, rz, rw = _quat(right)
+    return _quat(
+        [
+            lw * rx + lx * rw + ly * rz - lz * ry,
+            lw * ry - lx * rz + ly * rw + lz * rx,
+            lw * rz + lx * ry - ly * rx + lz * rw,
+            lw * rw - lx * rx - ly * ry - lz * rz,
+        ]
+    )
+
+
+def _canonical_contact_frame(
+    task: dict[str, Any], stage: dict[str, Any]
+) -> dict[str, Any]:
+    """Derive a deterministic link-local contact frame from collision geometry.
+
+    Local +Z is the measured outward surface normal.  Local +X is the contacted
+    link's longest principal tangent direction, with a deterministic sign.  An
+    agent therefore chooses only the point and one of four visual wrist rolls;
+    it cannot silently replace the common roll-zero frame with another IK branch.
+    """
+    source_urdf = _resolve(task["inputs"]["urdf"])
+    initial = task_initial_joint_values(task)
+    client = p.connect(p.DIRECT)
+    if client < 0:
+        raise RuntimeError("Could not connect contact-frame geometry client")
+    try:
+        body = p.loadURDF(
+            str(source_urdf),
+            useFixedBase=True,
+            flags=p.URDF_USE_MATERIAL_COLORS_FROM_MTL,
+            physicsClientId=client,
+        )
+        joints, links = _maps(body, client)
+        for name, value in initial.items():
+            if name in joints:
+                p.resetJointState(body, joints[name], float(value), physicsClientId=client)
+        contact_link = str(stage["contact_link"])
+        if contact_link not in links:
+            raise KeyError(f"Unknown contact link {contact_link!r}")
+        link_index = links[contact_link]
+        point_link = np.asarray(
+            stage["contact_pose_link"]["translation_m"], dtype=np.float64
+        )
+        link_position, link_rotation = link_world_pose(body, link_index, client)
+        point_world, _ = p.multiplyTransforms(
+            link_position,
+            link_rotation,
+            point_link.tolist(),
+            [0.0, 0.0, 0.0, 1.0],
+            physicsClientId=client,
+        )
+        probe_radius = 0.0005
+        probe_shape = p.createCollisionShape(
+            p.GEOM_SPHERE, radius=probe_radius, physicsClientId=client
+        )
+        probe = p.createMultiBody(
+            baseMass=0.0,
+            baseCollisionShapeIndex=probe_shape,
+            basePosition=point_world,
+            physicsClientId=client,
+        )
+        hits = p.getClosestPoints(
+            probe,
+            body,
+            0.25,
+            linkIndexB=link_index,
+            physicsClientId=client,
+        )
+        if not hits:
+            raise ValueError(
+                f"Contact point for {contact_link!r} has no nearby collision surface"
+            )
+        hit = min(hits, key=lambda item: abs(float(item[8]) + probe_radius))
+        inverse_link_rotation = p.invertTransform(
+            [0.0, 0.0, 0.0], link_rotation
+        )[1]
+        normal_link = np.asarray(
+            p.rotateVector(inverse_link_rotation, hit[7]), dtype=np.float64
+        )
+        normal_link /= np.linalg.norm(normal_link)
+
+        _, vertices = p.getMeshData(
+            body,
+            link_index,
+            flags=p.MESH_DATA_SIMULATION_MESH,
+            physicsClientId=client,
+        )
+        points = np.asarray(vertices, dtype=np.float64)
+        tangent: np.ndarray | None = None
+        if points.ndim == 2 and points.shape[0] >= 3 and points.shape[1] == 3:
+            covariance = np.cov((points - points.mean(axis=0)).T)
+            eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+            for eigen_index in np.argsort(eigenvalues)[::-1]:
+                candidate = eigenvectors[:, int(eigen_index)]
+                candidate = candidate - normal_link * float(np.dot(candidate, normal_link))
+                length = float(np.linalg.norm(candidate))
+                if length > 1e-6:
+                    tangent = candidate / length
+                    break
+        if tangent is None:
+            axes = np.eye(3, dtype=np.float64)
+            reference = min(axes, key=lambda axis: abs(float(np.dot(axis, normal_link))))
+            tangent = reference - normal_link * float(np.dot(reference, normal_link))
+            tangent /= np.linalg.norm(tangent)
+        sign_index = int(np.argmax(np.abs(tangent)))
+        if tangent[sign_index] < 0.0:
+            tangent *= -1.0
+        bitangent = np.cross(normal_link, tangent)
+        bitangent /= np.linalg.norm(bitangent)
+        tangent = np.cross(bitangent, normal_link)
+        tangent /= np.linalg.norm(tangent)
+        base_rotation = _matrix_to_quaternion_xyzw(
+            np.column_stack((tangent, bitangent, normal_link))
+        )
+        return {
+            "rotation_xyzw": base_rotation,
+            "surface_normal_link": normal_link.tolist(),
+            "principal_tangent_link": tangent.tolist(),
+            "point_to_surface_distance_m": float(hit[8]) + probe_radius,
+            "source": "application_collision_surface_normal_and_principal_tangent",
+        }
+    finally:
+        p.disconnect(client)
+
+
+def _canonical_contact_rotation_xyzw(
+    task: dict[str, Any], stage: dict[str, Any], roll_degrees: float = 0.0
+) -> tuple[list[float], dict[str, Any]]:
+    frame = _canonical_contact_frame(task, stage)
+    if float(roll_degrees) not in DEFAULT_CONTACT_ROLL_DEGREES:
+        raise ValueError(
+            "contact_roll_deg must be one of the application-owned five rolls "
+            f"{DEFAULT_CONTACT_ROLL_DEGREES}"
+        )
+    half_angle = math.radians(float(roll_degrees)) * 0.5
+    roll = [0.0, 0.0, math.sin(half_angle), math.cos(half_angle)]
+    return _quaternion_multiply_xyzw(frame["rotation_xyzw"], roll), frame
+
+
+def _urdf_robot_contact_links(
+    robot_urdf: Path, finger_joint_names: Iterable[str]
+) -> list[str]:
+    wanted = set(str(value) for value in finger_joint_names)
+    client = p.connect(p.DIRECT)
+    if client < 0:
+        raise RuntimeError("Could not connect robot-default geometry client")
+    try:
+        body = p.loadURDF(str(robot_urdf), useFixedBase=True, physicsClientId=client)
+        links = []
+        for index in range(p.getNumJoints(body, physicsClientId=client)):
+            info = p.getJointInfo(body, index, physicsClientId=client)
+            if info[1].decode("utf-8") in wanted:
+                links.append(info[12].decode("utf-8"))
+        if len(links) != len(wanted):
+            raise ValueError(
+                "Fixed Panda finger joints do not map uniquely to robot contact links"
+            )
+        return links
+    finally:
+        p.disconnect(client)
+
+
+def _urdf_object_link_names(object_urdf: Path) -> list[str]:
+    client = p.connect(p.DIRECT)
+    if client < 0:
+        raise RuntimeError("Could not connect object-default geometry client")
+    try:
+        body = p.loadURDF(str(object_urdf), useFixedBase=True, physicsClientId=client)
+        return list(_maps(body, client)[1])
+    finally:
+        p.disconnect(client)
+
+
+def _application_planning_backend() -> dict[str, Any]:
+    """Return the installed machine backend without consulting task/agent data."""
+    curobo_python = Path("C:/ProgramData/miniforge3/envs/artimo-curobo/python.exe")
+    if curobo_python.is_file():
+        return {
+            "name": "curobo",
+            "python_executable": str(curobo_python),
+            "device": "cuda:0",
+            "num_seeds": 64,
+            # Dense continuity needs the complete seed bank. Keeping only the
+            # best 16 pose-wise solutions can discard the one redundant-arm
+            # branch that connects to the adjacent sample even though every
+            # individual pose remains feasible.
+            "return_seeds": 64,
+            "cuda_graph": True,
+            "self_collision": True,
+            "environment_collision": True,
+            "collision_sphere_buffer_m": 0.0,
+            "allow_bullet_fallback": False,
+            "motion_num_graph_seeds": 4,
+            "motion_num_trajopt_seeds": 4,
+            "motion_timeout_s": 10.0,
+            "motion_max_attempts": 6,
+        }
+    return {"name": "bullet"}
+
+
+def materialize_execution_defaults(
+    task: dict[str, Any], execution_input: dict[str, Any]
+) -> dict[str, Any]:
+    """Materialize application-owned execution fields before validation/use.
+
+    The input may omit robot constants, contact-frame rotation, plan projection,
+    forbidden links, acquisition timing, backend and numerical budgets.  Values
+    supplied for those fields are overwritten, so a fresh agent cannot change
+    search semantics by guessing a different quaternion or tolerance bundle.
+    """
+    execution = copy.deepcopy(execution_input)
+    execution["schema_version"] = 2
+    # Collision representation is application-owned.  Ignore legacy agent-authored
+    # task-local proxies so sparse, dense, transit, release, and rollout all use
+    # the same deterministic model derived from the frozen source input.
+    execution.pop("physics_urdf", None)
+    scene = execution.setdefault("scene", {})
+    scene.setdefault("object_base_translation_m", [0.0, 0.0, 0.0])
+    scene.setdefault("object_base_rotation_xyzw", [0.0, 0.0, 0.0, 1.0])
+    scene.setdefault("ground_clearance_m", GROUND_CLEARANCE_M)
+
+    robot = execution.setdefault("robot", {})
+    robot.setdefault("base_translation_m", [0.0, 0.0, 0.0])
+    robot.setdefault("base_rotation_xyzw", [0.0, 0.0, 0.0, 1.0])
+    robot["arm_joint_names"] = list(PANDA_ARM_JOINT_NAMES)
+    robot["finger_joint_names"] = list(PANDA_FINGER_JOINT_NAMES)
+    robot["end_effector_link"] = PANDA_END_EFFECTOR_LINK
+    robot["home_joint_positions"] = list(PANDA_HOME_JOINT_POSITIONS)
+    robot.setdefault("base_support_height_m", 0.0)
+
+    execution["planning_ik_backend"] = _application_planning_backend()
+    execution["seeds"] = {
+        "search": DEFAULT_SEARCH_SEED,
+        "physics": DEFAULT_PHYSICS_SEED,
+    }
+    execution["ik"] = {
+        "random_restarts": DEFAULT_IK_RANDOM_RESTARTS,
+        "max_iterations": DEFAULT_IK_MAX_ITERATIONS,
+    }
+    execution.setdefault("causal_rules", [])
+    execution.setdefault("control_execution", [])
+    execution.setdefault("stages", [])
+    execution.setdefault("settle_s", 2.0)
+    execution.setdefault(
+        "camera",
+        {"eye_m": [2.0, -2.0, 1.45], "target_m": [0.0, 0.0, 0.8], "fov_deg": 48.0},
+    )
+
+    plan = _read_json(_resolve(task["inputs"]["plan"]))
+    phases = artimo_plan.phases_by_name(plan)
+    phase_order = {
+        str(phase["name"]): index for index, phase in enumerate(plan.get("timeline", []))
+    }
+    stages_by_id = {str(stage.get("id", "")): stage for stage in execution["stages"]}
+    robot_rows = []
+    for row in execution["control_execution"]:
+        if row.get("motion_owner") != "robot_contact":
+            continue
+        stage_id = str(row.get("stage_id", ""))
+        if stage_id not in stages_by_id:
+            raise ValueError(
+                f"robot_contact ownership references missing contact stage {stage_id!r}"
+            )
+        phase_name = str(row["source_phase"])
+        control_index = int(row["source_control_index"])
+        controls = phases[phase_name].get("controls", [])
+        if not 0 <= control_index < len(controls):
+            raise ValueError(f"Invalid plan control {phase_name!r}[{control_index}]")
+        control = controls[control_index]
+        target = artimo_plan.control_target(control)
+        if target is None:
+            raise ValueError(
+                f"robot_contact control {phase_name!r}[{control_index}] has no target"
+            )
+        stage = stages_by_id[stage_id]
+        stage["source_phase"] = phase_name
+        stage["source_control_index"] = control_index
+        stage["driver_joint"] = str(control["joint"])
+        stage["target_joint_position"] = float(target)
+        stage.pop("command_joint_position", None)
+        robot_rows.append((phase_order[phase_name], control_index, stage))
+
+    robot_rows.sort(key=lambda item: (item[0], item[1]))
+    groups: list[list[tuple[int, int, dict[str, Any]]]] = []
+    for row in robot_rows:
+        if not groups:
+            groups.append([row])
+            continue
+        prior_phase = groups[-1][-1][0]
+        current_phase = row[0]
+        contact_link_changed = str(groups[-1][-1][2]["contact_link"]) != str(
+            row[2]["contact_link"]
+        )
+        released = any(
+            str(plan["timeline"][index].get("phase_type", "")) == "control_release"
+            for index in range(prior_phase + 1, current_phase + 1)
+        )
+        if released or contact_link_changed:
+            groups.append([row])
+        else:
+            groups[-1].append(row)
+    for group_index, group in enumerate(groups):
+        sequence = f"contact_sequence_{group_index:03d}"
+        contact_links = {str(item[2].get("contact_link", "")) for item in group}
+        if len(contact_links) != 1:
+            raise ValueError(
+                "Plan has no release between robot controls, so application-owned "
+                f"sequence {sequence!r} requires one contact link; got {sorted(contact_links)}"
+            )
+        for _, _, stage in group:
+            stage["contact_sequence"] = sequence
+            stage.pop("release_before_phase", None)
+        final_phase_index = group[-1][0]
+        # A switch to another physical contact link necessarily releases and
+        # retreats before the next robot phase even if the object-only plan has
+        # no explicit control_release phase (for example door -> dishwasher
+        # tray).  Otherwise use the next plan-declared release boundary.
+        next_group = groups[group_index + 1] if group_index + 1 < len(groups) else None
+        release_phase = (
+            str(next_group[0][2]["source_phase"])
+            if next_group is not None
+            else next(
+                (
+                    str(phase["name"])
+                    for phase in plan["timeline"][final_phase_index + 1 :]
+                    if str(phase.get("phase_type", "")) == "control_release"
+                ),
+                None,
+            )
+        )
+        if release_phase is not None:
+            group[-1][2]["release_before_phase"] = release_phase
+
+    object_urdf = _resolve(task["inputs"]["urdf"])
+    object_links = _urdf_object_link_names(object_urdf)
+    robot_urdf = _resolve(task["inputs"]["robot_urdf"])
+    finger_links = _urdf_robot_contact_links(robot_urdf, PANDA_FINGER_JOINT_NAMES)
+    for stage in execution["stages"]:
+        interaction = str(stage.get("interaction", "explicit_ideal_feasibility"))
+        if interaction not in {"explicit_ideal_feasibility", "physical_push"}:
+            raise ValueError(f"Unknown contact interaction {interaction!r}")
+        stage["interaction"] = interaction
+        mode = "open_then_close" if interaction == "explicit_ideal_feasibility" else "maintain_width"
+        final_opening = float(stage.get("finger_opening_m", DEFAULT_FINAL_FINGER_OPENING_M))
+        stage["finger_opening_m"] = final_opening
+        stage["contact_acquisition"] = {
+            "mode": mode,
+            "approach_finger_opening_m": (
+                DEFAULT_APPROACH_FINGER_OPENING_M if mode == "open_then_close" else final_opening
+            ),
+            "close_s": DEFAULT_CONTACT_CLOSE_S if mode == "open_then_close" else 0.0,
+            "settle_s": DEFAULT_CONTACT_SETTLE_S,
+            "release_s": DEFAULT_CONTACT_RELEASE_S if mode == "open_then_close" else 0.0,
+        }
+        stage.setdefault("precontact_offset_m", DEFAULT_PRECONTACT_OFFSET_M)
+        stage.setdefault("grasp_depth_m", 0.0)
+        stage["manipulation_sample_hold_s"] = DEFAULT_MANIPULATION_SAMPLE_HOLD_S
+        stage.setdefault("minimum_swept_clearance_m", 0.0)
+        contact_link = str(stage["contact_link"])
+        stage["forbidden_contact_links"] = [
+            link for link in object_links if link != contact_link
+        ]
+        if mode == "open_then_close":
+            stage["allowed_robot_contact_links"] = list(finger_links)
+            stage.pop("robot_tool_contact_offset_eef_m", None)
+        elif not stage.get("allowed_robot_contact_links"):
+            # A physical push may intentionally nominate one of the two fingers;
+            # only that semantic tool choice remains agent-owned.
+            stage["allowed_robot_contact_links"] = [finger_links[0]]
+        roll_degrees = float(stage.get("contact_roll_deg", 0.0))
+        rotation, frame = _canonical_contact_rotation_xyzw(
+            task, stage, roll_degrees
+        )
+        stage["contact_roll_deg"] = roll_degrees
+        stage["contact_frame_source"] = frame["source"]
+        stage["contact_pose_link"]["rotation_xyzw"] = rotation
+
+    passive = []
+    for row in execution["control_execution"]:
+        if row.get("motion_owner") != "passive_return":
+            continue
+        phase = phases[str(row["source_phase"])]
+        control = phase["controls"][int(row["source_control_index"])]
+        passive.append(
+            {
+                "joint": str(control["joint"]),
+                "rest_position": float(artimo_plan.control_target(control)),
+                "maximum_force_or_torque": DEFAULT_PASSIVE_RETURN_FORCE,
+                "position_gain": DEFAULT_PASSIVE_RETURN_POSITION_GAIN,
+            }
+        )
+    execution["passive_joints"] = passive
+    return execution
 
 
 def _plan_requests(plan: dict[str, Any]) -> list[dict[str, Any]]:
@@ -711,6 +1450,8 @@ def _validate_contact_sequences(
         "interaction",
         "contact_link",
         "contact_pose_link",
+        "contact_roll_deg",
+        "contact_frame_source",
         "allowed_robot_contact_links",
         "finger_opening_m",
         "grasp_depth_m",
@@ -743,26 +1484,25 @@ def _validate_contact_sequences(
             for phase in intervening
         )
 
-        # The plan is the sole authority for release/reacquisition.  A later
-        # robot-owned control before any plan-declared control release must be
-        # executed through the existing grasp, even when the driven joint or
-        # the moving parent link changes.  Otherwise an agent can reinterpret
-        # an effect phase as "let go and push another link", which changes the
-        # requested physical workflow while still matching all joint targets.
-        if not plan_releases_contact and not _same_contact_sequence(left, right):
-            raise ValueError(
-                "Plan contains no control_release between adjacent robot-contact "
-                f"stages {left['id']!r} and {right['id']!r}; they must preserve "
-                "the same contact_link and one uninterrupted contact_sequence"
-            )
-
-        if str(left["contact_link"]) != str(right["contact_link"]):
+        same_link = str(left["contact_link"]) == str(right["contact_link"])
+        same_sequence = _same_contact_sequence(left, right)
+        if not same_link:
+            if same_sequence:
+                raise ValueError(
+                    f"Stages {left['id']!r} and {right['id']!r} change contact_link "
+                    "and therefore cannot preserve one grasp"
+                )
+            release_phase = left.get("release_before_phase")
+            if release_phase is None or phase_order[str(release_phase)] > right_index:
+                raise ValueError(
+                    f"Changing contact_link between {left['id']!r} and {right['id']!r} "
+                    f"requires release and retreat before phase {right['source_phase']!r}"
+                )
             continue
-        if not _same_contact_sequence(left, right) and not plan_releases_contact:
+        if not same_sequence and not plan_releases_contact:
             raise ValueError(
                 "Adjacent robot-contact stages on the same contact_link must "
-                "preserve one contact_sequence. Release/reacquire is allowed only "
-                "at an explicit plan-semantic release boundary."
+                "preserve one contact_sequence until a plan-declared release."
             )
     for index, stage in enumerate(stages):
         release_phase = stage.get("release_before_phase")
@@ -796,10 +1536,10 @@ def _validate_contact_sequences(
             )
         if require_release_route and float(
             stage.get("minimum_release_swept_clearance_m", 0.0)
-        ) < 0.0:
+        ) <= 0.0:
             raise ValueError(
-                f"Stage {stage['id']!r} release_before_phase requires nonnegative "
-                "minimum_release_swept_clearance_m"
+                f"Stage {stage['id']!r} release_before_phase requires strictly "
+                "positive measured minimum_release_swept_clearance_m"
             )
 
 
@@ -838,6 +1578,11 @@ def _validate_contact_acquisition(stage: dict[str, Any]) -> None:
         if close_s <= 0.0 or release_s <= 0.0:
             raise ValueError(
                 f"Stage {stage['id']!r} open_then_close requires positive close_s and release_s"
+            )
+        if float(acquisition["settle_s"]) <= 0.0:
+            raise ValueError(
+                f"Stage {stage['id']!r} open_then_close requires positive settle_s "
+                "so grasp acquisition completes before manipulation"
             )
     elif mode == "maintain_width":
         if stage["interaction"] != "physical_push":
@@ -907,6 +1652,9 @@ def _load_scene(
         useFixedBase=True,
         flags=p.URDF_USE_MATERIAL_COLORS_FROM_MTL,
         physicsClientId=client,
+    )
+    _install_static_concave_overlays(
+        object_urdf, object_body, client
     )
     robot_body = p.loadURDF(
         str(robot_urdf),
@@ -998,7 +1746,8 @@ def _target_pose(
     """Return a Panda EEF pose from the surface-contact convention.
 
     Contact-frame local +Z is the outward surface normal and ``offset_m`` is a
-    non-negative standoff into free space.  Panda ``grasptarget`` local +Z runs
+    signed final offset: positive is a standoff into free space and negative
+    moves inward to straddle protruding contact geometry. Panda ``grasptarget`` local +Z runs
     from palm to fingertips, so it must point *toward* the surface.  The fixed
     180-degree local-X frame conversion preserves the declared tangent X/roll
     while mapping EEF +Z to contact -Z.  Task data never has to encode this
@@ -1036,6 +1785,21 @@ def _target_pose(
     return list(position), list(eef_quaternion)
 
 
+def _effective_grasp_depth(stage: dict[str, Any]) -> float:
+    """Map execution depth adjustment to the robot's actual contact-frame offset."""
+    adjustment = float(stage.get("grasp_depth_m", 0.0))
+    acquisition = stage.get("contact_acquisition", {})
+    centered_parallel_jaw = (
+        acquisition.get("mode") == "open_then_close"
+        and stage.get("robot_tool_contact_offset_eef_m") is None
+    )
+    return (
+        PANDA_CENTERED_GRASP_BASELINE_M + adjustment
+        if centered_parallel_jaw
+        else adjustment
+    )
+
+
 @dataclass(frozen=True)
 class StagePlan:
     stage: dict[str, Any]
@@ -1051,6 +1815,10 @@ class StagePlan:
     minimum_joint_limit_margin_sample: int | None = None
     minimum_joint_limit_margin_joint: int | None = None
     maximum_adjacent_joint_step_rad: float = 0.0
+    ik_backend: str = "pybullet"
+    ik_backend_fallback_reason: str | None = None
+    transit_planner_backend: str = "direct_interpolation"
+    transit_planner_evidence: list[dict[str, Any]] = field(default_factory=list)
     debug_truncated: bool = False
     debug_failure: dict[str, Any] | None = None
     # Fully serialized joint path from the actual preceding robot state through
@@ -1058,6 +1826,89 @@ class StagePlan:
     # this in the plan makes planning clearance checks and rollout execute the
     # exact same transit instead of independently reconstructing a straight line.
     transit_in: np.ndarray | None = None
+
+
+def _curobo_collision_obstacles(
+    object_body: int,
+    object_link_names: dict[int, str],
+    included_link_indices: Iterable[int],
+    simulation_urdf: Path,
+    client: int,
+) -> list[dict[str, Any]]:
+    """Serialize selected PyBullet object collision shapes for cuRobo.
+
+    The geometry stays in the current kinematic shadow-world state.  cuRobo
+    consumes meshes/cuboids on the GPU; PyBullet later checks the returned path
+    against the exact same selected links and remains the final authority.
+    """
+    obstacles: list[dict[str, Any]] = []
+    for object_index in sorted(set(int(value) for value in included_link_indices)):
+        if object_index == -1:
+            link_position, link_rotation = p.getBasePositionAndOrientation(
+                object_body, physicsClientId=client
+            )
+        else:
+            link_position, link_rotation = link_world_pose(
+                object_body, object_index, client
+            )
+        shapes = p.getCollisionShapeData(
+            object_body, object_index, physicsClientId=client
+        )
+        for shape_index, shape in enumerate(shapes):
+            geometry_type = int(shape[2])
+            world_position, world_rotation = p.multiplyTransforms(
+                link_position,
+                link_rotation,
+                list(shape[5]),
+                list(shape[6]),
+            )
+            obstacle: dict[str, Any] = {
+                "name": f"object_{object_index}_shape_{shape_index}",
+                "position_world_m": list(world_position),
+                "rotation_xyzw_world": list(world_rotation),
+                "object_link": object_link_names.get(object_index, "base"),
+            }
+            if geometry_type == p.GEOM_MESH:
+                filename = shape[4].decode() if isinstance(shape[4], bytes) else str(shape[4])
+                mesh_path = Path(filename)
+                if not mesh_path.is_absolute():
+                    mesh_path = simulation_urdf.parent / mesh_path
+                if not mesh_path.is_file():
+                    raise FileNotFoundError(
+                        f"Collision mesh reported by PyBullet does not exist: {mesh_path}"
+                    )
+                obstacle.update(
+                    {
+                        "geometry_type": "mesh",
+                        "file_path": str(mesh_path.resolve()),
+                        "scale": [float(component) for component in shape[3]],
+                    }
+                )
+            elif geometry_type == p.GEOM_BOX:
+                obstacle.update(
+                    {
+                        "geometry_type": "cuboid",
+                        "dims_m": [float(component) for component in shape[3]],
+                    }
+                )
+            else:
+                lower, upper = p.getAABB(
+                    object_body,
+                    linkIndex=object_index,
+                    physicsClientId=client,
+                )
+                obstacle.update(
+                    {
+                        "geometry_type": "cuboid",
+                        "position_world_m": (
+                            (np.asarray(lower) + np.asarray(upper)) * 0.5
+                        ).tolist(),
+                        "rotation_xyzw_world": [0.0, 0.0, 0.0, 1.0],
+                        "dims_m": (np.asarray(upper) - np.asarray(lower)).tolist(),
+                    }
+                )
+            obstacles.append(obstacle)
+    return obstacles
 
 
 def _swept_clearance(
@@ -1086,12 +1937,12 @@ def _swept_clearance(
     for sample_index, q in enumerate(configurations):
         set_robot_arm(robot_body, arm, q, client)
         for link_name, link_index in sorted(forbidden.items()):
-            points = p.getClosestPoints(
+            points = object_closest_points(
                 robot_body,
                 object_body,
                 search_distance,
-                linkIndexB=link_index,
-                physicsClientId=client,
+                client,
+                link_index_b=link_index,
             )
             for point in points:
                 distance = float(point[8])
@@ -1107,12 +1958,12 @@ def _swept_clearance(
                     }
                 )
             if robot_support_body is not None:
-                for point in p.getClosestPoints(
+                for point in object_closest_points(
                     robot_support_body,
                     object_body,
                     search_distance,
-                    linkIndexB=link_index,
-                    physicsClientId=client,
+                    client,
+                    link_index_b=link_index,
                 ):
                     distance = float(point[8])
                     if minimum is None or distance < minimum:
@@ -1129,12 +1980,12 @@ def _swept_clearance(
         if target_contact is not None:
             target_name, target_index, allowed_robot_links = target_contact
             if target_name not in forbidden:
-                for point in p.getClosestPoints(
+                for point in object_closest_points(
                     robot_body,
                     object_body,
                     search_distance,
-                    linkIndexB=target_index,
-                    physicsClientId=client,
+                    client,
+                    link_index_b=target_index,
                 ):
                     robot_link = int(point[3])
                     if robot_link in allowed_robot_links:
@@ -1155,12 +2006,12 @@ def _swept_clearance(
                         }
                     )
                 if robot_support_body is not None:
-                    for point in p.getClosestPoints(
+                    for point in object_closest_points(
                         robot_support_body,
                         object_body,
                         search_distance,
-                        linkIndexB=target_index,
-                        physicsClientId=client,
+                        client,
+                        link_index_b=target_index,
                     ):
                         distance = float(point[8])
                         if minimum is None or distance < minimum:
@@ -1189,6 +2040,7 @@ def _plan_stages(
     allow_partial_debug: bool = False,
     validate_release_clearance: bool = True,
     object_plan: dict[str, Any] | None = None,
+    ik_path_solver: Any | None = None,
 ) -> list[StagePlan]:
     client = p.connect(p.DIRECT)
     if client < 0:
@@ -1199,6 +2051,7 @@ def _plan_stages(
         )
         object_joints, object_links = _maps(object_body, client)
         robot_joints, robot_links = _maps(robot_body, client)
+        object_link_names = {index: name for name, index in object_links.items()}
         robot_link_names = {index: name for name, index in robot_links.items()}
         robot_spec = execution["robot"]
         arm = [robot_joints[name] for name in robot_spec["arm_joint_names"]]
@@ -1231,6 +2084,14 @@ def _plan_stages(
             continues_from_previous = (
                 stage_index > 0
                 and _same_contact_sequence(execution["stages"][stage_index - 1], stage)
+            )
+            terminal_plan_hold = bool(
+                object_plan is not None
+                and stage_index + 1 == len(execution["stages"])
+                and _terminal_plan_hold_phase_index(
+                    object_plan, execution, stage
+                )
+                is not None
             )
             # Planning is sequential in object state.  A later robot-owned phase
             # must see every endpoint already reached by earlier phases (for
@@ -1279,7 +2140,11 @@ def _plan_stages(
             # trust region through high-curvature/singular portions of a link
             # sweep.  Endpoints and the smoothstep object path are unchanged;
             # the extra samples only halve the maximum object-side increment.
-            u = np.linspace(0.0, 1.0, 129)
+            # The dense execution path must remain inside the 0.08 rad local
+            # trust region even near high-curvature/singular portions of an
+            # articulated contact sweep. 257 object samples halve the step of
+            # the prior 129-point proof without weakening that invariant.
+            u = np.linspace(0.0, 1.0, DENSE_MANIPULATION_PATH_SAMPLES)
             object_path = start + (target - start) * (3.0 * u * u - 2.0 * u * u * u)
             opening = float(stage["finger_opening_m"])
             set_fingers(robot_body, fingers, opening, client)
@@ -1313,9 +2178,64 @@ def _plan_stages(
             # Grasp depth is the final manipulation standoff, not approach
             # clearance.  Its value must be justified by measured finger-to-target
             # gaps; precontact_offset_m is the separate transient approach distance.
-            grasp_depth = float(stage.get("grasp_depth_m", 0.0))
+            grasp_depth = _effective_grasp_depth(stage)
+            curobo_path: list[list[float]] | None = None
+            curobo_evidence: dict[str, Any] | None = None
+            curobo_fallback_reason: str | None = None
+            if ik_path_solver is not None:
+                dense_target_poses: list[tuple[list[float], list[float]]] = []
+                dense_obstacle_worlds: list[list[dict[str, Any]]] = []
+                for value in object_path:
+                    p.resetJointState(
+                        object_body, driver, float(value), physicsClientId=client
+                    )
+                    dense_target_poses.append(_target_pose(
+                        object_body,
+                        contact_link,
+                        stage["contact_pose_link"],
+                        grasp_depth,
+                        client,
+                        stage.get("robot_tool_contact_offset_eef_m"),
+                    ))
+                    if ik_path_solver.environment_collision:
+                        dense_obstacle_worlds.append(_curobo_collision_obstacles(
+                            object_body,
+                            {index: name for name, index in object_links.items()},
+                            forbidden.values(),
+                            object_urdf,
+                            client,
+                        ))
+                try:
+                    curobo_evidence = ik_path_solver.solve_path(
+                        [pose[0] for pose in dense_target_poses],
+                        [pose[1] for pose in dense_target_poses],
+                        execution["robot"]["base_translation_m"],
+                        execution["robot"]["base_rotation_xyzw"],
+                        reference,
+                        0.08,
+                        continues_from_previous,
+                        dense_obstacle_worlds,
+                        sequential=True,
+                    )
+                    if curobo_evidence.get("success"):
+                        curobo_path = curobo_evidence["path"]
+                    else:
+                        curobo_fallback_reason = (
+                            "no_continuous_gpu_branch_at_sample_"
+                            f"{curobo_evidence.get('failed_sample')}"
+                        )
+                except Exception as exc:
+                    curobo_fallback_reason = f"curobo_worker_error: {exc}"
+                # A redundant-arm singularity can leave every pose individually
+                # valid while cuRobo's returned seed set contains no adjacent
+                # branch inside 0.08 rad. In that specific case the sequential
+                # Bullet IK below may construct the kinematic path, but source-
+                # mesh collision remains GPU-authoritative afterward. This is
+                # not a collision fallback.
+
             def trace_manipulation_branch(
                 first_answer: dict[str, Any] | None,
+                precomputed_path: list[list[float]] | None = None,
             ) -> dict[str, Any]:
                 branch_reference = reference.copy()
                 branch_path: list[np.ndarray] = []
@@ -1336,7 +2256,25 @@ def _plan_stages(
                         stage.get("robot_tool_contact_offset_eef_m"),
                     )
                     try:
-                        if sample_index == 0 and first_answer is not None:
+                        if precomputed_path is not None:
+                            q = np.asarray(precomputed_path[sample_index], dtype=np.float64)
+                            set_robot_arm(robot_body, arm, q, client)
+                            actual_position, actual_rotation = link_world_pose(
+                                robot_body, eef, client
+                            )
+                            answer = {
+                                "success": True,
+                                "q": q,
+                                "position_error_m": float(np.linalg.norm(
+                                    np.asarray(actual_position)
+                                    - np.asarray(target_position)
+                                )),
+                                "orientation_error_rad": quat_angle_rad(
+                                    actual_rotation, target_rotation
+                                ),
+                                "solver": "curobo_batch_ik_pybullet_verified",
+                            }
+                        elif sample_index == 0 and first_answer is not None:
                             answer = dict(first_answer)
                             answer.setdefault("success", True)
                             answer.setdefault(
@@ -1399,7 +2337,12 @@ def _plan_stages(
                         arm,
                         robot_link_names,
                         robot_support_body,
-                        forbidden,
+                        (
+                            {}
+                            if ik_path_solver is not None
+                            and ik_path_solver.environment_collision
+                            else forbidden
+                        ),
                         target_contact,
                         [branch_reference],
                         "manipulation_branch",
@@ -1444,7 +2387,9 @@ def _plan_stages(
                 }
 
             branch_traces: list[dict[str, Any]] = []
-            if continues_from_previous:
+            if curobo_path is not None:
+                branch_traces.append(trace_manipulation_branch(None, curobo_path))
+            elif continues_from_previous:
                 # The preceding stage already ends at this exact link-relative
                 # contact pose and object state. Re-solving sample zero lets a
                 # redundant arm move to another nearby IK solution even though
@@ -1505,6 +2450,117 @@ def _plan_stages(
                 )
 
             chosen_branch = min(branch_traces, key=manipulation_branch_rank)
+            manipulation_gpu_evidence: dict[str, Any] | None = curobo_evidence
+            if (
+                curobo_path is None
+                and ik_path_solver is not None
+                and ik_path_solver.environment_collision
+                and chosen_branch["path"]
+            ):
+                manipulation_gpu_evidence = ik_path_solver.check_joint_path(
+                    chosen_branch["path"],
+                    execution["robot"]["base_translation_m"],
+                    execution["robot"]["base_rotation_xyzw"],
+                    dense_obstacle_worlds,
+                    required_clearance_m=float(required_clearance or 0.0),
+                )
+                gpu_minimum = manipulation_gpu_evidence.get(
+                    "minimum_environment_clearance_m"
+                )
+                if gpu_minimum is not None:
+                    existing_minimum = chosen_branch["minimum_swept_clearance_m"]
+                    chosen_branch["minimum_swept_clearance_m"] = (
+                        float(gpu_minimum)
+                        if existing_minimum is None
+                        else min(float(existing_minimum), float(gpu_minimum))
+                    )
+                chosen_branch["clearance_passed"] = bool(
+                    chosen_branch["clearance_passed"]
+                    and manipulation_gpu_evidence.get("success")
+                )
+
+            def exact_path_clearance(
+                configurations: Iterable[np.ndarray],
+                included_object_links: Iterable[int],
+                target_semantics: tuple[str, int, set[int]] | None,
+                phase: str,
+                obstacle_worlds: list[list[dict[str, Any]]] | None = None,
+            ) -> tuple[float | None, list[dict[str, Any]], dict[str, Any] | None]:
+                """Use source-mesh GPU collision plus target-only Bullet semantics."""
+                rows = [np.asarray(row, dtype=np.float64) for row in configurations]
+                if not rows:
+                    return None, [], None
+                if ik_path_solver is None or not ik_path_solver.environment_collision:
+                    minimum, found = _swept_clearance(
+                        robot_body,
+                        object_body,
+                        arm,
+                        robot_link_names,
+                        robot_support_body,
+                        {
+                            object_link_names[index]: index
+                            for index in included_object_links
+                        },
+                        target_semantics,
+                        rows,
+                        phase,
+                        search_distance,
+                        client,
+                    )
+                    return minimum, found, None
+                if obstacle_worlds is None:
+                    one_world = _curobo_collision_obstacles(
+                        object_body,
+                        object_link_names,
+                        included_object_links,
+                        object_urdf,
+                        client,
+                    )
+                    obstacle_worlds = [one_world for _ in rows]
+                evidence = ik_path_solver.check_joint_path(
+                    rows,
+                    execution["robot"]["base_translation_m"],
+                    execution["robot"]["base_rotation_xyzw"],
+                    obstacle_worlds,
+                    required_clearance_m=float(required_clearance or 0.0),
+                )
+                minimum = evidence.get("minimum_environment_clearance_m")
+                found: list[dict[str, Any]] = []
+                if not evidence.get("success"):
+                    found.append({
+                        "phase": phase,
+                        "sample": evidence.get("failed_sample"),
+                        "robot_link": "curobo_collision_spheres",
+                        "object_link": "source_mesh_environment",
+                        "distance_m": float(minimum or 0.0),
+                        "reason": "gpu_source_mesh_collision",
+                    })
+                if target_semantics is not None:
+                    target_minimum, target_found = _swept_clearance(
+                        robot_body,
+                        object_body,
+                        arm,
+                        robot_link_names,
+                        robot_support_body,
+                        {},
+                        target_semantics,
+                        rows,
+                        phase + "_target_semantics",
+                        search_distance,
+                        client,
+                    )
+                    if target_minimum is not None:
+                        minimum = (
+                            float(target_minimum)
+                            if minimum is None
+                            else min(float(minimum), float(target_minimum))
+                        )
+                    found.extend(target_found)
+                return (
+                    None if minimum is None else float(minimum),
+                    found,
+                    evidence,
+                )
             manipulation = chosen_branch["path"]
             ik_failures = chosen_branch["failures"]
             max_position = float(chosen_branch["maximum_position_error_m"])
@@ -1586,6 +2642,12 @@ def _plan_stages(
                 max_rotation = max(max_rotation, float(answer["orientation_error_rad"]))
 
             approach = np.asarray(list(reversed(reverse)))
+            if continues_from_previous:
+                # This stage begins with the exact grasp and arm command left
+                # by the preceding stage in the same contact sequence. There is
+                # no second approach, open, close, or reacquisition to plan or
+                # collision-check.
+                approach = np.asarray([manipulation[0].copy()])
             # Retreat is not the reverse of approach when the contacted object
             # link has moved.  Solve it in the stage's final object state so the
             # arm leaves the actual final contact point rather than snapping
@@ -1723,6 +2785,21 @@ def _plan_stages(
                         max_rotation, float(answer["orientation_error_rad"])
                     )
             retreat = np.asarray(retreat_configurations)
+            continues_to_next = bool(
+                stage_index + 1 < len(execution["stages"])
+                and _same_contact_sequence(
+                    stage, execution["stages"][stage_index + 1]
+                )
+            )
+            if continues_to_next or terminal_plan_hold:
+                # Preserve the final grasp command into the next same-sequence
+                # manipulation stage. A generated withdrawal here is a
+                # manufactured release and must not participate in planning.
+                # The same rule applies when the authoritative plan ends in a
+                # hold_position: rollout keeps the disclosed grasp through the
+                # terminal hold, so planning must not invent a release,
+                # withdrawal, or return-home path after that endpoint.
+                retreat = np.asarray([manipulation[-1].copy()])
             # A contact change may need to route around geometry moved by an
             # earlier plan stage (for example an opened panel).  These waypoints
             # belong only to the incoming transit of this stage: unlike
@@ -1734,6 +2811,8 @@ def _plan_stages(
                     "transit_waypoints_world"
                 )
             transit_in: np.ndarray | None = None
+            transit_planner_backend = "direct_interpolation"
+            transit_planner_evidence: list[dict[str, Any]] = []
             if not continues_from_previous:
                 for name, value in current.items():
                     if name in object_joints:
@@ -1745,6 +2824,18 @@ def _plan_stages(
                         )
                 p.resetJointState(
                     object_body, driver, start, physicsClientId=client
+                )
+                transit_gpu_obstacles = (
+                    _curobo_collision_obstacles(
+                        object_body,
+                        {index: name for name, index in object_links.items()},
+                        [*forbidden.values(), contact_link],
+                        object_urdf,
+                        client,
+                    )
+                    if ik_path_solver is not None
+                    and ik_path_solver.environment_collision
+                    else []
                 )
                 anchors = [stage_entry_reference.copy()]
                 waypoint_reference = stage_entry_reference.copy()
@@ -1846,18 +2937,11 @@ def _plan_stages(
                     zip(anchors, anchors[1:])
                 ):
                     segment = _interpolate(left, right, 90)
-                    direct_minimum, direct_violations = _swept_clearance(
-                        robot_body,
-                        object_body,
-                        arm,
-                        robot_link_names,
-                        robot_support_body,
-                        forbidden,
-                        target_contact_during_transit,
+                    direct_minimum, direct_violations, direct_gpu = exact_path_clearance(
                         segment,
+                        [*forbidden.values(), contact_link],
+                        None,
                         "transit_direct_probe",
-                        search_distance,
-                        client,
                     )
                     direct_clear = (
                         not direct_violations
@@ -1867,41 +2951,103 @@ def _plan_stages(
                         )
                     )
                     if not direct_clear:
-                        def configuration_is_clear(q: np.ndarray) -> bool:
-                            probe_minimum, probe_violations = _swept_clearance(
-                                robot_body,
-                                object_body,
-                                arm,
-                                robot_link_names,
-                                robot_support_body,
-                                forbidden,
-                                target_contact_during_transit,
-                                [q],
-                                "transit_rrt_probe",
-                                search_distance,
-                                client,
-                            )
-                            return bool(
-                                not probe_violations
-                                and (
-                                    probe_minimum is None
-                                    or probe_minimum
-                                    >= float(required_clearance or 0.0)
+                        planned: list[np.ndarray] | None = None
+                        gpu_evidence: dict[str, Any] | None = None
+                        if ik_path_solver is not None:
+                            try:
+                                gpu_evidence = ik_path_solver.plan_joint_path(
+                                    left,
+                                    right,
+                                    execution["robot"]["base_translation_m"],
+                                    execution["robot"]["base_rotation_xyzw"],
+                                    transit_gpu_obstacles,
+                                    maximum_joint_step_rad=0.08,
+                                    required_clearance_m=float(required_clearance or 0.0),
                                 )
+                                if gpu_evidence.get("success"):
+                                    gpu_candidate = [
+                                        np.asarray(row, dtype=np.float64)
+                                        for row in gpu_evidence["path"]
+                                    ]
+                                    gpu_minimum, gpu_violations, gpu_verify = exact_path_clearance(
+                                        gpu_candidate,
+                                        [*forbidden.values(), contact_link],
+                                        None,
+                                        "transit_curobo_pybullet_verify",
+                                    )
+                                    gpu_passed = bool(
+                                        not gpu_violations
+                                        and (
+                                            gpu_minimum is None
+                                            or gpu_minimum
+                                            >= float(required_clearance or 0.0)
+                                        )
+                                    )
+                                    gpu_evidence["pybullet_verified"] = gpu_passed
+                                    gpu_evidence["pybullet_minimum_clearance_m"] = gpu_minimum
+                                    gpu_evidence["source_mesh_gpu_verify"] = gpu_verify
+                                    if gpu_passed:
+                                        planned = gpu_candidate
+                                        transit_planner_backend = (
+                                            "curobo_motion_gen_gpu_pybullet_verified"
+                                        )
+                            except Exception as exc:
+                                gpu_evidence = {
+                                    "success": False,
+                                    "backend": "curobo_motion_gen_gpu",
+                                    "error": str(exc)[:2000],
+                                }
+                            transit_planner_evidence.append(
+                                {
+                                    "anchor_index": int(anchor_index),
+                                    **(gpu_evidence or {}),
+                                }
                             )
 
-                        planned = _rrt_connect(
-                            left,
-                            right,
-                            solver.arm_lower,
-                            solver.arm_upper,
-                            configuration_is_clear,
-                            np.random.default_rng(
-                                int(execution["seeds"].get("search", 0))
-                                + 1009 * stage_index
-                                + anchor_index
-                            ),
-                        )
+                        # CPU RRT is compatibility-only. Selecting cuRobo with
+                        # allow_bullet_fallback=false makes a GPU failure visible
+                        # instead of silently moving the expensive search to CPU.
+                        if planned is None and (
+                            ik_path_solver is None
+                            or ik_path_solver.allow_bullet_fallback
+                        ):
+                            def configuration_is_clear(q: np.ndarray) -> bool:
+                                probe_minimum, probe_violations = _swept_clearance(
+                                    robot_body,
+                                    object_body,
+                                    arm,
+                                    robot_link_names,
+                                    robot_support_body,
+                                    forbidden,
+                                    target_contact_during_transit,
+                                    [q],
+                                    "transit_rrt_probe",
+                                    search_distance,
+                                    client,
+                                )
+                                return bool(
+                                    not probe_violations
+                                    and (
+                                        probe_minimum is None
+                                        or probe_minimum
+                                        >= float(required_clearance or 0.0)
+                                    )
+                                )
+
+                            planned = _rrt_connect(
+                                left,
+                                right,
+                                solver.arm_lower,
+                                solver.arm_upper,
+                                configuration_is_clear,
+                                np.random.default_rng(
+                                    int(execution["seeds"].get("search", 0))
+                                    + 1009 * stage_index
+                                    + anchor_index
+                                ),
+                            )
+                            if planned is not None:
+                                transit_planner_backend = "pybullet_cpu_rrt_fallback"
                         if planned is not None:
                             segment = planned
                     if anchor_index:
@@ -1912,18 +3058,11 @@ def _plan_stages(
                 )
             p.resetJointState(object_body, driver, start, physicsClientId=client)
             set_fingers(robot_body, fingers, approach_opening, client)
-            minimum_clearance, violations = _swept_clearance(
-                robot_body,
-                object_body,
-                arm,
-                robot_link_names,
-                robot_support_body,
-                forbidden,
-                target_contact,
+            minimum_clearance, violations, approach_gpu = exact_path_clearance(
                 list(approach),
+                forbidden.values(),
+                target_contact,
                 "approach",
-                search_distance,
-                client,
             )
             # A stage begins at the actual preceding robot state.  The first
             # stage starts at home; a later, different contact starts at the
@@ -1931,18 +3070,11 @@ def _plan_stages(
             # between contacts manufactures two unnecessary transits and can
             # drive the arm back through an already moved door or lid.
             if not continues_from_previous:
-                transit_minimum, transit_violations = _swept_clearance(
-                    robot_body,
-                    object_body,
-                    arm,
-                    robot_link_names,
-                    robot_support_body,
-                    forbidden,
-                    target_contact_during_transit,
+                transit_minimum, transit_violations, transit_gpu = exact_path_clearance(
                     list(transit_in),
+                    [*forbidden.values(), contact_link],
+                    None,
                     "transit_in",
-                    search_distance,
-                    client,
                 )
                 if transit_minimum is not None and (
                     minimum_clearance is None or transit_minimum < minimum_clearance
@@ -1952,6 +3084,30 @@ def _plan_stages(
             # The manipulation path is swept with the object at the states it will
             # actually pass through, since a forbidden link can move too.
             set_fingers(robot_body, fingers, opening, client)
+            manipulation_gpu_minimum = (
+                None
+                if manipulation_gpu_evidence is None
+                else manipulation_gpu_evidence.get(
+                    "minimum_environment_clearance_m"
+                )
+            )
+            if manipulation_gpu_minimum is not None and (
+                minimum_clearance is None
+                or float(manipulation_gpu_minimum) < minimum_clearance
+            ):
+                minimum_clearance = float(manipulation_gpu_minimum)
+            if (
+                manipulation_gpu_evidence is not None
+                and not manipulation_gpu_evidence.get("success")
+            ):
+                violations.append({
+                    "phase": "manipulate",
+                    "sample": manipulation_gpu_evidence.get("failed_sample"),
+                    "robot_link": "curobo_collision_spheres",
+                    "object_link": "source_mesh_environment",
+                    "distance_m": float(manipulation_gpu_minimum or 0.0),
+                    "reason": "gpu_source_mesh_collision",
+                })
             for sample_index, value in enumerate(object_path):
                 p.resetJointState(object_body, driver, float(value), physicsClientId=client)
                 sample_minimum, sample_violations = _swept_clearance(
@@ -1960,7 +3116,7 @@ def _plan_stages(
                     arm,
                     robot_link_names,
                     robot_support_body,
-                    forbidden,
+                    {},
                     target_contact,
                     [manipulation[sample_index]],
                     "manipulate",
@@ -1982,18 +3138,11 @@ def _plan_stages(
                 else opening
             )
             set_fingers(robot_body, fingers, retreat_opening, client)
-            retreat_minimum, retreat_violations = _swept_clearance(
-                robot_body,
-                object_body,
-                arm,
-                robot_link_names,
-                robot_support_body,
-                forbidden,
-                target_contact,
+            retreat_minimum, retreat_violations, retreat_gpu = exact_path_clearance(
                 list(retreat),
+                forbidden.values(),
+                target_contact,
                 "retreat",
-                search_distance,
-                client,
             )
             if retreat_minimum is not None and (
                 minimum_clearance is None or retreat_minimum < minimum_clearance
@@ -2006,7 +3155,10 @@ def _plan_stages(
                 and stage.get("release_before_phase") is not None
             )
             if validate_release_clearance and release_required is not None:
-                release_required = float(release_required)
+                # The serialized value is measured evidence, not a requested
+                # comfort margin. Strict validation requires only positive
+                # separation over the complete release and later object sweep.
+                release_required = 0.0
                 if len(retreat) < 2:
                     ik_failures.append(
                         {
@@ -2042,13 +3194,17 @@ def _plan_stages(
                 # Validate the exact dense joint path serialized into the stage
                 # plan and consumed by rollout, not a fresh endpoint chord.
                 release_path = list(retreat)
-                for sample_index, q in enumerate(release_path):
+                # The first retreat element is byte-identical to the final
+                # manipulation command and was already validated under the
+                # manipulation collision tolerance. Release clearance begins
+                # at the first newly commanded withdrawal sample.
+                for sample_index, q in enumerate(release_path[1:], start=1):
                     set_robot_arm(robot_body, arm, q, client)
-                    points = p.getClosestPoints(
+                    points = object_closest_points(
                         robot_body,
                         object_body,
                         0.25,
-                        physicsClientId=client,
+                        client,
                     )
                     distances = [
                         float(point[8])
@@ -2059,20 +3215,26 @@ def _plan_stages(
                     if robot_support_body is not None:
                         distances.extend(
                             float(point[8])
-                            for point in p.getClosestPoints(
+                            for point in object_closest_points(
                                 robot_support_body,
                                 object_body,
                                 0.25,
-                                physicsClientId=client,
+                                client,
                             )
                         )
                     if distances:
                         release_minimum = min(release_minimum, min(distances))
                 set_robot_arm(robot_body, arm, retreat[-1], client)
+                next_contact_phase = (
+                    str(execution["stages"][stage_index + 1]["source_phase"])
+                    if stage_index + 1 < len(execution["stages"])
+                    else None
+                )
                 for transition in _object_joint_transitions_from_phase(
                     object_plan,
                     final_state,
                     str(stage["release_before_phase"]),
+                    next_contact_phase,
                 ):
                     name = str(transition["joint"])
                     if name not in object_joints:
@@ -2091,21 +3253,21 @@ def _plan_stages(
                         )
                         distances = [
                             float(point[8])
-                            for point in p.getClosestPoints(
+                            for point in object_closest_points(
                                 robot_body,
                                 object_body,
                                 0.25,
-                                physicsClientId=client,
+                                client,
                             )
                         ]
                         if robot_support_body is not None:
                             distances.extend(
                                 float(point[8])
-                                for point in p.getClosestPoints(
+                                for point in object_closest_points(
                                     robot_support_body,
                                     object_body,
                                     0.25,
-                                    physicsClientId=client,
+                                    client,
                                 )
                             )
                         if distances:
@@ -2140,19 +3302,13 @@ def _plan_stages(
                 # return-to-home motion at that semantic boundary.
                 and stage.get("release_before_phase") is None
                 and next_stage is None
+                and not terminal_plan_hold
             ):
-                transit_out_minimum, transit_out_violations = _swept_clearance(
-                    robot_body,
-                    object_body,
-                    arm,
-                    robot_link_names,
-                    robot_support_body,
-                    forbidden,
-                    target_contact_during_transit,
+                transit_out_minimum, transit_out_violations, transit_out_gpu = exact_path_clearance(
                     _interpolate(retreat[-1], home, 90),
+                    [*forbidden.values(), contact_link],
+                    None,
                     "transit_out",
-                    search_distance,
-                    client,
                 )
                 if transit_out_minimum is not None and (
                     minimum_clearance is None
@@ -2202,6 +3358,14 @@ def _plan_stages(
                         if adjacent_steps.size
                         else 0.0
                     ),
+                    ik_backend=(
+                        "curobo_batch_ik_pybullet_verified"
+                        if curobo_path is not None
+                        else "pybullet"
+                    ),
+                    ik_backend_fallback_reason=curobo_fallback_reason,
+                    transit_planner_backend=transit_planner_backend,
+                    transit_planner_evidence=transit_planner_evidence,
                     debug_truncated=False,
                     debug_failure=debug_failure,
                     transit_in=transit_in,
@@ -2352,9 +3516,113 @@ def _grasp_constraint_key(stage: dict[str, Any], stage_index: int) -> str:
     return f"sequence:{sequence}" if sequence is not None else f"stage:{stage_index}"
 
 
+def _bilateral_grasp_sample(
+    contact_points: Iterable[tuple[Any, ...]],
+    required_robot_links: set[int],
+    target_object_link: int,
+    finger_joint_states: Iterable[tuple[Any, ...]],
+    approach_opening_m: float,
+    commanded_opening_m: float,
+) -> dict[str, Any]:
+    """Measure one real opposed-finger acquisition sample.
+
+    The agent does not nominate collision links or claim that a grasp worked.
+    ``required_robot_links`` is the application-derived pair of Panda finger
+    collision links.  PyBullet contact points, contact normals and measured
+    finger joint states are the only acquisition authority.
+    """
+    required = sorted(int(index) for index in required_robot_links)
+    contacts_by_link: dict[int, list[tuple[Any, ...]]] = {
+        index: [] for index in required
+    }
+    unexpected_contact_pairs: dict[str, int] = {}
+    for point in contact_points:
+        robot_link = int(point[3])
+        object_link = int(point[4])
+        if robot_link in contacts_by_link and object_link == int(target_object_link):
+            contacts_by_link[robot_link].append(point)
+        else:
+            key = f"{robot_link}|{object_link}"
+            unexpected_contact_pairs[key] = unexpected_contact_pairs.get(key, 0) + 1
+
+    both_links_contact = (
+        len(required) == 2
+        and all(bool(contacts_by_link[index]) for index in required)
+    )
+    minimum_normal_dot: float | None = None
+    if both_links_contact:
+        for left in contacts_by_link[required[0]]:
+            left_normal = np.asarray(left[7], dtype=np.float64)
+            left_norm = float(np.linalg.norm(left_normal))
+            if left_norm <= 1e-12:
+                continue
+            left_normal /= left_norm
+            for right in contacts_by_link[required[1]]:
+                right_normal = np.asarray(right[7], dtype=np.float64)
+                right_norm = float(np.linalg.norm(right_normal))
+                if right_norm <= 1e-12:
+                    continue
+                right_normal /= right_norm
+                dot = float(np.dot(left_normal, right_normal))
+                minimum_normal_dot = (
+                    dot
+                    if minimum_normal_dot is None
+                    else min(minimum_normal_dot, dot)
+                )
+    opposed_contact = bool(
+        minimum_normal_dot is not None
+        and minimum_normal_dot <= GRASP_CONTACT_NORMAL_MAXIMUM_DOT
+    )
+
+    states = list(finger_joint_states)
+    positions = [float(state[0]) for state in states]
+    speeds = [abs(float(state[1])) for state in states]
+    maximum_speed = max(speeds, default=float("inf"))
+    fingers_settled = bool(
+        len(states) == 2 and maximum_speed <= GRASP_FINGER_MAXIMUM_SPEED_M_S
+    )
+    closure_span = max(
+        float(approach_opening_m) - float(commanded_opening_m), 1e-9
+    )
+    closure_fractions = [
+        (float(approach_opening_m) - position) / closure_span
+        for position in positions
+    ]
+    minimum_closure_fraction = min(closure_fractions, default=-float("inf"))
+    sufficiently_closed = bool(
+        len(states) == 2
+        and minimum_closure_fraction >= GRASP_MINIMUM_CLOSURE_FRACTION
+    )
+    passed = bool(
+        both_links_contact
+        and opposed_contact
+        and fingers_settled
+        and sufficiently_closed
+        and not unexpected_contact_pairs
+    )
+    return {
+        "passed": passed,
+        "required_robot_links": required,
+        "contact_count_by_robot_link": {
+            str(index): len(contacts_by_link[index]) for index in required
+        },
+        "unexpected_contact_pairs": unexpected_contact_pairs,
+        "non_target_contact_zero": not unexpected_contact_pairs,
+        "both_finger_links_contact_target": both_links_contact,
+        "minimum_opposed_contact_normal_dot": minimum_normal_dot,
+        "opposed_contact_normals": opposed_contact,
+        "finger_joint_positions_m": positions,
+        "maximum_finger_speed_m_s": maximum_speed,
+        "fingers_settled": fingers_settled,
+        "minimum_closure_fraction": minimum_closure_fraction,
+        "sufficiently_closed": sufficiently_closed,
+    }
+
+
 def _schedule(
     plans: list[StagePlan], execution: dict[str, Any], plan: dict[str, Any]
 ) -> list[dict[str, Any]]:
+    object_plan = plan
     home = np.asarray(execution["robot"]["home_joint_positions"], dtype=np.float64)
     # The settle tail is the only window in which a released effect (a lid
     # closing after the pedal returns) can finish, so its length is execution
@@ -2502,6 +3770,36 @@ def _schedule(
                         timeline_phase,
                         0,
                     )
+            if plan.stage["interaction"] == "explicit_ideal_feasibility":
+                # Acquisition is deliberately split into three ordered pieces:
+                # close the fingers, let the real robot converge while the
+                # object driver remains locked, then create the single disclosed
+                # ideal constraint and stabilize it before manipulation.  The
+                # old schedule attached on the first contact-settle tick; a
+                # lagging arm could therefore drag an unlatched door before the
+                # commanded grasp pose had actually settled.
+                append_command(
+                    "contact_attach",
+                    index,
+                    plan.manipulation[0],
+                    opening,
+                    finger_force,
+                    timeline_phase,
+                    0,
+                )
+                constraint_settle_ticks = max(
+                    1, int(round(IDEAL_GRASP_CONSTRAINT_STABILIZE_S / DT))
+                )
+                for _ in range(constraint_settle_ticks):
+                    append_command(
+                        "grasp_stabilize",
+                        index,
+                        plan.manipulation[0],
+                        opening,
+                        finger_force,
+                        timeline_phase,
+                        0,
+                    )
         sample_ticks = max(
             1,
             int(
@@ -2577,11 +3875,13 @@ def _schedule(
                     finger_force,
                 )
                 stage_last_timeline_phase = held_through_timeline_phase
-            terminal_plan_hold = (
+            terminal_plan_hold = bool(
                 release_before_phase is None
-                and held_through_timeline_phase == len(timeline) - 1
-                and held_through_timeline_phase > timeline_phase
                 and index + 1 == len(plans)
+                and _terminal_plan_hold_phase_index(
+                    object_plan, execution, plan.stage
+                )
+                is not None
             )
             if terminal_plan_hold:
                 # There is no later semantic release boundary.  End the
@@ -2717,30 +4017,13 @@ def _attach(robot: int, eef: int, object_body: int, object_link: int, client: in
         childFrameOrientation=child_frame[1],
         physicsClientId=client,
     )
-    p.changeConstraint(constraint, maxForce=180.0, erp=0.35, physicsClientId=client)
+    p.changeConstraint(
+        constraint,
+        maxForce=IDEAL_GRASP_CONSTRAINT_FORCE_N,
+        erp=IDEAL_GRASP_CONSTRAINT_ERP,
+        physicsClientId=client,
+    )
     return constraint
-
-
-def _complete_declared_grasp_contact(
-    contact_points: list[tuple[Any, ...]] | tuple[tuple[Any, ...], ...],
-    required_robot_links: set[int],
-    target_object_link: int,
-) -> tuple[bool, set[int]]:
-    """Require simultaneous target contact from every declared grasp link.
-
-    ``explicit_ideal_feasibility`` means that a grasp may stay attached *after*
-    physical acquisition.  It must never turn one fingertip touch into an
-    attachment.  The execution therefore declares the complete set of robot
-    links that must be touching the target at the same collision-detection
-    instant (normally Panda's two opposing fingers).
-    """
-    observed = {
-        int(point[3])
-        for point in contact_points
-        if int(point[4]) == int(target_object_link)
-        and int(point[3]) in required_robot_links
-    }
-    return bool(required_robot_links) and required_robot_links.issubset(observed), observed
 
 
 def _project_pixel(
@@ -2766,13 +4049,21 @@ def _render_frame(
     status: str,
     phase: str,
     target_world: list[float] | None,
+    renderer: int,
 ) -> np.ndarray:
     camera = execution.get("camera", {})
     eye = camera.get("eye_m", [1.2, -1.2, 0.9])
     target = camera.get("target_m", [0.0, 0.0, 0.35])
     view = p.computeViewMatrix(eye, target, [0.0, 0.0, 1.0])
     projection = p.computeProjectionMatrixFOV(float(camera.get("fov_deg", 50.0)), 4.0 / 3.0, 0.02, 6.0)
-    _, _, rgba, _, _ = p.getCameraImage(960, 720, view, projection, renderer=p.ER_TINY_RENDERER, physicsClientId=client)
+    _, _, rgba, _, _ = p.getCameraImage(
+        960,
+        720,
+        view,
+        projection,
+        renderer=renderer,
+        physicsClientId=client,
+    )
     image = Image.fromarray(np.asarray(rgba, dtype=np.uint8).reshape(720, 960, 4), "RGBA").convert("RGB")
     draw = ImageDraw.Draw(image)
     draw.rectangle((0, 0, 960, 34), fill=(18, 22, 29))
@@ -2801,6 +4092,56 @@ def _render_frame(
     return np.asarray(image, dtype=np.uint8)
 
 
+def _select_rollout_frame_renderer(client: int) -> tuple[int, dict[str, Any]]:
+    """Use EGL hardware OpenGL when this PyBullet build actually provides it.
+
+    Merely passing ``ER_BULLET_HARDWARE_OPENGL`` to a DIRECT client on Windows
+    silently runs TinyRenderer.  Probe for the real EGL plugin instead and
+    record an explicit fallback.  ``ARTIMO_PYBULLET_RENDERER=gpu`` makes the
+    absence of a hardware context an error rather than an undisclosed fallback.
+    """
+    requested = os.environ.get("ARTIMO_PYBULLET_RENDERER", "auto").strip().lower()
+    if requested not in {"auto", "gpu", "egl", "cpu", "tiny"}:
+        raise ValueError(
+            "ARTIMO_PYBULLET_RENDERER must be auto, gpu, egl, cpu, or tiny"
+        )
+    if requested in {"auto", "gpu", "egl"}:
+        loader = pkgutil.get_loader("eglRenderer")
+        if loader is not None:
+            try:
+                plugin_id = p.loadPlugin(
+                    loader.get_filename(), "_eglRendererPlugin", physicsClientId=client
+                )
+            except Exception as exc:  # pragma: no cover - platform/plugin guard
+                plugin_id = -1
+                failure = str(exc)
+            else:
+                failure = None
+            if plugin_id >= 0:
+                return p.ER_BULLET_HARDWARE_OPENGL, {
+                    "backend": "egl_hardware_opengl",
+                    "hardware_accelerated": True,
+                    "requested": requested,
+                    "plugin_id": int(plugin_id),
+                }
+        else:
+            failure = "eglRenderer plugin is not installed in this PyBullet build"
+        if requested in {"gpu", "egl"}:
+            raise RuntimeError(
+                "GPU PyBullet rendering was requested but unavailable: " + str(failure)
+            )
+    return p.ER_TINY_RENDERER, {
+        "backend": "tiny_renderer",
+        "hardware_accelerated": False,
+        "requested": requested,
+        "fallback_reason": (
+            "eglRenderer plugin is not installed in this PyBullet build"
+            if requested == "auto"
+            else None
+        ),
+    }
+
+
 def _rollout(
     object_urdf: Path,
     robot_urdf: Path,
@@ -2812,12 +4153,14 @@ def _rollout(
     condition: str,
     video_path: Path | None,
     debug_partial: bool = False,
+    maximum_command_count: int | None = None,
 ) -> dict[str, Any]:
     client = p.connect(p.DIRECT)
     if client < 0:
         raise RuntimeError("Could not connect PyBullet rollout client")
     writer = None
     video_encoding = None
+    frame_renderer, frame_rendering = _select_rollout_frame_renderer(client)
     try:
         p.setPhysicsEngineParameter(
             fixedTimeStep=DT,
@@ -2838,6 +4181,19 @@ def _rollout(
         robot_spec = execution["robot"]
         arm = [robot_joints[name] for name in robot_spec["arm_joint_names"]]
         fingers = [robot_joints[name] for name in robot_spec["finger_joint_names"]]
+        arm_effort_limits = [
+            (
+                float(p.getJointInfo(robot_body, joint, physicsClientId=client)[10])
+                or PANDA_ARM_FORCE_N
+            )
+            * PANDA_ARM_FORCE_SCALE
+            for joint in arm
+        ]
+        finger_effort_limits = [
+            float(p.getJointInfo(robot_body, joint, physicsClientId=client)[10])
+            or PANDA_FINGER_FORCE_N
+            for joint in fingers
+        ]
         eef = robot_links[robot_spec["end_effector_link"]]
         for name, value in initial.items():
             if name in object_joints:
@@ -2860,7 +4216,7 @@ def _rollout(
         for name in undeclared_object_joints:
             joint = object_joints[name]
             maximum_force = max(
-                1.0,
+                DEFAULT_OBJECT_HOLD_FORCE_OR_TORQUE,
                 float(p.getJointInfo(object_body, joint, physicsClientId=client)[10]),
             )
             p.setJointMotorControl2(
@@ -2902,6 +4258,9 @@ def _rollout(
             writer, video_encoding = artimo_video.open_h264_writer(
                 video_path, fps=VIDEO_FPS, macro_block_size=1
             )
+            video_encoding["frame_rendering"] = frame_rendering
+            video_encoding["fps"] = VIDEO_FPS
+            video_encoding["resolution"] = [960, 720]
         stage_metrics = [
             {
                 "stage_id": plan.stage["id"],
@@ -2962,6 +4321,22 @@ def _rollout(
             for index, plan in enumerate(plans)
             if plan.stage["interaction"] == "explicit_ideal_feasibility"
         }
+        acquisition_required_ticks = max(
+            1, int(round(GRASP_ACQUISITION_DWELL_S / DT))
+        )
+        acquisition_states = {
+            key: {
+                "consecutive_pass_ticks": 0,
+                "maximum_consecutive_pass_ticks": 0,
+                "acquired": False,
+                "attach_tick": None,
+                "failed_attach_tick": None,
+                "last_sample": None,
+            }
+            for key in required_constraint_keys
+        }
+        aborted_after_failed_acquisition = False
+        executed_command_count = 0
         initial_driver = {
             plan.stage["id"]: float(initial.get(plan.stage["driver_joint"], 0.0)) for plan in plans
         }
@@ -2969,7 +4344,13 @@ def _rollout(
         contact_released_driver_joints: set[str] = set()
         timeline_phase_order = _timeline_phase_order(object_plan)
 
-        for tick, command in enumerate(commands):
+        scheduled_commands = (
+            commands
+            if maximum_command_count is None
+            else commands[: int(maximum_command_count)]
+        )
+        for tick, command in enumerate(scheduled_commands):
+            executed_command_count = tick + 1
             stage_index = command.get("stage")
             phase = str(command["phase"])
             p.setJointMotorControlArray(
@@ -2977,7 +4358,7 @@ def _rollout(
                 arm,
                 p.POSITION_CONTROL,
                 targetPositions=command["arm"],
-                forces=[PANDA_ARM_FORCE_N * PANDA_ARM_FORCE_SCALE] * len(arm),
+                forces=arm_effort_limits,
                 positionGains=[PANDA_ARM_POSITION_GAIN] * len(arm),
                 velocityGains=[1.0] * len(arm),
                 physicsClientId=client,
@@ -3005,7 +4386,7 @@ def _rollout(
                     )
                     continue
                 maximum_force = max(
-                    1.0,
+                    DEFAULT_OBJECT_HOLD_FORCE_OR_TORQUE,
                     float(
                         p.getJointInfo(
                             object_body, joint, physicsClientId=client
@@ -3048,7 +4429,10 @@ def _rollout(
                 fingers,
                 p.POSITION_CONTROL,
                 targetPositions=[float(command["finger"])] * len(fingers),
-                forces=[float(command["finger_force_n"])] * len(fingers),
+                forces=[
+                    min(float(command["finger_force_n"]), effort)
+                    for effort in finger_effort_limits
+                ],
                 physicsClientId=client,
             )
             if stage_index is not None:
@@ -3056,30 +4440,6 @@ def _rollout(
                 constraint_key = _grasp_constraint_key(
                     active_stage_plan.stage, int(stage_index)
                 )
-                if (
-                    active_stage_plan.stage["interaction"]
-                    == "explicit_ideal_feasibility"
-                    and phase == "manipulate"
-                    and constraint_key not in constraints
-                    and condition == "physical"
-                ):
-                    allowed_robot, allowed_object = allowed_by_stage[int(stage_index)]
-                    physically_acquired, _ = _complete_declared_grasp_contact(
-                        p.getContactPoints(
-                            robot_body, object_body, physicsClientId=client
-                        ),
-                        allowed_robot,
-                        allowed_object,
-                    )
-                    if physically_acquired:
-                        constraints[constraint_key] = _attach(
-                            robot_body,
-                            eef,
-                            object_body,
-                            object_links[active_stage_plan.stage["contact_link"]],
-                            client,
-                        )
-                        created_constraints += 1
                 if phase in {"contact_release", "retreat"} and constraint_key in constraints:
                     p.removeConstraint(constraints.pop(constraint_key), physicsClientId=client)
 
@@ -3135,12 +4495,12 @@ def _rollout(
                 if minimum_clearance > 0.0:
                     for effect in rule["effects"]:
                         effect_link = object_joints[effect["joint"]]
-                        nearby = p.getClosestPoints(
+                        nearby = object_closest_points(
                             robot_body,
                             object_body,
                             minimum_clearance,
-                            linkIndexB=effect_link,
-                            physicsClientId=client,
+                            client,
+                            link_index_b=effect_link,
                         )
                         if nearby:
                             clearance_passed = False
@@ -3200,6 +4560,75 @@ def _rollout(
 
             p.stepSimulation(physicsClientId=client)
             p.performCollisionDetection(physicsClientId=client)
+            all_object_contacts = object_contact_points(
+                robot_body, object_body, client
+            )
+            if stage_index is not None:
+                acquisition_plan = plans[int(stage_index)]
+                acquisition_key = _grasp_constraint_key(
+                    acquisition_plan.stage, int(stage_index)
+                )
+                if (
+                    condition == "physical"
+                    and acquisition_plan.stage["interaction"]
+                    == "explicit_ideal_feasibility"
+                    and acquisition_key not in constraints
+                    and phase in {"contact_settle", "contact_attach"}
+                ):
+                    allowed_robot, allowed_object = allowed_by_stage[
+                        int(stage_index)
+                    ]
+                    sample = _bilateral_grasp_sample(
+                        all_object_contacts,
+                        allowed_robot,
+                        allowed_object,
+                        [
+                            p.getJointState(
+                                robot_body, joint, physicsClientId=client
+                            )
+                            for joint in fingers
+                        ],
+                        float(
+                            acquisition_plan.stage["contact_acquisition"][
+                                "approach_finger_opening_m"
+                            ]
+                        ),
+                        float(command["finger"]),
+                    )
+                    state = acquisition_states[acquisition_key]
+                    state["last_sample"] = sample
+                    state["consecutive_pass_ticks"] = (
+                        int(state["consecutive_pass_ticks"]) + 1
+                        if sample["passed"]
+                        else 0
+                    )
+                    state["maximum_consecutive_pass_ticks"] = max(
+                        int(state["maximum_consecutive_pass_ticks"]),
+                        int(state["consecutive_pass_ticks"]),
+                    )
+                    if (
+                        int(state["consecutive_pass_ticks"])
+                        >= acquisition_required_ticks
+                    ):
+                        # Transition as soon as the measured dwell is complete;
+                        # the remaining settle commands then stabilize an
+                        # already-proven grasp instead of waiting for a timer.
+                        constraints[acquisition_key] = _attach(
+                            robot_body,
+                            eef,
+                            object_body,
+                            allowed_object,
+                            client,
+                        )
+                        created_constraints += 1
+                        state["acquired"] = True
+                        state["attach_tick"] = int(tick)
+                    elif phase == "contact_attach":
+                            # Do not execute even one manipulation command after
+                            # a failed physical acquisition.  The negative
+                            # control later receives this exact command prefix.
+                            state["failed_attach_tick"] = int(tick)
+                            aborted_after_failed_acquisition = True
             maximum_constraints = max(maximum_constraints, p.getNumConstraints(physicsClientId=client))
             command_q = np.asarray(command["arm"], dtype=np.float64)
             actual_q = np.asarray(
@@ -3255,11 +4684,25 @@ def _rollout(
                     float(metric["maximum_driver_displacement"]),
                     current_driver_displacement[index],
                 )
-                target_observed = False
-                for point in p.getContactPoints(robot_body, object_body, physicsClientId=client):
+                constraint_key = _grasp_constraint_key(
+                    plans[index].stage, index
+                )
+                ideal_contact_active = bool(
+                    plans[index].stage["interaction"]
+                    == "explicit_ideal_feasibility"
+                    and constraint_key in constraints
+                    and condition == "physical"
+                )
+                target_observed = ideal_contact_active
+                if ideal_contact_active:
+                    # The stabilizing constraint can only exist after the
+                    # measured bilateral-contact dwell gate has passed.
+                    metric["target_contact_observations"] += 1
+                for point in all_object_contacts:
                     robot_link, object_link = int(point[3]), int(point[4])
                     if robot_link in allowed_robot and object_link == allowed_object:
-                        metric["target_contact_observations"] += 1
+                        if not ideal_contact_active:
+                            metric["target_contact_observations"] += 1
                         target_observed = True
                     else:
                         metric["non_target_contact_observations"] += 1
@@ -3281,8 +4724,8 @@ def _rollout(
                             float(record["deepest_penetration_m"]), float(point[8])
                         )
                 if robot_support_body is not None:
-                    for point in p.getContactPoints(
-                        robot_support_body, object_body, physicsClientId=client
+                    for point in object_contact_points(
+                        robot_support_body, object_body, client
                     ):
                         object_link = int(point[4])
                         metric["non_target_contact_observations"] += 1
@@ -3307,9 +4750,19 @@ def _rollout(
                 if target_observed:
                     if metric["first_target_contact_tick"] is None:
                         metric["first_target_contact_tick"] = int(tick)
-                    contact_released_driver_joints.add(
-                        str(plans[index].stage["driver_joint"])
-                    )
+                    # A raw fingertip contact during closing is not permission
+                    # to unlatch an explicit ideal interaction.  Release that
+                    # object driver only once the constraint is active and the
+                    # first manipulation command has begun.  This prevents a
+                    # door from moving backwards before the grasp is complete.
+                    if (
+                        plans[index].stage["interaction"]
+                        != "explicit_ideal_feasibility"
+                        or (ideal_contact_active and phase == "manipulate")
+                    ):
+                        contact_released_driver_joints.add(
+                            str(plans[index].stage["driver_joint"])
+                        )
                     current_contact_ticks[index] += 1
                     metric["maximum_continuous_contact_ticks"] = max(
                         int(metric["maximum_continuous_contact_ticks"]), current_contact_ticks[index]
@@ -3351,8 +4804,12 @@ def _rollout(
                         + f" | phase={phase} | stage={stage_index}",
                         phase,
                         target_world,
+                        frame_renderer,
                     )
                 )
+
+            if aborted_after_failed_acquisition:
+                break
 
         for constraint in list(constraints.values()):
             p.removeConstraint(constraint, physicsClientId=client)
@@ -3472,10 +4929,25 @@ def _rollout(
             "object_joint_maximum_initial_displacements": maximum_initial_displacements,
             "created_fixed_constraints": created_constraints,
             "required_ideal_grasp_constraints": len(required_constraint_keys),
+            "grasp_acquisition": [
+                {
+                    "constraint_key": key,
+                    "required_consecutive_ticks": acquisition_required_ticks,
+                    "required_dwell_s": GRASP_ACQUISITION_DWELL_S,
+                    **state,
+                }
+                for key, state in sorted(acquisition_states.items())
+            ],
+            "aborted_after_failed_grasp_acquisition": bool(
+                aborted_after_failed_acquisition
+            ),
+            "executed_command_count": int(executed_command_count),
             "maximum_runtime_constraint_count": maximum_constraints,
             "object_joint_resets_after_initialization": 0,
             "undeclared_object_joints": undeclared_object_joints,
-            "robot_command_schedule_sha256": _canonical_hash(commands),
+            "robot_command_schedule_sha256": _canonical_hash(
+                scheduled_commands[:executed_command_count]
+            ),
             "robot_tracking": robot_tracking,
             "video_encoding": video_encoding,
         }
@@ -3628,17 +5100,38 @@ def _object_joint_transitions_from_phase(
     plan: dict[str, Any],
     start_state: dict[str, float],
     start_phase: str,
+    stop_before_phase: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Return every sequential plan joint sweep at and after a release phase."""
+    """Return plan sweeps after release, optionally stopping at reacquisition.
+
+    ``stop_before_phase`` is exclusive.  A cross-contact release whose boundary
+    is the next robot-contact phase therefore has no stationary post-release
+    object sweep: its subsequent motion belongs to that next manipulation
+    block, while the path between contacts belongs to the transit planner.
+    """
     state = {str(name): float(value) for name, value in start_state.items()}
     transitions: list[dict[str, Any]] = []
-    started = False
-    for phase in plan.get("timeline", []):
+    timeline = list(plan.get("timeline", []))
+    phase_indices = {
+        str(phase["name"]): index for index, phase in enumerate(timeline)
+    }
+    if str(start_phase) not in phase_indices:
+        raise ValueError(f"Unknown release phase {start_phase!r} in plan timeline")
+    start_index = phase_indices[str(start_phase)]
+    stop_index = len(timeline)
+    if stop_before_phase is not None:
+        if str(stop_before_phase) not in phase_indices:
+            raise ValueError(
+                f"Unknown post-release stop phase {stop_before_phase!r} in plan timeline"
+            )
+        stop_index = phase_indices[str(stop_before_phase)]
+        if stop_index < start_index:
+            raise ValueError(
+                f"Post-release stop phase {stop_before_phase!r} precedes "
+                f"release phase {start_phase!r}"
+            )
+    for phase in timeline[start_index:stop_index]:
         phase_name = str(phase["name"])
-        if phase_name == str(start_phase):
-            started = True
-        if not started:
-            continue
         for control_index, control in enumerate(phase.get("controls", [])):
             joint = str(control.get("joint", ""))
             target = artimo_plan.control_target(control)
@@ -3657,8 +5150,6 @@ def _object_joint_transitions_from_phase(
                     }
                 )
             state[joint] = target
-    if not started:
-        raise ValueError(f"Unknown release phase {start_phase!r} in plan timeline")
     return transitions
 
 
@@ -3668,6 +5159,49 @@ def _timeline_phase_order(object_plan: dict[str, Any]) -> dict[str, int]:
         str(item["name"]): index
         for index, item in enumerate(object_plan.get("timeline", []))
     }
+
+
+def _terminal_plan_hold_phase_index(
+    object_plan: dict[str, Any],
+    execution: dict[str, Any],
+    stage: dict[str, Any],
+) -> int | None:
+    """Return the terminal hold phase retained by ``stage``, if any.
+
+    A terminal plan-owned ``hold_position`` has no release boundary.  The
+    robot therefore remains at the final manipulation command with the grasp
+    active.  This helper is shared by path planning and scheduling so the
+    planner cannot reject a candidate for a release/retreat/home segment that
+    the scheduler will never execute.
+    """
+    timeline = list(object_plan.get("timeline", []))
+    phase_order = _timeline_phase_order(object_plan)
+    source_phase = str(stage.get("source_phase", ""))
+    if source_phase not in phase_order:
+        return None
+    ownership = {
+        (str(row["source_phase"]), int(row["source_control_index"])): row
+        for row in execution.get("control_execution", [])
+    }
+    driver_joint = str(stage.get("driver_joint", ""))
+    source_index = int(phase_order[source_phase])
+    held_through = source_index
+    for phase_index in range(source_index + 1, len(timeline)):
+        phase = timeline[phase_index]
+        phase_name = str(phase.get("name", ""))
+        retains_driver = any(
+            str(control.get("mode", "")) == "hold_position"
+            and str(control.get("joint", "")) == driver_joint
+            and ownership.get((phase_name, control_index), {}).get("motion_owner")
+            == "hold"
+            for control_index, control in enumerate(phase.get("controls", []))
+        )
+        if not retains_driver:
+            break
+        held_through = phase_index
+    if held_through == len(timeline) - 1 and held_through > source_index:
+        return held_through
+    return None
 
 
 def _joint_first_motion_ticks(
@@ -3763,34 +5297,20 @@ def _require_matching_mechanism(source_urdf: Path, simulation_urdf: Path) -> Non
 def resolve_simulation_urdf(
     task: dict[str, Any], execution: dict[str, Any], source_urdf: Path
 ) -> Path:
-    """Resolve a collision-only URDF without turning it into shared config.
+    """Return the locked source collision model (or an explicit task input).
 
-    A pre-supplied task physics URDF remains supported for external handoffs.
-    A fresh agent task instead records its derived proxy in execution data and
-    must keep the file below that task's own `.artimo-runs/<task_id>/` tree. This
-    prevents another asset/task's proxy from becoming an implicit prior.
+    Collision representation is not agent-authored execution data.  In
+    particular, do not automatically replace source meshes with convex hulls or
+    V-HACD parts: those representations are not geometrically equivalent and
+    can close real free space.  A separately locked task input remains valid,
+    but ordinary runs use the source URDF byte-for-byte.
     """
     task_value = task["inputs"].get("physics_urdf")
-    execution_value = execution.get("physics_urdf")
-    if task_value and execution_value:
-        raise ValueError(
-            "physics_urdf must be declared either by the frozen task or by "
-            "execution data, not both"
-        )
-    if execution_value:
-        resolved = _resolve(execution_value)
-        task_debug_root = (REPO_ROOT / ".artimo-runs" / str(task["task_id"])).resolve()
-        try:
-            resolved.relative_to(task_debug_root)
-        except ValueError as exc:
-            raise ValueError(
-                "execution.physics_urdf must be below the current task debug "
-                f"directory {task_debug_root}"
-            ) from exc
-        return resolved
-    if task_value:
-        return _resolve(task_value)
-    return source_urdf
+    # Deliberately ignore a legacy execution.physics_urdf value.  Old debug
+    # executions remain readable, but they cannot change collision semantics.
+    simulation_urdf = _resolve(task_value) if task_value else source_urdf.resolve()
+    _require_matching_mechanism(source_urdf.resolve(), simulation_urdf)
+    return simulation_urdf
 
 
 def run(
@@ -3802,7 +5322,7 @@ def run(
 ) -> dict[str, Any]:
     task = _read_json(task_spec_path)
     execution_input = _read_json(execution_path)
-    execution = execution_input
+    execution = materialize_execution_defaults(task, execution_input)
     if task.get("schema_version") != 2 or execution.get("schema_version") != 2:
         raise ValueError("Expected task schema v2 and execution schema v2")
     inputs = task["inputs"]
@@ -3810,9 +5330,8 @@ def run(
     robot_urdf = _resolve(inputs["robot_urdf"])
     plan_path = _resolve(inputs["plan"])
     _validate_execution_schema(execution)
-    # A collision-only URDF may be frozen in the task handoff or generated by
-    # the fresh agent and declared in execution data. In both cases the source
-    # URDF remains the mechanism contract.
+    # One application-owned collision model is shared by planning and rollout;
+    # the source URDF remains the mechanism and visual contract.
     simulation_urdf = resolve_simulation_urdf(task, execution, object_urdf)
     for path in (object_urdf, simulation_urdf, robot_urdf, plan_path, execution_path):
         if not path.is_file():
@@ -3825,14 +5344,20 @@ def run(
     execution = grounding.pop("execution")
     requests = _plan_requests(plan)
     _validate_execution_against_plan(plan, execution)
-    plans = _plan_stages(
-        simulation_urdf,
-        robot_urdf,
-        execution,
-        initial,
-        allow_partial_debug=allow_partial_debug,
-        object_plan=plan,
-    )
+    ik_path_solver = create_curobo_backend(execution, robot_urdf, execution["robot"])
+    try:
+        plans = _plan_stages(
+            simulation_urdf,
+            robot_urdf,
+            execution,
+            initial,
+            allow_partial_debug=allow_partial_debug,
+            object_plan=plan,
+            ik_path_solver=ik_path_solver,
+        )
+    finally:
+        if ik_path_solver is not None:
+            ik_path_solver.close()
     ik_diagnostics = [
         plan.debug_failure for plan in plans if plan.debug_failure is not None
     ]
@@ -3862,6 +5387,7 @@ def run(
         "contact_disabled",
         None,
         debug_partial=bool(ik_diagnostics),
+        maximum_command_count=int(physical["executed_command_count"]),
     )
     motion = _joint_motion(requests, initial, physical["joint_history"])
     requested_joints = {request["joint"] for request in requests}
@@ -3922,8 +5448,7 @@ def run(
                     "release_then_passive_sweep",
                     "release_then_plan_sweep",
                 }
-                and float(sample.get("distance_m", -math.inf))
-                >= float(item.stage["minimum_release_swept_clearance_m"])
+                and float(sample.get("distance_m", -math.inf)) > 0.0
                 for sample in item.swept_clearance_violations
             )
             for item in plans
@@ -3961,6 +5486,12 @@ def run(
             for item in physical["contacts"]
         ),
         "physical_grasp_acquisition": (
+            not physical["aborted_after_failed_grasp_acquisition"]
+            and all(
+                bool(item["acquired"])
+                for item in physical["grasp_acquisition"]
+            )
+            and
             int(physical["created_fixed_constraints"])
             == int(physical["required_ideal_grasp_constraints"])
         ),
@@ -3998,7 +5529,10 @@ def run(
             and diagnostics_passed
         ),
         "video_exported": bool(video_path is not None and video_path.is_file()),
-        "rollout_completed": len(plans) == len(execution["stages"]),
+        "rollout_completed": bool(
+            not physical["aborted_after_failed_grasp_acquisition"]
+            and int(physical["executed_command_count"]) == len(commands)
+        ),
         "diagnostics_passed": diagnostics_passed,
         "debug_partial_rollout": {
             "enabled": False,
@@ -4021,6 +5555,10 @@ def run(
                 "minimum_joint_limit_margin_sample": plan.minimum_joint_limit_margin_sample,
                 "minimum_joint_limit_margin_joint": plan.minimum_joint_limit_margin_joint,
                 "maximum_adjacent_joint_step_rad": plan.maximum_adjacent_joint_step_rad,
+                "ik_backend": plan.ik_backend,
+                "ik_backend_fallback_reason": plan.ik_backend_fallback_reason,
+                "transit_planner_backend": plan.transit_planner_backend,
+                "transit_planner_evidence": plan.transit_planner_evidence,
                 "tightest_swept_samples": plan.swept_clearance_violations,
                 "debug_truncated": plan.debug_truncated,
                 "debug_failure": plan.debug_failure,
@@ -4038,6 +5576,11 @@ def run(
             "object_urdf_sha256": _sha256(object_urdf),
             "simulated_urdf_sha256": _sha256(simulation_urdf),
             "collision_proxy_used": simulation_urdf != object_urdf,
+            "collision_model_policy": (
+                "task_locked_collision_model"
+                if simulation_urdf != object_urdf
+                else "source_urdf_meshes"
+            ),
             "robot_urdf_sha256": _sha256(robot_urdf),
             "initial_joint_state_source": (
                 "trajectory_first_frame"

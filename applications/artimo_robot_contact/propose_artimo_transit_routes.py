@@ -206,7 +206,7 @@ def _outer_contact_pose(
         object_body,
         object_links[stage["contact_link"]],
         stage["contact_pose_link"],
-        float(stage.get("grasp_depth_m", 0.0))
+        ph._effective_grasp_depth(stage)
         + float(stage["precontact_offset_m"]),
         client,
         stage.get("robot_tool_contact_offset_eef_m"),
@@ -225,6 +225,7 @@ def propose(
 ) -> dict[str, Any]:
     if expansion_margin_m <= 0.0:
         raise ValueError("expansion_margin_m must be positive")
+    execution = ph.materialize_execution_defaults(task, execution)
     ph._validate_execution_schema(execution)
     plan_json = ph._read_json(ph._resolve(task["inputs"]["plan"]))
     ph._validate_execution_against_plan(plan_json, execution)

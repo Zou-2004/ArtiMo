@@ -19,11 +19,15 @@ candidate is reported.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
+import copy
 import hashlib
 import itertools
 import json
 import math
 import sys
+import threading
+import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any, Iterable
@@ -36,7 +40,123 @@ REPO = APP_ROOT.parents[1]
 sys.path.insert(0, str(APP_ROOT))
 
 import run_artimo_physics as ph  # noqa: E402
-from artimo_ik import BulletIK, set_fingers, set_robot_arm  # noqa: E402
+from artimo_curobo import create_curobo_backend  # noqa: E402
+from artimo_ik import (  # noqa: E402
+    BulletIK,
+    link_world_pose,
+    quat_angle_rad,
+    set_fingers,
+    set_robot_arm,
+)
+
+
+# Depth is an application-owned one-dimensional contact search.  Positive
+# values are shallower relative to the Panda centered-grasp baseline; candidates
+# are ordered shallow-to-deep so the first dense pass uses the least intrusive
+# pose that still brings both fingers within target-contact range.
+RULE_BASED_GRASP_DEPTH_ADJUSTMENTS_M = (
+    0.015,
+    0.010,
+    0.005,
+    0.000,
+    -0.005,
+    -0.010,
+)
+SPARSE_GPU_BASE_BATCH_SIZE = 16
+
+
+class _SparseBatchIKProxy:
+    """Coalesce concurrent sparse candidate paths into one cuRobo request."""
+
+    def __init__(self, backend: Any, maximum_batch_size: int) -> None:
+        self.backend = backend
+        self.maximum_batch_size = int(maximum_batch_size)
+        self.allow_bullet_fallback = backend.allow_bullet_fallback
+        self.environment_collision = backend.environment_collision
+        self.self_collision = backend.self_collision
+        self._condition = threading.Condition()
+        self._queue: list[dict[str, Any]] = []
+        self._running = True
+        self._dispatcher = threading.Thread(
+            target=self._dispatch, name="artimo-sparse-gpu-batcher", daemon=True
+        )
+        self._dispatcher.start()
+
+    def solve_path(
+        self,
+        positions_world: Any,
+        quaternions_xyzw_world: Any,
+        robot_base_position_world: Any,
+        robot_base_quaternion_xyzw_world: Any,
+        reference: Any,
+        maximum_joint_step_rad: float | None,
+        enforce_start_step: bool,
+        obstacle_worlds_by_sample: Any = None,
+        sequential: bool = False,
+    ) -> dict[str, Any]:
+        pending = {
+            "request": {
+                "positions_world": positions_world,
+                "quaternions_xyzw_world": quaternions_xyzw_world,
+                "robot_base_position_world": robot_base_position_world,
+                "robot_base_quaternion_xyzw_world": robot_base_quaternion_xyzw_world,
+                "reference": list(map(float, reference)),
+                "maximum_joint_step_rad": maximum_joint_step_rad,
+                "enforce_start_step": bool(enforce_start_step),
+                "sequential": bool(sequential),
+                "obstacle_worlds_by_sample": (
+                    []
+                    if obstacle_worlds_by_sample is None
+                    else obstacle_worlds_by_sample
+                ),
+            },
+            "event": threading.Event(),
+            "response": None,
+            "error": None,
+        }
+        with self._condition:
+            if not self._running:
+                raise RuntimeError("Sparse GPU batcher is closed")
+            self._queue.append(pending)
+            self._condition.notify_all()
+        pending["event"].wait()
+        if pending["error"] is not None:
+            raise pending["error"]
+        return pending["response"]
+
+    def _dispatch(self) -> None:
+        while True:
+            with self._condition:
+                while self._running and not self._queue:
+                    self._condition.wait()
+                if not self._running and not self._queue:
+                    return
+                deadline = time.perf_counter() + 0.10
+                while self._running and len(self._queue) < self.maximum_batch_size:
+                    remaining = deadline - time.perf_counter()
+                    if remaining <= 0.0:
+                        break
+                    self._condition.wait(timeout=remaining)
+                batch = self._queue[: self.maximum_batch_size]
+                del self._queue[: self.maximum_batch_size]
+            try:
+                responses = self.backend.solve_paths_batch(
+                    [item["request"] for item in batch]
+                )
+                for item, response in zip(batch, responses):
+                    item["response"] = response
+            except Exception as exc:
+                for item in batch:
+                    item["error"] = exc
+            finally:
+                for item in batch:
+                    item["event"].set()
+
+    def close(self) -> None:
+        with self._condition:
+            self._running = False
+            self._condition.notify_all()
+        self._dispatcher.join()
 
 
 def _sha256(path: Path) -> str:
@@ -82,6 +202,18 @@ def _validated_orientation_gate(
     missing = sorted(required_stage_ids - set(gated_ids))
     if missing:
         raise ValueError(f"Orientation gate does not cover grasp stages {missing}")
+    for gated_stage in gate.get("stages", []):
+        if "inherited_from_stage_id" in gated_stage:
+            continue
+        if gated_stage.get("agent_decision_scope") != "wrist_angle_only":
+            raise ValueError(
+                "Orientation gate predates angle-only agent decisions; rerender "
+                "the five-roll batch and apply schema-v4 decisions"
+            )
+        if gated_stage.get("grasp_depth_owner") != "application_rule_based_dense_search":
+            raise ValueError("Orientation gate gives grasp depth to the wrong owner")
+        if gated_stage.get("selected_angle_status") != "valid":
+            raise ValueError("Orientation gate selected angle did not pass visual review")
     groups = gate.get("placement_candidate_groups")
     if not isinstance(groups, list) or not groups:
         raise ValueError(
@@ -155,9 +287,19 @@ def _gated_orientation_options(
             source = ph._read_json(Path(str(choice["execution"])).resolve())
             source_by_id = {str(stage["id"]): stage for stage in source["stages"]}
             for stage_id in group["stage_ids"]:
-                oriented["stages"][stages_by_id[str(stage_id)]]["contact_pose_link"][
-                    "rotation_xyzw"
-                ] = list(source_by_id[str(stage_id)]["contact_pose_link"]["rotation_xyzw"])
+                target_stage = oriented["stages"][stages_by_id[str(stage_id)]]
+                source_stage = source_by_id[str(stage_id)]
+                if "contact_roll_deg" in source_stage:
+                    target_stage["contact_roll_deg"] = float(
+                        source_stage["contact_roll_deg"]
+                    )
+                if "contact_frame_source" in source_stage:
+                    target_stage["contact_frame_source"] = str(
+                        source_stage["contact_frame_source"]
+                    )
+                target_stage["contact_pose_link"]["rotation_xyzw"] = list(
+                    source_stage["contact_pose_link"]["rotation_xyzw"]
+                )
             ids.append(str(choice["id"]))
             priorities.append(int(choice["visual_priority"]))
         options.append(
@@ -169,6 +311,61 @@ def _gated_orientation_options(
             }
         )
     return options
+
+
+def _rule_based_grasp_depth_groups(
+    execution: dict[str, Any],
+) -> list[tuple[str, list[int]]]:
+    """Group stages that must preserve one application-selected grasp depth."""
+    grouped: dict[str, list[int]] = {}
+    for index, stage in enumerate(execution.get("stages", [])):
+        if stage.get("interaction") != "explicit_ideal_feasibility":
+            continue
+        sequence = stage.get("contact_sequence")
+        key = (
+            f"sequence:{sequence}"
+            if sequence is not None
+            else f"stage:{stage['id']}"
+        )
+        grouped.setdefault(key, []).append(index)
+    return list(grouped.items())
+
+
+def _reset_agent_grasp_depths(execution: dict[str, Any]) -> dict[str, Any]:
+    """Remove task-agent depth authority before placement search."""
+    answer = copy.deepcopy(execution)
+    for _, indices in _rule_based_grasp_depth_groups(answer):
+        for index in indices:
+            answer["stages"][index]["grasp_depth_m"] = 0.0
+    return answer
+
+
+def _expand_rule_based_grasp_depths(
+    records: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Expand sparse base survivors into deterministic dense depth probes."""
+    expanded: list[dict[str, Any]] = []
+    for record in records:
+        execution = record["_candidate_execution"]
+        groups = _rule_based_grasp_depth_groups(execution)
+        if not groups:
+            expanded.append(record)
+            continue
+        for values in itertools.product(
+            RULE_BASED_GRASP_DEPTH_ADJUSTMENTS_M, repeat=len(groups)
+        ):
+            candidate_record = copy.deepcopy(record)
+            candidate_execution = candidate_record["_candidate_execution"]
+            selected: dict[str, float] = {}
+            for (key, indices), depth in zip(groups, values):
+                selected[key] = float(depth)
+                for index in indices:
+                    candidate_execution["stages"][index]["grasp_depth_m"] = float(
+                        depth
+                    )
+            candidate_record["rule_based_grasp_depth_m_by_group"] = selected
+            expanded.append(candidate_record)
+    return expanded
 
 
 def _yaw_quat(yaw_deg: float) -> list[float]:
@@ -605,6 +802,7 @@ def _score_candidate(
     maximum_screening_joint_step_rad: float = 0.5,
     ik_random_restarts: int | None = None,
     ik_max_iterations: int | None = None,
+    ik_backend: Any | None = None,
 ) -> dict[str, Any]:
     """Return tiered reachability and clearance evidence for one placement.
 
@@ -645,6 +843,7 @@ def _score_candidate(
 
         stage_reports: list[dict[str, Any]] = []
         feasible = True
+        pybullet_contact_collision_queries_ran = False
         current = dict(initial)
         reference = home.copy()
         for stage_index, stage in enumerate(grounded["stages"]):
@@ -704,7 +903,7 @@ def _score_candidate(
                         object_body,
                         contact_link,
                         stage["contact_pose_link"],
-                        float(stage.get("grasp_depth_m", 0.0)),
+                        ph._effective_grasp_depth(stage),
                         client,
                         stage.get("robot_tool_contact_offset_eef_m"),
                     )
@@ -713,7 +912,10 @@ def _score_candidate(
                     start,
                     target,
                     pose_at_value,
+                    initial_samples=min(65, samples),
                     maximum_samples=samples,
+                    maximum_position_step_m=0.004,
+                    maximum_rotation_step_deg=1.0,
                 )
             else:
                 path = _driver_path(start, target, samples)
@@ -722,6 +924,7 @@ def _score_candidate(
             worst_error = 0.0
             worst_orientation_error = 0.0
             maximum_adjacent_joint_step = 0.0
+            maximum_entry_joint_step = 0.0
             minimum_joint_limit_margin = float("inf")
             deepest = 0.0
             grasp_reach_limit = 0.05
@@ -745,18 +948,118 @@ def _score_candidate(
             # Match the physics entry point. Grasp depth remains at the final
             # manipulation pose, so an excessive value appears here as a real
             # per-finger gap instead of being confused with precontact clearance.
-            grasp_depth = float(stage.get("grasp_depth_m", 0.0))
+            grasp_depth = ph._effective_grasp_depth(stage)
+            target_poses: list[tuple[list[float], list[float]]] = []
+            gpu_obstacle_worlds: list[list[dict[str, Any]]] = []
             for value in path:
                 p.resetJointState(object_body, driver, float(value), physicsClientId=client)
-                position, rotation = ph._target_pose(
+                target_poses.append(ph._target_pose(
                     object_body,
                     contact_link,
                     stage["contact_pose_link"],
                     grasp_depth,
                     client,
                     stage.get("robot_tool_contact_offset_eef_m"),
-                )
-                if validation_tier == "coarse" or solved == 0:
+                ))
+                if (
+                    validation_tier in {"sparse", "dense"}
+                    and ik_backend is not None
+                    and ik_backend.environment_collision
+                ):
+                    # Sparse and dense collision use the object's actual
+                    # collision meshes on the GPU. The
+                    # nominated target link is omitted because contact with it
+                    # is intentional and its angle/offset geometry was already
+                    # frozen by the mandatory visual gate. Every forbidden
+                    # object link is represented by its current source shapes.
+                    gpu_obstacle_worlds.append(ph._curobo_collision_obstacles(
+                        object_body,
+                        object_link_names,
+                        forbidden.values(),
+                        simulation_urdf,
+                        client,
+                    ))
+            gpu_path: list[list[float]] | None = None
+            gpu_evidence: dict[str, Any] | None = None
+            gpu_fallback_reason: str | None = None
+            if ik_backend is not None:
+                try:
+                    maximum_gpu_step = (
+                        None
+                        if validation_tier == "coarse"
+                        else float(maximum_screening_joint_step_rad)
+                        if validation_tier == "dense"
+                        else float(maximum_screening_joint_step_rad)
+                    )
+                    gpu_evidence = ik_backend.solve_path(
+                        [pose[0] for pose in target_poses],
+                        [pose[1] for pose in target_poses],
+                        grounded["robot"]["base_translation_m"],
+                        grounded["robot"]["base_rotation_xyzw"],
+                        reference,
+                        maximum_gpu_step,
+                        continues_from_previous,
+                        (
+                            gpu_obstacle_worlds
+                            if validation_tier in {"sparse", "dense"}
+                            else None
+                        ),
+                        sequential=validation_tier == "dense",
+                    )
+                    if gpu_evidence.get("success"):
+                        gpu_path = gpu_evidence["path"]
+                    else:
+                        gpu_fallback_reason = (
+                            "no_continuous_gpu_branch_at_sample_"
+                            f"{gpu_evidence.get('failed_sample')}"
+                        )
+                except Exception as exc:
+                    gpu_fallback_reason = f"curobo_worker_error: {exc}"
+                # Sparse matrix semantics are GPU-only. A worker/collision
+                # failure rejects the cell visibly; it may not silently turn a
+                # 336-cell GPU search back into the old CPU bottleneck.
+                if gpu_path is None and (
+                    validation_tier == "sparse"
+                    or not ik_backend.allow_bullet_fallback
+                ):
+                    feasible = False
+            gpu_source_mesh_environment_checked = bool(
+                gpu_path is not None
+                and validation_tier in {"sparse", "dense"}
+                and gpu_evidence is not None
+                and gpu_evidence.get("gpu_environment_collision_checked")
+            )
+            if gpu_source_mesh_environment_checked:
+                gpu_minimum = gpu_evidence.get("minimum_environment_clearance_m")
+                if gpu_minimum is not None:
+                    minimum_forbidden_clearance = float(gpu_minimum)
+                    clearance_pairs["gpu_source_mesh_environment"] = float(gpu_minimum)
+                    deepest = min(deepest, float(gpu_minimum))
+            for sample_index, value in enumerate(path):
+                p.resetJointState(object_body, driver, float(value), physicsClientId=client)
+                position, rotation = target_poses[sample_index]
+                if gpu_path is not None:
+                    q = np.asarray(gpu_path[sample_index], dtype=np.float64)
+                    set_robot_arm(robot_body, arm, q, client)
+                    actual_position, actual_rotation = link_world_pose(robot_body, eef, client)
+                    answer = {
+                        "success": True,
+                        "q": q,
+                        "position_error_m": float(np.linalg.norm(
+                            np.asarray(actual_position) - np.asarray(position)
+                        )),
+                        "orientation_error_rad": quat_angle_rad(actual_rotation, rotation),
+                        "minimum_joint_limit_margin_rad": float(np.min(np.minimum(
+                            q - solver.arm_lower, solver.arm_upper - q
+                        ))),
+                        "solver": "curobo_batch_ik_pybullet_verified",
+                    }
+                elif ik_backend is not None and (
+                    validation_tier == "sparse"
+                    or not ik_backend.allow_bullet_fallback
+                ):
+                    break
+                elif validation_tier == "coarse" or solved == 0:
                     answer = solver.solve(
                         position, rotation, reference, enforce_step=False
                     )
@@ -771,10 +1074,18 @@ def _score_candidate(
                     worst_orientation_error,
                     float(answer["orientation_error_rad"]),
                 )
-                maximum_adjacent_joint_step = max(
-                    maximum_adjacent_joint_step,
-                    float(np.max(np.abs(reference - previous_reference))),
-                )
+                joint_step = float(np.max(np.abs(reference - previous_reference)))
+                if sample_index == 0 and not continues_from_previous:
+                    # Home/previous-retreat -> approach is a transit planning
+                    # problem. Rejecting a placement because the first grasp IK
+                    # is more than the manipulation trust radius from home
+                    # prevents the dedicated interpolation/RRT planner from ever
+                    # seeing an otherwise continuous manipulation path.
+                    maximum_entry_joint_step = max(maximum_entry_joint_step, joint_step)
+                else:
+                    maximum_adjacent_joint_step = max(
+                        maximum_adjacent_joint_step, joint_step
+                    )
                 minimum_joint_limit_margin = min(
                     minimum_joint_limit_margin,
                     float(
@@ -790,16 +1101,28 @@ def _score_candidate(
                     ),
                 )
                 set_robot_arm(robot_body, arm, reference, client)
+                # Full-matrix sparse search has already checked robot self and
+                # non-target environment collision in cuRobo on GPU. Nominal
+                # target contact was frozen by the visual angle/offset gate.
+                # Do not repeat PyBullet contact/collision queries for hundreds
+                # of base cells; exact queries are reserved for dense Top-K.
+                if validation_tier == "sparse" and gpu_path is not None:
+                    solved += 1
+                    continue
+                pybullet_contact_collision_queries_ran = True
                 p.performCollisionDetection(physicsClientId=client)
                 # The gripper must actually reach the driven link.  Without this
                 # test a candidate that never touches anything scores perfectly on
                 # collision and wins, which is how an arm that plainly misses the
                 # handle can look like the best placement.
                 for link_name, link_index in allowed_by_name.items():
-                    near = p.getClosestPoints(
-                        robot_body, object_body, grasp_reach_limit,
-                        linkIndexA=link_index, linkIndexB=contact_link,
-                        physicsClientId=client,
+                    near = ph.object_closest_points(
+                        robot_body,
+                        object_body,
+                        grasp_reach_limit,
+                        client,
+                        link_index_a=link_index,
+                        link_index_b=contact_link,
                     )
                     gap = (
                         min(float(h[8]) for h in near)
@@ -810,34 +1133,14 @@ def _score_candidate(
                         worst_gap_by_link[link_name], gap
                     )
                 clearance_query = max(required_clearance, 0.02)
-                for object_name, object_index in forbidden.items():
-                    for point in p.getClosestPoints(
-                        robot_body,
-                        object_body,
-                        clearance_query,
-                        linkIndexB=object_index,
-                        physicsClientId=client,
-                    ):
-                        distance = float(point[8])
-                        if (
-                            minimum_forbidden_clearance is None
-                            or distance < minimum_forbidden_clearance
-                        ):
-                            minimum_forbidden_clearance = distance
-                        key = (
-                            f"{robot_link_names.get(int(point[3]), point[3])}|"
-                            f"{object_name}"
-                        )
-                        clearance_pairs[key] = min(
-                            clearance_pairs.get(key, float("inf")), distance
-                        )
-                    if robot_support_body is not None:
-                        for point in p.getClosestPoints(
-                            robot_support_body,
+                if not gpu_source_mesh_environment_checked:
+                    for object_name, object_index in forbidden.items():
+                        for point in ph.object_closest_points(
+                            robot_body,
                             object_body,
                             clearance_query,
-                            linkIndexB=object_index,
-                            physicsClientId=client,
+                            client,
+                            link_index_b=object_index,
                         ):
                             distance = float(point[8])
                             if (
@@ -845,11 +1148,41 @@ def _score_candidate(
                                 or distance < minimum_forbidden_clearance
                             ):
                                 minimum_forbidden_clearance = distance
-                            key = f"robot_support|{object_name}"
+                            key = (
+                                f"{robot_link_names.get(int(point[3]), point[3])}|"
+                                f"{object_name}"
+                            )
                             clearance_pairs[key] = min(
                                 clearance_pairs.get(key, float("inf")), distance
                             )
-                for point in p.getClosestPoints(robot_body, object_body, 0.0, physicsClientId=client):
+                        if robot_support_body is not None:
+                            for point in ph.object_closest_points(
+                                robot_support_body,
+                                object_body,
+                                clearance_query,
+                                client,
+                                link_index_b=object_index,
+                            ):
+                                distance = float(point[8])
+                                if (
+                                    minimum_forbidden_clearance is None
+                                    or distance < minimum_forbidden_clearance
+                                ):
+                                    minimum_forbidden_clearance = distance
+                                key = f"robot_support|{object_name}"
+                                clearance_pairs[key] = min(
+                                    clearance_pairs.get(key, float("inf")), distance
+                                )
+                collision_points = ph.object_closest_points(
+                    robot_body,
+                    object_body,
+                    0.0,
+                    client,
+                    link_index_b=contact_link,
+                ) if gpu_source_mesh_environment_checked else ph.object_closest_points(
+                    robot_body, object_body, 0.0, client
+                )
+                for point in collision_points:
                     robot_link, object_link = int(point[3]), int(point[4])
                     depth = float(point[8])
                     if robot_link in allowed and object_link == contact_link:
@@ -862,11 +1195,16 @@ def _score_candidate(
                     )
                     offenders[key] = min(offenders.get(key, 0.0), depth)
                 if robot_support_body is not None:
-                    for point in p.getClosestPoints(
+                    for point in ph.object_closest_points(
                         robot_support_body,
                         object_body,
                         0.0,
-                        physicsClientId=client,
+                        client,
+                        link_index_b=(
+                            contact_link
+                            if gpu_source_mesh_environment_checked
+                            else None
+                        ),
                     ):
                         object_link = int(point[4])
                         depth = float(point[8])
@@ -897,17 +1235,29 @@ def _score_candidate(
                 2 if stage["interaction"] == "explicit_ideal_feasibility" else 1,
                 len(normalized_gaps),
             )
-            # An open-then-close grasp needs opposing gripper geometry close to the
-            # target throughout the path. One nearby finger and one finger
-            # centimetres away is a miss, even though the EEF IK is perfect.
-            grasped = (
+            # An open-then-close grasp needs both application-owned finger links
+            # physically near the target throughout the dense path.  The visual
+            # gate decides only orientation; it is never evidence that a depth
+            # is seated or that both sides can close. Sparse GPU screening may
+            # defer this exact target query, but dense acceptance may not.
+            target_gap_deferred = bool(
+                stage["interaction"] == "explicit_ideal_feasibility"
+                and validation_tier != "dense"
+            )
+            grasped = bool(
                 solved == required_samples
                 and required_near_links > 0
-                and near_link_count >= required_near_links
+                and (
+                    target_gap_deferred
+                    or near_link_count >= required_near_links
+                )
+            )
+            effective_required_clearance = (
+                required_clearance - abs(float(allowed_penetration_m))
             )
             clearance_passed = (
                 minimum_forbidden_clearance is None
-                or minimum_forbidden_clearance >= required_clearance
+                or minimum_forbidden_clearance >= effective_required_clearance
             )
             pose_residual_passed = (
                 worst_error <= 0.004
@@ -941,12 +1291,61 @@ def _score_candidate(
                 "validation_tier": validation_tier,
                 "ik_random_restarts": tier_random_restarts,
                 "ik_max_iterations": tier_max_iterations,
+                "ik_backend": (
+                    (
+                        "curobo_gpu_ik_source_mesh_collision_screened"
+                        if validation_tier in {"sparse", "dense"}
+                        else "curobo_batch_ik_pybullet_verified"
+                    )
+                    if gpu_path is not None
+                    else (
+                        "curobo_gpu_no_valid_solution"
+                        if validation_tier == "sparse" and ik_backend is not None
+                        else "pybullet"
+                    )
+                ),
+                "ik_backend_fallback_reason": gpu_fallback_reason,
+                "curobo_solve_time_s": (
+                    None if gpu_evidence is None else gpu_evidence.get("solve_time_s")
+                ),
+                "curobo_failed_sample": (
+                    None if gpu_evidence is None else gpu_evidence.get("failed_sample")
+                ),
+                "curobo_failure_attribution": (
+                    None
+                    if gpu_path is not None or gpu_evidence is None
+                    else "unattributed_no_valid_solution_not_collision_evidence"
+                ),
+                "curobo_valid_candidates_per_sample": (
+                    []
+                    if gpu_evidence is None
+                    else gpu_evidence.get("valid_candidates_per_sample", [])
+                ),
+                "curobo_gpu_collision_obstacles_per_sample": (
+                    []
+                    if gpu_evidence is None
+                    else gpu_evidence.get("gpu_collision_obstacles_per_sample", [])
+                ),
+                "curobo_minimum_environment_clearance_m": (
+                    None
+                    if gpu_evidence is None
+                    else gpu_evidence.get("minimum_environment_clearance_m")
+                ),
+                "curobo_environment_clearance_by_sample_m": (
+                    []
+                    if gpu_evidence is None
+                    else gpu_evidence.get("environment_clearance_by_sample_m", [])
+                ),
                 "maximum_ik_position_error_m": round(worst_error, 6),
                 "maximum_ik_orientation_error_deg": round(
                     math.degrees(worst_orientation_error), 6
                 ),
                 "maximum_adjacent_joint_step_rad": round(
                     maximum_adjacent_joint_step, 6
+                ),
+                "maximum_entry_joint_step_rad": round(maximum_entry_joint_step, 6),
+                "entry_step_deferred_to_transit_planner": bool(
+                    not continues_from_previous
                 ),
                 "minimum_joint_limit_margin_rad": (
                     None
@@ -967,7 +1366,31 @@ def _score_candidate(
                 "required_near_contact_links": required_near_links,
                 "near_contact_link_count": near_link_count,
                 "target_actually_gripped": bool(grasped),
-                "required_forbidden_clearance_m": required_clearance,
+                "target_contact_geometry_source": (
+                    "deferred_to_dense_pybullet_exact_contact_query"
+                    if target_gap_deferred
+                    else "pybullet_exact_contact_query"
+                ),
+                "pybullet_contact_collision_queries_ran": bool(
+                    pybullet_contact_collision_queries_ran
+                ),
+                "gpu_self_collision_checked": bool(
+                    gpu_evidence is not None
+                    and gpu_evidence.get("gpu_self_collision_checked")
+                ),
+                "gpu_environment_collision_checked": bool(
+                    gpu_evidence is not None
+                    and gpu_evidence.get("gpu_environment_collision_checked")
+                ),
+                "required_forbidden_clearance_m": round(
+                    effective_required_clearance, 5
+                ),
+                "nominal_minimum_swept_clearance_m": round(
+                    required_clearance, 5
+                ),
+                "allowed_body_penetration_m": round(
+                    abs(float(allowed_penetration_m)), 5
+                ),
                 "minimum_forbidden_clearance_m": (
                     None
                     if minimum_forbidden_clearance is None
@@ -995,6 +1418,7 @@ def _score_candidate(
         # Run this dense confirmation only for otherwise feasible candidates so
         # placement search remains bounded.
         screening_passed = bool(feasible)
+        transit_route_repairs: list[dict[str, Any]] = []
         if feasible and run_full_path_confirmation:
             try:
                 # World-frame release waypoints are solved only after the robot
@@ -1013,6 +1437,7 @@ def _score_candidate(
                     initial,
                     validate_release_clearance=False,
                     object_plan=object_plan,
+                    ik_path_solver=ik_backend,
                 )
             except Exception as exc:
                 feasible = False
@@ -1021,7 +1446,7 @@ def _score_candidate(
                     stage_reports[-1]["feasible"] = False
             else:
                 by_id = {item.stage["id"]: item for item in dense_plans}
-                for stage_report in stage_reports:
+                for stage_index, stage_report in enumerate(stage_reports):
                     dense = by_id[stage_report["stage_id"]]
                     stage_report["dense_full_path_minimum_clearance_m"] = (
                         None
@@ -1031,13 +1456,24 @@ def _score_candidate(
                     stage_report["dense_full_path_tightest_samples"] = (
                         dense.swept_clearance_violations[:5]
                     )
+                    stage_report["dense_full_path_ik_backend"] = dense.ik_backend
+                    stage_report["dense_full_path_ik_backend_fallback_reason"] = (
+                        dense.ik_backend_fallback_reason
+                    )
                     required_dense_clearance = float(
                         dense.stage.get("minimum_swept_clearance_m", 0.0)
+                    )
+                    effective_dense_clearance = (
+                        required_dense_clearance
+                        - abs(float(allowed_penetration_m))
                     )
                     dense_clearance_passed = (
                         dense.minimum_swept_clearance_m is None
                         or dense.minimum_swept_clearance_m
-                        >= required_dense_clearance
+                        >= effective_dense_clearance
+                    )
+                    stage_report["dense_full_path_required_clearance_m"] = round(
+                        effective_dense_clearance, 6
                     )
                     dense_ik_passed = (
                         not dense.debug_truncated
@@ -1051,6 +1487,18 @@ def _score_candidate(
                     )
                     stage_report["dense_ik_passed"] = bool(dense_ik_passed)
                     if not dense_clearance_passed or not dense_ik_passed:
+                        route_repair = None
+                        if dense_ik_passed and not dense_clearance_passed:
+                            route_repair = _transit_route_repair(
+                                simulation_urdf,
+                                grounded["stages"],
+                                stage_index,
+                                dense,
+                            )
+                        if route_repair is not None:
+                            stage_report["transit_route_repair_required"] = True
+                            stage_report["transit_route_repair"] = route_repair
+                            transit_route_repairs.append(route_repair)
                         stage_report["feasible"] = False
                         reasons = []
                         if not dense_clearance_passed:
@@ -1067,6 +1515,8 @@ def _score_candidate(
             "screening_passed": screening_passed,
             "validation_tier": validation_tier,
             "full_path_confirmation_ran": bool(run_full_path_confirmation),
+            "transit_route_repair_required": bool(transit_route_repairs),
+            "transit_route_repairs": transit_route_repairs,
             "stages": stage_reports,
             "manipulation_blocks": _summarize_manipulation_blocks(
                 grounded["stages"], stage_reports
@@ -1098,6 +1548,90 @@ def _manipulation_block_stage_ids(
             blocks.append([stage_id])
         previous = stage
     return blocks
+
+
+def _joint_moved_link_sets(urdf: Path) -> dict[str, set[str]]:
+    """Map every articulated joint to the complete link subtree it moves."""
+    root = ET.parse(urdf).getroot()
+    child_by_joint: dict[str, str] = {}
+    children_by_link: dict[str, set[str]] = {}
+    for joint in root.findall("joint"):
+        name = joint.attrib.get("name")
+        parent = joint.find("parent")
+        child = joint.find("child")
+        if not name or parent is None or child is None:
+            continue
+        parent_name = parent.attrib.get("link")
+        child_name = child.attrib.get("link")
+        if not parent_name or not child_name:
+            continue
+        child_by_joint[name] = child_name
+        children_by_link.setdefault(parent_name, set()).add(child_name)
+
+    def subtree(link: str) -> set[str]:
+        answer = {link}
+        pending = [link]
+        while pending:
+            for child in children_by_link.get(pending.pop(), set()):
+                if child not in answer:
+                    answer.add(child)
+                    pending.append(child)
+        return answer
+
+    return {joint: subtree(link) for joint, link in child_by_joint.items()}
+
+
+def _transit_route_repair(
+    simulation_urdf: Path,
+    stages: list[dict[str, Any]],
+    stage_index: int,
+    dense_plan: ph.StagePlan,
+) -> dict[str, Any] | None:
+    """Classify a failed direct transit that must enter bounded route search.
+
+    Only a collision confined to ``transit_in`` and caused by a link moved by
+    an earlier plan-owned stage is repairable here. Manipulation, approach,
+    release, static-body, and continuous-grasp collisions remain ordinary hard
+    failures and must never be hidden behind a waypoint search.
+    """
+    if stage_index <= 0 or ph._same_contact_sequence(
+        stages[stage_index - 1], stages[stage_index]
+    ):
+        return None
+    required = float(stages[stage_index].get("minimum_swept_clearance_m", 0.0))
+    failing = [
+        item
+        for item in dense_plan.swept_clearance_violations
+        if item.get("object_link") is not None
+        and float(item.get("distance_m", math.inf)) < required
+    ]
+    if not failing or any(item.get("phase") != "transit_in" for item in failing):
+        return None
+    moved_by_joint = _joint_moved_link_sets(simulation_urdf)
+    prior_moved_links: set[str] = set()
+    source_joints: dict[str, list[str]] = {}
+    for prior in stages[:stage_index]:
+        joint = str(prior["driver_joint"])
+        links = moved_by_joint.get(joint, set())
+        prior_moved_links.update(links)
+        for link in links:
+            source_joints.setdefault(link, []).append(joint)
+    blocking_links = sorted({str(item["object_link"]) for item in failing})
+    if any(link not in prior_moved_links for link in blocking_links):
+        return None
+    tightest = min(failing, key=lambda item: float(item["distance_m"]))
+    obstacle_link = str(tightest["object_link"])
+    return {
+        "incoming_stage_id": str(stages[stage_index]["id"]),
+        "incoming_stage_index": int(stage_index),
+        "classification": "prior_plan_moved_link_blocks_transit",
+        "blocking_object_links": blocking_links,
+        "primary_obstacle_link": obstacle_link,
+        "moved_by_prior_driver_joints": sorted(set(source_joints[obstacle_link])),
+        "minimum_direct_transit_clearance_m": float(tightest["distance_m"]),
+        "required_clearance_m": required,
+        "route_solver_required_before_rejection": True,
+    }
 
 
 def _summarize_manipulation_blocks(
@@ -1138,6 +1672,14 @@ def _summarize_manipulation_blocks(
                     float(row.get("maximum_ik_position_error_m", 1.0))
                     for row in rows
                 ),
+                "minimum_gpu_environment_clearance_m": min(
+                    (
+                        float(row["curobo_minimum_environment_clearance_m"])
+                        for row in rows
+                        if row.get("curobo_minimum_environment_clearance_m") is not None
+                    ),
+                    default=None,
+                ),
             }
         )
     return summaries
@@ -1167,15 +1709,20 @@ def _candidate_rank(report: dict[str, Any]) -> tuple:
                 "maximum_ik_position_error_m": float(
                     stage.get("maximum_ik_position_error_m", 1.0)
                 ),
+                "minimum_gpu_environment_clearance_m": stage.get(
+                    "curobo_minimum_environment_clearance_m"
+                ),
             }
             for stage in report["stages"]
         ]
 
     def block_rank(block: dict[str, Any]) -> tuple:
+        gpu_clearance = block.get("minimum_gpu_environment_clearance_m")
         return (
             not bool(block.get("feasible", False)),
             not bool(block.get("target_actually_gripped", False)),
             1.0 - float(block.get("minimum_sample_completion_ratio", 0.0)),
+            float("inf") if gpu_clearance is None else -float(gpu_clearance),
             max(0.0, -float(block.get("deepest_body_penetration_m", 0.0))),
             float(block.get("maximum_target_link_gap_m", 1.0)),
             float(block.get("maximum_ik_position_error_m", 1.0)),
@@ -1183,7 +1730,7 @@ def _candidate_rank(report: dict[str, Any]) -> tuple:
 
     worst_block = max(
         (block_rank(block) for block in blocks),
-        default=(True, True, 1.0, 1.0, 1.0, 1.0),
+        default=(True, True, 1.0, float("inf"), 1.0, 1.0, 1.0),
     )
     all_blocks_feasible = all(bool(block.get("feasible")) for block in blocks)
     visual_penalty = sum(
@@ -1199,56 +1746,24 @@ def _candidate_rank(report: dict[str, Any]) -> tuple:
     )
 
 
-def _best_centerline_attempt(
-    attempts: list[dict[str, Any]], candidate_ids: list[str] | None = None
-) -> dict[str, Any] | None:
-    """Return the closest-to-feasible whole-task centerline row.
-
-    Rejected rows without a numerical stage report cannot seed a lateral
-    refinement.  ``min`` is stable, so an exact score tie preserves the
-    declared centerline-distance order.
-    """
-    eligible = [
-        attempt
-        for attempt in attempts
-        if attempt.get("placement_mode") == "contact_facing"
-        and abs(float(attempt.get("contact_facing_lateral_offset_m", 0.0))) <= 1e-12
-        and (
-            candidate_ids is None
-            or list(attempt.get("orientation_candidate_ids", []))
-            == list(candidate_ids)
-        )
-        and isinstance(attempt.get("stages"), list)
-        and attempt["stages"]
-        and attempt.get("contact_facing_distance_m") is not None
-    ]
-    return min(eligible, key=_candidate_rank) if eligible else None
-
-
-def _matches_lateral_refinement_seed(
-    placement_values: tuple[Any, ...], seed: dict[str, Any]
-) -> bool:
-    """Whether a lateral row keeps every non-lateral centerline variable fixed."""
-    oyaw, rz, distance, yaw_offset, _ = placement_values
-    seed_base = seed.get("robot_base_m", [None, None, None])
-    return (
-        math.isclose(float(oyaw), float(seed["object_yaw_deg"]), abs_tol=1e-12)
-        and len(seed_base) == 3
-        and math.isclose(float(rz), float(seed_base[2]), abs_tol=1e-12)
-        and math.isclose(
-            float(distance), float(seed["contact_facing_distance_m"]), abs_tol=1e-12
-        )
-        and math.isclose(
-            float(yaw_offset),
-            float(seed.get("contact_facing_yaw_offset_deg", 0.0)),
-            abs_tol=1e-12,
+def _contact_facing_sparse_matrix(
+    object_yaws: list[Any],
+    robot_z: list[Any],
+    distances: list[Any],
+    yaw_offsets: list[Any],
+    lateral_offsets: list[Any],
+) -> list[tuple[Any, ...]]:
+    """Return every declared contact-facing placement cell exactly once."""
+    return list(
+        itertools.product(
+            object_yaws, robot_z, distances, yaw_offsets, lateral_offsets
         )
     )
 
 
-def _coarse_survivors(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Return only rows that may spend the sparse-IK budget."""
-    return [record for record in records if record.get("coarse_screening_passed")]
+def _sparse_survivors(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return rows eligible for the dense top-K budget."""
+    return [record for record in records if record.get("sparse_screening_passed")]
 
 
 def _dense_shortlist(
@@ -1313,6 +1828,7 @@ def _feasible_region_summary(attempts: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def solve(config: dict[str, Any], task: dict[str, Any]) -> dict[str, Any]:
+    solve_started_at = time.perf_counter()
     inputs = task["inputs"]
     template_value = config.get("execution_template")
     resolved_template_path: Path | None = None
@@ -1331,6 +1847,16 @@ def solve(config: dict[str, Any], task: dict[str, Any]) -> dict[str, Any]:
     orientation_gate = _validated_orientation_gate(
         config, resolved_template_path, template
     )
+    template = _reset_agent_grasp_depths(
+        ph.materialize_execution_defaults(task, template)
+    )
+    planning_backend = ph._application_planning_backend()
+    if planning_backend.get("name", "bullet") == "curobo":
+        # Carry the selected generic accelerator into the runnable execution so
+        # final dense planning and any moved-obstacle transit use the same GPU
+        # backend instead of silently rebuilding those paths on CPU.
+        planning_backend.setdefault("allow_bullet_fallback", False)
+        template["planning_ik_backend"] = planning_backend
     source_urdf = ph._resolve(inputs["urdf"])
     simulation_urdf = ph.resolve_simulation_urdf(
         task, template, source_urdf
@@ -1339,42 +1865,50 @@ def solve(config: dict[str, Any], task: dict[str, Any]) -> dict[str, Any]:
     robot_urdf = ph._resolve(inputs["robot_urdf"])
     initial = ph.task_initial_joint_values(task)
     plan = ph._read_json(ph._resolve(inputs["plan"]))
+    ik_backend = create_curobo_backend(
+        {"planning_ik_backend": planning_backend}, robot_urdf, template["robot"]
+    )
 
-    bounds = config["bounds"]
-    dense_samples = int(config.get("path_samples", 65))
-    coarse_samples = int(config.get("coarse_keyframe_samples", 5))
-    sparse_samples = int(config.get("sparse_path_samples", 17))
-    dense_top_k = int(config.get("dense_top_k", 5))
-    coarse_ik_restarts = int(config.get("coarse_ik_random_restarts", 4))
-    sparse_ik_restarts = int(config.get("sparse_ik_random_restarts", 12))
-    coarse_ik_iterations = int(config.get("coarse_ik_max_iterations", 500))
-    sparse_ik_iterations = int(config.get("sparse_ik_max_iterations", 1000))
-    if coarse_samples < 3:
-        raise ValueError("coarse_keyframe_samples must be at least 3")
-    if sparse_samples <= coarse_samples:
-        raise ValueError(
-            "sparse_path_samples must exceed coarse_keyframe_samples"
-        )
+    bounds = _application_contact_facing_bounds(task)
+    # Match the final rollout exactly. A 129-point non-sequential DP can accept
+    # one IK branch while the 257-point sequential execution selects or falls
+    # back to another branch that intersects the object.
+    dense_samples = ph.DENSE_MANIPULATION_PATH_SAMPLES
+    sparse_samples = 17
+    dense_top_k = 5
+    # Dense rows are already deterministically ordered by base cost and then by
+    # shallow-to-deep rule-based grasp depth. Run exactly one at a time and stop
+    # on the first full-path pass; speculative parallel dense work can return a
+    # later/deeper row first and wastes GPU time after an earlier solution.
+    dense_candidate_jobs = 1
+    sparse_ik_restarts = 12
+    sparse_ik_iterations = 1000
+    sparse_maximum_joint_step = 1.2
+    if sparse_samples < 3:
+        raise ValueError("sparse_path_samples must be at least 3")
     if dense_samples < sparse_samples:
         raise ValueError("path_samples must be at least sparse_path_samples")
     if dense_top_k <= 0:
         raise ValueError("dense_top_k must be positive")
-    if coarse_ik_restarts < 0 or sparse_ik_restarts < 0:
-        raise ValueError("screening IK restart budgets must be nonnegative")
-    if coarse_ik_iterations <= 0 or sparse_ik_iterations <= 0:
-        raise ValueError("screening IK iteration budgets must be positive")
-    allowed_penetration = float(config.get("allowed_body_penetration_m", 0.002))
+    if dense_candidate_jobs <= 0:
+        raise ValueError("dense_candidate_jobs must be positive")
+    if dense_candidate_jobs > 1:
+        backend = planning_backend
+        if not isinstance(backend, dict) or backend.get("name", "bullet") != "curobo":
+            raise ValueError(
+                "dense_candidate_jobs greater than one requires the cuRobo backend"
+            )
+    if sparse_ik_restarts < 0:
+        raise ValueError("sparse IK restart budget must be nonnegative")
+    if sparse_ik_iterations <= 0:
+        raise ValueError("sparse IK iteration budget must be positive")
+    allowed_penetration = 0.002
     # How close an allowed contact link must come to the driven link for the grasp
     # to count as real rather than a near miss.
-    maximum_grasp_gap = float(config.get("maximum_grasp_gap_m", 0.006))
+    maximum_grasp_gap = 0.006
 
     object_yaws = bounds.get("object_yaw_deg", [0.0])
-    placement_mode = str(
-        config.get(
-            "placement_mode",
-            "contact_facing" if "contact_facing_distance_m" in bounds else "cartesian",
-        )
-    )
+    placement_mode = "contact_facing"
     if placement_mode not in {"contact_facing", "cartesian"}:
         raise ValueError("placement_mode must be 'contact_facing' or 'cartesian'")
     # A pedestal height is part of placement: a contact well above or below the
@@ -1432,22 +1966,21 @@ def solve(config: dict[str, Any], task: dict[str, Any]) -> dict[str, Any]:
     # Contact points depend on the placement: which face of the part is reachable
     # changes as the object rotates and the robot moves.  They are therefore
     # rediscovered per placement rather than once up front.
-    discovery = config.get("contact_point_discovery", {})
-    discover = discovery.get("enabled", True) and len(template["stages"]) == 1
+    discovery = {"enabled": False}
+    discover = False
     declared_point = list(template["stages"][0]["contact_pose_link"]["translation_m"])
 
     attempts: list[dict[str, Any]] = []
+    sparse_jobs: list[dict[str, Any]] = []
     index = -1
     if placement_mode == "contact_facing":
-        centered_placement_count = (
+        placement_count = (
             len(object_yaws)
             * len(robot_z)
             * len(distances)
             * len(yaw_offsets)
+            * len(lateral_offsets)
         )
-        # After the complete centerline batch, lateral refinement is evaluated
-        # only at its single closest-to-feasible row.
-        placement_count = centered_placement_count + max(0, len(lateral_offsets) - 1)
     else:
         placement_count = len(object_yaws) * len(robot_x) * len(robot_y) * len(robot_z) * len(robot_yaws)
     contacts_per_placement = (
@@ -1456,27 +1989,16 @@ def solve(config: dict[str, Any], task: dict[str, Any]) -> dict[str, Any]:
     total = placement_count * len(orientation_options) * contacts_per_placement
     all_discovered: list[dict[str, Any]] = []
     if placement_mode == "contact_facing":
-        # Search the physically interpretable centerline first: all declared
-        # normal distances are attempted with zero lateral offset.  The refined
-        # Cartesian rows remain in deterministic order, but the loop below
-        # evaluates only those sharing the closest-to-feasible centerline row.
-        # This prevents both arbitrary off-center defaults and an unnecessary
-        # distance-by-lateral Cartesian explosion.
-        centered = list(
-            itertools.product(object_yaws, robot_z, distances, yaw_offsets, [0.0])
+        # Visual-invalid orientations have already been removed by the gate.
+        # Evaluate the complete declared distance-by-lateral matrix so a base
+        # that is weak on the centerline cannot hide a feasible off-center row.
+        # ``_center_first_lateral_offsets`` preserves deterministic ordering but
+        # no matrix cell is skipped.
+        sparse_placements = _contact_facing_sparse_matrix(
+            object_yaws, robot_z, distances, yaw_offsets, lateral_offsets
         )
-        refined = list(
-            itertools.product(
-                object_yaws,
-                robot_z,
-                distances,
-                yaw_offsets,
-                lateral_offsets[1:],
-            )
-        )
-        coarse_placements = centered + refined
     else:
-        coarse_placements = list(
+        sparse_placements = list(
             itertools.product(object_yaws, robot_z, robot_x, robot_y, robot_yaws)
         )
     # Whole-task planning treats base and per-block contact choices jointly.
@@ -1485,40 +2007,13 @@ def solve(config: dict[str, Any], task: dict[str, Any]) -> dict[str, Any]:
     # making a later block unreachable.
     ordered_search = (
         (orientation_option, placement_values)
-        for placement_values in coarse_placements
+        for placement_values in sparse_placements
         for orientation_option in orientation_options
     )
-    lateral_refinement_seed: dict[str, Any] | None = None
-    centered_search_feasible: bool | None = None
     for orientation_option, placement_values in ordered_search:
         if placement_mode == "contact_facing":
             oyaw, rz, distance, yaw_offset, lateral_offset = placement_values
             explicit_pose = None
-            if abs(float(lateral_offset)) > 1e-12:
-                if centered_search_feasible is None:
-                    centered_rows = [
-                        attempt
-                        for attempt in attempts
-                        if abs(
-                            float(
-                                attempt.get(
-                                    "contact_facing_lateral_offset_m", 0.0
-                                )
-                            )
-                        )
-                        <= 1e-12
-                        and isinstance(attempt.get("stages"), list)
-                    ]
-                    # Lateral rows receive only the cheap five-keyframe screen
-                    # at this point.  Sparse/dense lateral work remains dormant
-                    # unless the complete centerline funnel later proves that
-                    # no centered candidate is fully feasible.
-                    centered_search_feasible = False
-                    lateral_refinement_seed = _best_centerline_attempt(centered_rows)
-                if lateral_refinement_seed is None or not _matches_lateral_refinement_seed(
-                    placement_values, lateral_refinement_seed
-                ):
-                    continue
         else:
             oyaw, rz, rx, ry, ryaw = placement_values
             distance = None
@@ -1583,47 +2078,6 @@ def solve(config: dict[str, Any], task: dict[str, Any]) -> dict[str, Any]:
                 index += 1
                 candidate = json.loads(json.dumps(placed))
                 candidate["stages"][0]["contact_pose_link"]["translation_m"] = [float(v) for v in point]
-                try:
-                    # Placement fixes the base that world-frame release
-                    # waypoints depend on. Validate the release boundary now,
-                    # but intentionally defer the route requirement until the
-                    # dedicated release-clearance solver runs afterward.
-                    ph._validate_execution_against_plan(
-                        plan, candidate, require_release_route=False
-                    )
-                    report = _score_candidate(
-                        simulation_urdf,
-                        robot_urdf,
-                        candidate,
-                        initial,
-                        plan,
-                        coarse_samples,
-                        allowed_penetration,
-                        maximum_grasp_gap,
-                        validation_tier="coarse",
-                        run_full_path_confirmation=False,
-                        ik_random_restarts=coarse_ik_restarts,
-                        ik_max_iterations=coarse_ik_iterations,
-                    )
-                except Exception as exc:
-                    attempts.append({
-                        "index": index,
-                        "object_yaw_deg": oyaw, "robot_base_m": [rx, ry, rz], "robot_yaw_deg": ryaw,
-                        "placement_mode": placement_mode,
-                        "contact_facing_distance_m": distance,
-                        "contact_facing_lateral_offset_m": lateral_offset,
-                        "contact_facing_yaw_offset_deg": yaw_offset,
-                        "approach_tilt_deg": tilt, "approach_spin_deg": spin,
-                        "approach_roll_deg": roll,
-                        "orientation_candidate_ids": list(
-                            orientation_option["candidate_ids"]
-                        ),
-                        "orientation_visual_priorities": list(
-                            orientation_option["visual_priorities"]
-                        ),
-                        "contact_point_link_m": point, "rejected": str(exc)[:200],
-                    })
-                    continue
                 record = {
                     "index": index,
                     "object_yaw_deg": oyaw, "robot_base_m": [rx, ry, rz], "robot_yaw_deg": ryaw,
@@ -1641,28 +2095,104 @@ def solve(config: dict[str, Any], task: dict[str, Any]) -> dict[str, Any]:
                         orientation_option["visual_priorities"]
                     ),
                     "contact_point_link_m": point,
-                    # Coarse/sparse passes are rejection filters, never final
-                    # placement acceptance.  Only dense full-path confirmation
-                    # may set this public field true.
                     "feasible": False,
-                    "coarse_screening_passed": bool(report["screening_passed"]),
-                    "latest_validation_tier": "coarse",
+                    "_candidate_execution": candidate,
+                }
+                try:
+                    # Placement fixes the base that world-frame release
+                    # waypoints depend on. Validate the release boundary now,
+                    # but intentionally defer the route requirement until the
+                    # dedicated release-clearance solver runs afterward.
+                    ph._validate_execution_against_plan(
+                        plan, candidate, require_release_route=False
+                    )
+                except Exception as exc:
+                    record["rejected"] = str(exc)[:200]
+                    attempts.append(record)
+                    continue
+                sparse_jobs.append(record)
+
+    def score_sparse(record: dict[str, Any], backend: Any) -> dict[str, Any]:
+        return _score_candidate(
+            simulation_urdf,
+            robot_urdf,
+            record["_candidate_execution"],
+            initial,
+            plan,
+            sparse_samples,
+            allowed_penetration,
+            maximum_grasp_gap,
+            validation_tier="sparse",
+            run_full_path_confirmation=False,
+            ik_random_restarts=sparse_ik_restarts,
+            ik_max_iterations=sparse_ik_iterations,
+            maximum_screening_joint_step_rad=sparse_maximum_joint_step,
+            ik_backend=backend,
+        )
+
+    sparse_backend: Any = ik_backend
+    sparse_workers = 1
+    sparse_batch_proxy: _SparseBatchIKProxy | None = None
+    if ik_backend is not None and sparse_jobs:
+        sparse_batch_proxy = _SparseBatchIKProxy(
+            ik_backend, SPARSE_GPU_BASE_BATCH_SIZE
+        )
+        sparse_backend = sparse_batch_proxy
+        sparse_workers = min(SPARSE_GPU_BASE_BATCH_SIZE, len(sparse_jobs))
+
+    def run_sparse(record: dict[str, Any]) -> tuple[dict[str, Any] | None, Exception | None]:
+        try:
+            return score_sparse(record, sparse_backend), None
+        except Exception as exc:
+            return None, exc
+
+    try:
+        if sparse_workers == 1:
+            sparse_results = [run_sparse(record) for record in sparse_jobs]
+        else:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=sparse_workers,
+                thread_name_prefix="artimo-sparse-base",
+            ) as executor:
+                sparse_results = list(executor.map(run_sparse, sparse_jobs))
+    finally:
+        if sparse_batch_proxy is not None:
+            sparse_batch_proxy.close()
+
+    for record, (report, error) in zip(sparse_jobs, sparse_results):
+        if error is not None or report is None:
+            record["rejected"] = str(error)[:200]
+        else:
+            record.update(
+                {
+                    "sparse_screening_passed": bool(report["screening_passed"]),
+                    "latest_validation_tier": "sparse",
                     "stages": report["stages"],
                     "manipulation_blocks": report["manipulation_blocks"],
-                    "_candidate_execution": candidate,
                     "_grounding": report["grounding"],
                 }
-                attempts.append(record)
-                print(
-                    f"[{index + 1}/~{total}] obj_yaw={oyaw:3.0f} base=({rx:+.2f},{ry:+.2f},{rz:.2f}) "
-                    f"yaw={ryaw:+.0f} "
-                    f"orientation={('/'.join(orientation_option['candidate_ids']) if orientation is None else f'tilt={tilt:.0f} spin={spin:.0f} roll={roll:.0f}')} "
-                    f"pt={point} -> "
-                    f"solved={[s['samples_solved'] for s in report['stages']]} "
-                    f"pen={[s['deepest_body_penetration_m'] for s in report['stages']]} "
-                    f"{'COARSE_PASS' if report['screening_passed'] else ''}",
-                    flush=True,
+            )
+        attempts.append(record)
+        if report is not None:
+            orientation_label = (
+                "/".join(record["orientation_candidate_ids"])
+                if record["approach_tilt_deg"] is None
+                else (
+                    f"tilt={record['approach_tilt_deg']:.0f} "
+                    f"spin={record['approach_spin_deg']:.0f} "
+                    f"roll={record['approach_roll_deg']:.0f}"
                 )
+            )
+            print(
+                f"[{record['index'] + 1}/~{total}] obj_yaw={record['object_yaw_deg']:3.0f} "
+                f"base=({record['robot_base_m'][0]:+.2f},{record['robot_base_m'][1]:+.2f},{record['robot_base_m'][2]:.2f}) "
+                f"yaw={record['robot_yaw_deg']:+.0f} orientation={orientation_label} "
+                f"pt={record['contact_point_link_m']} -> "
+                f"solved={[s['samples_solved'] for s in report['stages']]} "
+                f"pen={[s['deepest_body_penetration_m'] for s in report['stages']]} "
+                f"{'SPARSE_PASS' if report['screening_passed'] else ''}",
+                flush=True,
+            )
 
     def refine_records(
         records: list[dict[str, Any]],
@@ -1674,8 +2204,9 @@ def solve(config: dict[str, Any], task: dict[str, Any]) -> dict[str, Any]:
         ik_iterations: int | None = None,
     ) -> list[dict[str, Any]]:
         passed: list[dict[str, Any]] = []
-        for position, record in enumerate(records, start=1):
-            report = _score_candidate(
+
+        def score(record: dict[str, Any], backend: Any) -> dict[str, Any]:
+            return _score_candidate(
                 simulation_urdf,
                 robot_urdf,
                 record["_candidate_execution"],
@@ -1688,7 +2219,12 @@ def solve(config: dict[str, Any], task: dict[str, Any]) -> dict[str, Any]:
                 run_full_path_confirmation=full_path,
                 ik_random_restarts=ik_restarts,
                 ik_max_iterations=ik_iterations,
+                ik_backend=backend,
             )
+
+        def apply_report(
+            position: int, record: dict[str, Any], report: dict[str, Any]
+        ) -> None:
             record["latest_validation_tier"] = tier
             record["stages"] = report["stages"]
             record["manipulation_blocks"] = report["manipulation_blocks"]
@@ -1699,6 +2235,17 @@ def solve(config: dict[str, Any], task: dict[str, Any]) -> dict[str, Any]:
                 record["dense_full_path_confirmation_ran"] = True
                 record["feasible"] = bool(report["feasible"])
                 record["_output_execution"] = report["execution"]
+                record["transit_route_repair_required"] = bool(
+                    report.get("transit_route_repair_required")
+                )
+                record["transit_route_repairs"] = report.get(
+                    "transit_route_repairs", []
+                )
+                if record["transit_route_repair_required"]:
+                    # This execution is input only to the bounded transit route
+                    # solver. It is deliberately kept separate from runnable
+                    # placement execution until that solver succeeds.
+                    record["_transit_route_repair_execution"] = report["execution"]
             if report["feasible"]:
                 passed.append(record)
             print(
@@ -1710,19 +2257,100 @@ def solve(config: dict[str, Any], task: dict[str, Any]) -> dict[str, Any]:
                 f"{'PASS' if report['feasible'] else 'REJECT'}",
                 flush=True,
             )
+
+        if tier != "dense" or dense_candidate_jobs == 1 or len(records) <= 1:
+            for position, record in enumerate(records, start=1):
+                report = score(record, ik_backend)
+                apply_report(position, record, report)
+                if tier == "dense" and bool(report["feasible"]):
+                    print(
+                        "first feasible dense candidate found; stopping remaining dense candidates",
+                        flush=True,
+                    )
+                    break
+            return passed
+
+        # Dense candidates are independent. Give each executor thread its own
+        # persistent cuRobo subprocess: sharing one line-delimited worker would
+        # serialize requests and corrupt request/response ownership. PyBullet
+        # scoring already creates an isolated DIRECT client per candidate.
+        worker_local = threading.local()
+        worker_lock = threading.Lock()
+        worker_backends: list[Any] = []
+
+        def thread_backend() -> Any:
+            backend = getattr(worker_local, "backend", None)
+            if backend is None:
+                backend = create_curobo_backend(
+                    config, robot_urdf, template["robot"]
+                )
+                worker_local.backend = backend
+                with worker_lock:
+                    worker_backends.append(backend)
+            return backend
+
+        def parallel_score(record: dict[str, Any]) -> dict[str, Any]:
+            return score(record, thread_backend())
+
+        try:
+            worker_count = min(dense_candidate_jobs, len(records))
+            executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=worker_count,
+                thread_name_prefix="artimo-dense",
+            )
+            pending_records = iter(enumerate(records, start=1))
+            futures: dict[Any, tuple[int, dict[str, Any]]] = {}
+
+            def submit_next() -> bool:
+                try:
+                    position, record = next(pending_records)
+                except StopIteration:
+                    return False
+                futures[executor.submit(parallel_score, record)] = (position, record)
+                return True
+
+            for _ in range(worker_count):
+                submit_next()
+            found = False
+            while futures and not found:
+                done, _ = concurrent.futures.wait(
+                    futures,
+                    return_when=concurrent.futures.FIRST_COMPLETED,
+                )
+                for future in done:
+                    position, record = futures.pop(future)
+                    report = future.result()
+                    apply_report(position, record, report)
+                    if bool(report["feasible"]):
+                        found = True
+                        print(
+                            "first feasible dense candidate found; stopping remaining dense candidates",
+                            flush=True,
+                        )
+                        break
+                    submit_next()
+            for future in futures:
+                future.cancel()
+            executor.shutdown(wait=True, cancel_futures=True)
+        finally:
+            for backend in worker_backends:
+                if backend is not None:
+                    backend.close()
         return passed
 
+    dense_depth_attempts: list[dict[str, Any]] = []
+
     def run_funnel(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        coarse_survivor_rows = _coarse_survivors(records)
-        sparse_survivors = refine_records(
-            coarse_survivor_rows,
-            tier="sparse",
-            sample_count=sparse_samples,
-            full_path=False,
-            ik_restarts=sparse_ik_restarts,
-            ik_iterations=sparse_ik_iterations,
-        )
-        dense_shortlist = _dense_shortlist(sparse_survivors, dense_top_k)
+        nonlocal ik_backend
+        sparse_survivors = _sparse_survivors(records)
+        base_shortlist = _dense_shortlist(sparse_survivors, dense_top_k)
+        dense_shortlist = _expand_rule_based_grasp_depths(base_shortlist)
+        dense_depth_attempts.extend(dense_shortlist)
+        if dense_candidate_jobs > 1 and ik_backend is not None:
+            # Do not retain the sparse worker while the configured dense worker
+            # pool allocates its own models and CUDA graphs.
+            ik_backend.close()
+            ik_backend = None
         return refine_records(
             dense_shortlist,
             tier="dense",
@@ -1730,28 +2358,22 @@ def solve(config: dict[str, Any], task: dict[str, Any]) -> dict[str, Any]:
             full_path=True,
         )
 
-    centerline_records = [
-        record
-        for record in attempts
-        if abs(float(record.get("contact_facing_lateral_offset_m") or 0.0))
-        <= 1e-12
-    ] if placement_mode == "contact_facing" else list(attempts)
-    final_feasible = run_funnel(centerline_records)
-    if placement_mode == "contact_facing" and not final_feasible:
-        lateral_records = [
-            record
-            for record in attempts
-            if abs(float(record.get("contact_facing_lateral_offset_m") or 0.0))
-            > 1e-12
-        ]
-        final_feasible = run_funnel(lateral_records)
+    sparse_matrix_elapsed_s = time.perf_counter() - solve_started_at
+    dense_started_at = time.perf_counter()
+    final_feasible = run_funnel(list(attempts))
+    dense_elapsed_s = time.perf_counter() - dense_started_at
 
     dense_evaluated = [
         record
-        for record in attempts
+        for record in dense_depth_attempts
         if record.get("dense_full_path_confirmation_ran")
     ]
-    ranked_pool = final_feasible or dense_evaluated or attempts
+    route_repair_records = [
+        record
+        for record in dense_evaluated
+        if record.get("transit_route_repair_required")
+    ]
+    ranked_pool = final_feasible or route_repair_records or dense_evaluated or attempts
     best = min(ranked_pool, key=_candidate_rank) if ranked_pool else None
     discovered = all_discovered
     feasible_regions = _feasible_region_summary(attempts)
@@ -1759,14 +2381,34 @@ def solve(config: dict[str, Any], task: dict[str, Any]) -> dict[str, Any]:
     if best is None:
         raise RuntimeError("No placement candidate could be evaluated; check bounds and template")
     best_execution = best.get("_output_execution") if best["feasible"] else None
+    best_route_repair = (
+        {
+            "required": True,
+            "candidate_index": int(best["index"]),
+            "repairs": best.get("transit_route_repairs", []),
+            "execution": best.get("_transit_route_repair_execution"),
+            "runnable_before_route_solve": False,
+        }
+        if best.get("transit_route_repair_required")
+        else None
+    )
     public_attempts = [
         {
             key: value
             for key, value in record.items()
             if not key.startswith("_")
         }
-        for record in attempts
+        for record in attempts + dense_depth_attempts
     ]
+    feedback_execution = (
+        best.get("_output_execution")
+        or best.get("_candidate_execution")
+        or template
+    )
+    collision_feedback = _collision_rejection_feedback(best, feedback_execution)
+    backend_report = json.loads(json.dumps(planning_backend))
+    if ik_backend is not None:
+        ik_backend.close()
     return {
         "schema_version": 1,
         "feasible": bool(best["feasible"]),
@@ -1787,44 +2429,329 @@ def solve(config: dict[str, Any], task: dict[str, Any]) -> dict[str, Any]:
             "orientation_visual_priorities": best.get(
                 "orientation_visual_priorities", []
             ),
+            "rule_based_grasp_depth_m_by_group": best.get(
+                "rule_based_grasp_depth_m_by_group", {}
+            ),
             "contact_point_link_m": best["contact_point_link_m"],
             "stages": best["stages"],
             "manipulation_blocks": best.get("manipulation_blocks", []),
         },
         # Never emit a runnable execution from a merely "best available"
-        # placement.  Every coarse sample and the dense 65-point planner must
+        # placement. Every sparse sample and the dense 65-to-129-point planner must
         # pass first; otherwise only rejection diagnostics are returned.
         "execution": best_execution,
+        "transit_route_repair": best_route_repair,
+        "agent_feedback": {
+            "collision_and_depth": collision_feedback,
+        },
         "search": {
+            "planning_ik_backend": backend_report,
             "orientation_gate": orientation_gate,
-            "coarse_keyframe_samples": coarse_samples,
             "sparse_path_samples": sparse_samples,
             "adaptive_dense_max_samples": dense_samples,
             "dense_top_k": dense_top_k,
-            "coarse_ik_random_restarts": coarse_ik_restarts,
+            "dense_candidate_jobs": dense_candidate_jobs,
+            "sparse_gpu_base_batch_size": (
+                SPARSE_GPU_BASE_BATCH_SIZE if ik_backend is not None else 1
+            ),
+            "sparse_gpu_batching": (
+                "multi_base_single_worker_solve_batch_env"
+                if ik_backend is not None
+                else "disabled_for_bullet_backend"
+            ),
+            "sparse_matrix_elapsed_s": round(sparse_matrix_elapsed_s, 6),
+            "dense_elapsed_s": round(dense_elapsed_s, 6),
+            "total_solve_elapsed_s": round(
+                time.perf_counter() - solve_started_at, 6
+            ),
             "sparse_ik_random_restarts": sparse_ik_restarts,
-            "coarse_ik_max_iterations": coarse_ik_iterations,
             "sparse_ik_max_iterations": sparse_ik_iterations,
             "allowed_body_penetration_m": allowed_penetration,
             "maximum_grasp_gap_m": maximum_grasp_gap,
+            "grasp_depth_policy": {
+                "owner": "application_rule_based_dense_search",
+                "agent_supplied_depth_ignored": True,
+                "ordered_adjustments_m": list(
+                    RULE_BASED_GRASP_DEPTH_ADJUSTMENTS_M
+                ),
+                "acceptance": (
+                    "both_application_owned_finger_links_within_target_gap_"
+                    "and_no_forbidden_collision_over_dense_full_path"
+                ),
+            },
             "candidates_evaluated": len(attempts),
-            "coarse_candidates_passed": sum(
-                bool(record.get("coarse_screening_passed")) for record in attempts
-            ),
             "sparse_candidates_evaluated": sum(
                 "sparse_screening_passed" in record for record in attempts
             ),
+            "sparse_candidates_passed": sum(
+                bool(record.get("sparse_screening_passed")) for record in attempts
+            ),
             "dense_candidates_evaluated": len(dense_evaluated),
+            "transit_route_repair_candidates": len(route_repair_records),
             "discovered_contact_points": discovered,
             "bounds": bounds,
             "attempts": public_attempts,
-            "lateral_refinement_seed": lateral_refinement_seed,
             "selection_policy": (
-                "coarse_5_keyframes__sparse_continuous_ik__top_k_adaptive_dense_full_path"
+                "full_visual_valid_sparse_matrix_gpu_batched__"
+                "ordered_top_k_adaptive_dense_stop_at_first_feasible"
             ),
             **feasible_regions,
         },
     }
+
+
+def _collision_rejection_feedback(
+    best: dict[str, Any], execution: dict[str, Any]
+) -> dict[str, Any]:
+    """Explain collision-owned rejection without accepting agent link policy.
+
+    ``materialize_execution_defaults`` derives every stage's forbidden object
+    links from the URDF (all object links except ``contact_link``) and derives
+    the allowed Panda links from the interaction.  This report deliberately
+    echoes those application-owned sets so a task agent only has to revise
+    contact geometry such as ``grasp_depth_m``; it can neither hide an offender
+    by editing a blacklist nor widen target-contact permission.
+    """
+    stage_definitions = {
+        str(stage["id"]): stage for stage in execution.get("stages", [])
+    }
+    rejected_stages: list[dict[str, Any]] = []
+    for report in best.get("stages", []):
+        stage_id = str(report.get("stage_id", ""))
+        stage = stage_definitions.get(stage_id)
+        if stage is None:
+            continue
+        contact_link = str(stage["contact_link"])
+        forbidden = {str(name) for name in stage.get("forbidden_contact_links", [])}
+        allowed_robot = {
+            str(name) for name in stage.get("allowed_robot_contact_links", [])
+        }
+        violations: list[dict[str, Any]] = []
+
+        for pair, distance_value in report.get("worst_offenders", {}).items():
+            distance = float(distance_value)
+            robot_link, separator, object_link = str(pair).partition("|")
+            if not separator:
+                continue
+            if object_link in forbidden:
+                collision_class = "non_target_object_link"
+            elif object_link == contact_link and robot_link not in allowed_robot:
+                collision_class = "non_allowed_robot_link_on_target"
+            else:
+                continue
+            violations.append({
+                "collision_class": collision_class,
+                "phase": "manipulation_screen",
+                "robot_link": robot_link,
+                "object_link": object_link,
+                "distance_m": distance,
+            })
+
+        required_dense = float(
+            report.get(
+                "dense_full_path_required_clearance_m",
+                report.get("required_forbidden_clearance_m", 0.0),
+            )
+        )
+        for row in report.get("dense_full_path_tightest_samples", []):
+            if not isinstance(row, dict) or row.get("object_link") is None:
+                continue
+            distance = float(row.get("distance_m", 0.0))
+            if distance >= required_dense:
+                continue
+            robot_link = str(row.get("robot_link", "unknown"))
+            object_link = str(row["object_link"])
+            # cuRobo checks the application-owned forbidden source meshes as a
+            # batch and may therefore report their collective obstacle label.
+            # It is still collision evidence, but never an agent-authored link.
+            if object_link == "source_mesh_environment":
+                collision_class = "application_forbidden_source_mesh"
+            elif object_link in forbidden:
+                collision_class = "non_target_object_link"
+            elif object_link == contact_link and robot_link not in allowed_robot:
+                collision_class = "non_allowed_robot_link_on_target"
+            else:
+                continue
+            violation = {
+                "collision_class": collision_class,
+                "phase": str(row.get("phase", "dense_full_path")),
+                "robot_link": robot_link,
+                "object_link": object_link,
+                "distance_m": distance,
+            }
+            if row.get("sample") is not None:
+                violation["sample"] = int(row["sample"])
+            if row.get("reason") is not None:
+                violation["reason"] = str(row["reason"])
+            violations.append(violation)
+
+        # A GPU batch can reject the forbidden world without an exact Bullet
+        # pair. Preserve that conservative result rather than asking the agent
+        # to guess which link should be ignored.
+        if (
+            report.get("forbidden_clearance_passed") is False
+            and not violations
+            and report.get("minimum_forbidden_clearance_m") is not None
+        ):
+            violations.append({
+                "collision_class": "application_forbidden_source_mesh",
+                "phase": "manipulation_screen",
+                "robot_link": "curobo_collision_spheres",
+                "object_link": "source_mesh_environment",
+                "distance_m": float(report["minimum_forbidden_clearance_m"]),
+            })
+
+        if violations:
+            rejected_stages.append({
+                "stage_id": stage_id,
+                "contact_link": contact_link,
+                "grasp_depth_m": float(stage.get("grasp_depth_m", 0.0)),
+                "effective_robot_contact_offset_m": ph._effective_grasp_depth(stage),
+                "application_forbidden_contact_links": sorted(forbidden),
+                "application_allowed_robot_contact_links": sorted(allowed_robot),
+                "violations": violations,
+            })
+
+    rejected = bool(rejected_stages)
+    return {
+        "policy": (
+            "application_derives_all_object_links_except_contact_link_as_forbidden; "
+            "agent-supplied forbidden/allowed collision lists are ignored"
+        ),
+        "agent_collision_link_input_accepted": False,
+        "depth_adjustment_valid": not rejected,
+        "status": (
+            "rejected_collision_at_proposed_depth"
+            if rejected
+            else "no_collision_attributed_depth_rejection"
+        ),
+        "rejected_stages": rejected_stages,
+        "next_action": (
+            "revise only task-local contact geometry (normally a shallower "
+            "grasp_depth_m), rerender the complete five-roll visual batch, and "
+            "rerun placement; do not edit collision-link lists"
+            if rejected
+            else "inspect the non-collision placement diagnostics before changing depth"
+        ),
+    }
+
+
+def _application_contact_facing_bounds(task: dict[str, Any]) -> dict[str, Any]:
+    """Build the full sparse base matrix from geometry and harness constants.
+
+    Lateral coverage is the widest initial horizontal object-link extent, with
+    a robot-independent minimum half-span.  The 5 cm grid and Panda working
+    distance range are application policy; an agent cannot narrow them because
+    a prior centered row failed or a command is taking too long.
+    """
+    object_urdf = ph._resolve(task["inputs"]["urdf"])
+    initial = ph.task_initial_joint_values(task)
+    client = p.connect(p.DIRECT)
+    if client < 0:
+        raise RuntimeError("Could not connect placement-bounds geometry client")
+    try:
+        body = p.loadURDF(str(object_urdf), useFixedBase=True, physicsClientId=client)
+        joints, _ = ph._maps(body, client)
+        for name, value in initial.items():
+            if name in joints:
+                p.resetJointState(body, joints[name], float(value), physicsClientId=client)
+        p.performCollisionDetection(physicsClientId=client)
+        horizontal_extents = []
+        for link_index in range(-1, p.getNumJoints(body, physicsClientId=client)):
+            low, high = p.getAABB(body, link_index, physicsClientId=client)
+            horizontal_extents.extend(
+                [float(high[0] - low[0]), float(high[1] - low[1])]
+            )
+        widest = max(horizontal_extents, default=0.5)
+    finally:
+        p.disconnect(client)
+    step = 0.05
+    lateral_half_span = max(0.5, round(widest / step) * step)
+    lateral_count = int(round(lateral_half_span / step))
+    return {
+        "object_yaw_deg": [0.0],
+        "robot_base_z_m": [0.0],
+        "contact_facing_distance_m": [
+            round(0.35 + step * index, 10) for index in range(16)
+        ],
+        "contact_facing_lateral_offset_m": [
+            round(step * index, 10)
+            for index in range(-lateral_count, lateral_count + 1)
+        ],
+        "contact_facing_yaw_offset_deg": [0.0],
+    }
+
+
+def _run_transit_route_repair(
+    task: dict[str, Any], answer: dict[str, Any], out: Path
+) -> None:
+    """Run the one bounded moved-obstacle repair batch selected by placement."""
+    repair = answer.get("transit_route_repair")
+    if not isinstance(repair, dict) or not repair.get("required"):
+        return
+    execution = repair.get("execution")
+    repairs = repair.get("repairs", [])
+    if not isinstance(execution, dict) or not repairs:
+        return
+    chosen_repair = min(
+        repairs,
+        key=lambda item: (
+            int(item.get("incoming_stage_index", 1 << 30)),
+            float(item.get("minimum_direct_transit_clearance_m", math.inf)),
+        ),
+    )
+    repair_root = out / "transit-route-repair"
+    repair_root.mkdir(parents=True, exist_ok=True)
+    candidate_execution_path = repair_root / "candidate-execution.json"
+    candidate_execution_path.write_text(
+        json.dumps(execution, indent=2, ensure_ascii=False, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    repair["candidate_execution_path"] = str(candidate_execution_path)
+    repair["selected_repair"] = chosen_repair
+    repair.pop("execution", None)
+
+    # Import lazily to keep ordinary placement startup independent of the
+    # conditional route machinery.
+    import propose_artimo_transit_routes as route_proposer
+    import solve_artimo_transit_clearance as route_solver
+
+    proposal = route_proposer.propose(
+        task,
+        execution,
+        candidate_execution_path,
+        str(chosen_repair["incoming_stage_id"]),
+        str(chosen_repair["primary_obstacle_link"]),
+        0.06,
+        0.02,
+        (0.55, 0.70, 0.85),
+    )
+    (repair_root / "proposal.json").write_text(
+        json.dumps(proposal, indent=2, ensure_ascii=False, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    routes = proposal.get("routes_config")
+    if routes is None:
+        repair["solved"] = False
+        repair["failure"] = "route_proposer_emitted_no_bounded_routes"
+        return
+    (repair_root / "routes.json").write_text(
+        json.dumps(routes, indent=2, ensure_ascii=False, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    transit = route_solver.solve(routes, task, jobs=4)
+    (repair_root / "transit.json").write_text(
+        json.dumps(transit, indent=2, ensure_ascii=False, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    repair["solved"] = bool(transit["feasible"])
+    repair["transit_report_path"] = str(repair_root / "transit.json")
+    if transit["execution"] is not None:
+        answer["execution"] = transit["execution"]
+        answer["feasible"] = True
+        repair["runnable_before_route_solve"] = False
+        repair["runnable_after_route_solve"] = True
+        repair["chosen_route"] = transit["chosen"]
 
 
 def main() -> int:
@@ -1839,6 +2766,8 @@ def main() -> int:
         answer = solve(config, task)
         out = args.out.expanduser().resolve()
         out.mkdir(parents=True, exist_ok=True)
+        if answer["execution"] is None and answer.get("transit_route_repair"):
+            _run_transit_route_repair(task, answer, out)
         (out / "placement.json").write_text(
             json.dumps(answer, indent=2, ensure_ascii=False, sort_keys=True) + "\n", encoding="utf-8"
         )

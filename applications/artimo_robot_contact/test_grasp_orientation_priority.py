@@ -7,20 +7,23 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 from apply_artimo_grasp_orientation_decisions import apply_decisions
 from solve_artimo_placement import (
     _adaptive_driver_path,
-    _best_centerline_attempt,
     _candidate_rank,
-    _coarse_survivors,
+    _contact_facing_sparse_matrix,
     _dense_shortlist,
+    _expand_rule_based_grasp_depths,
     _feasible_region_summary,
     _gated_orientation_options,
     _manipulation_block_stage_ids,
-    _matches_lateral_refinement_seed,
+    _sparse_survivors,
     _tier_ik_budget,
+    _transit_route_repair,
 )
+from render_artimo_grasp_orientation_candidates import DEFAULT_ROLL_DEGREES
 
 
 def _sha256(path: Path) -> str:
@@ -28,6 +31,54 @@ def _sha256(path: Path) -> str:
 
 
 class OrientationPriorityTest(unittest.TestCase):
+    def test_prior_moved_link_transit_collision_requires_route_solver(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        urdf = Path(temporary.name) / "object.urdf"
+        urdf.write_text(
+            """<robot name='fixture'>
+            <link name='base'/><link name='door'/><link name='handle'/>
+            <joint name='door_joint' type='revolute'>
+              <parent link='base'/><child link='door'/><axis xyz='0 0 1'/>
+              <limit lower='0' upper='1.57' effort='1' velocity='1'/>
+            </joint>
+            <joint name='handle_fixed' type='fixed'>
+              <parent link='door'/><child link='handle'/>
+            </joint></robot>""",
+            encoding="utf-8",
+        )
+        stages = [
+            {"id": "open", "driver_joint": "door_joint", "contact_sequence": "a"},
+            {
+                "id": "pull_tray",
+                "driver_joint": "tray_joint",
+                "contact_sequence": "b",
+                "minimum_swept_clearance_m": 0.0,
+            },
+        ]
+        plan = SimpleNamespace(swept_clearance_violations=[{
+            "phase": "transit_in",
+            "object_link": "handle",
+            "robot_link": "panda_link4",
+            "distance_m": -0.012,
+        }])
+        repair = _transit_route_repair(urdf, stages, 1, plan)
+        self.assertIsNotNone(repair)
+        self.assertEqual(repair["primary_obstacle_link"], "handle")
+        self.assertEqual(
+            repair["classification"], "prior_plan_moved_link_blocks_transit"
+        )
+
+        plan.swept_clearance_violations[0]["phase"] = "manipulate"
+        self.assertIsNone(_transit_route_repair(urdf, stages, 1, plan))
+
+    def test_default_rolls_keep_symmetric_jaws_as_distinct_robot_ik_branches(self) -> None:
+        self.assertEqual(
+            DEFAULT_ROLL_DEGREES, (0.0, 45.0, 90.0, 135.0, 180.0)
+        )
+        self.assertEqual(len(DEFAULT_ROLL_DEGREES), 5)
+        self.assertEqual(0.0 % 180.0, 180.0 % 180.0)
+
     def test_screening_ik_budgets_do_not_inherit_dense_restarts(self) -> None:
         execution_ik = {"random_restarts": 96, "max_iterations": 2000}
         self.assertEqual(_tier_ik_budget(execution_ik, "coarse"), (4, 500))
@@ -66,21 +117,37 @@ class OrientationPriorityTest(unittest.TestCase):
         self.assertAlmostEqual(float(changing[0]), 0.0)
         self.assertAlmostEqual(float(changing[-1]), 1.0)
 
-    def test_only_coarse_passes_reach_sparse_and_top_k_reaches_dense(self) -> None:
+    def test_only_sparse_passes_reach_dense_top_k(self) -> None:
         rejected = self._placement_attempt(0.45, -0.1)
-        rejected["coarse_screening_passed"] = False
+        rejected["sparse_screening_passed"] = False
         survivors = []
         for distance, residual in ((0.5, 0.003), (0.6, 0.001), (0.7, 0.002)):
             row = self._placement_attempt(distance, 0.0)
-            row["coarse_screening_passed"] = True
+            row["sparse_screening_passed"] = True
             row["stages"][0]["maximum_ik_position_error_m"] = residual
             survivors.append(row)
-        sparse_rows = _coarse_survivors([rejected, *survivors])
+        sparse_rows = _sparse_survivors([rejected, *survivors])
         self.assertNotIn(rejected, sparse_rows)
         self.assertEqual(len(sparse_rows), 3)
         dense_rows = _dense_shortlist(sparse_rows, 2)
         self.assertEqual(len(dense_rows), 2)
         self.assertNotIn(rejected, dense_rows)
+
+    def test_dense_top_k_prefers_larger_gpu_path_clearance(self) -> None:
+        tight = self._placement_attempt(0.55, 0.0, lateral=0.0)
+        roomy = self._placement_attempt(0.65, 0.0, lateral=0.2)
+        for row, clearance in ((tight, 0.002), (roomy, 0.035)):
+            row["sparse_screening_passed"] = True
+            row["manipulation_blocks"] = [{
+                "feasible": True,
+                "target_actually_gripped": True,
+                "minimum_sample_completion_ratio": 1.0,
+                "minimum_gpu_environment_clearance_m": clearance,
+                "deepest_body_penetration_m": 0.0,
+                "maximum_target_link_gap_m": 0.0,
+                "maximum_ik_position_error_m": 0.001,
+            }]
+        self.assertIs(_dense_shortlist([tight, roomy], 1)[0], roomy)
 
     @staticmethod
     def _placement_attempt(
@@ -158,6 +225,14 @@ class OrientationPriorityTest(unittest.TestCase):
         report = {
             "schema_version": 4,
             "visual_render_ik_was_run": False,
+            "maximum_target_gap_m": 0.006,
+            "contact_offset_under_review": {
+                "contact_translation_m": [0.0, 0.0, 0.0],
+                "grasp_depth_m": 0.0,
+                "robot_tool_contact_offset_eef_m": None,
+                "finger_opening_m": 0.01,
+            },
+            "maximum_target_gap_m": 0.006,
             "stage_id": "press",
             "stage_index": 0,
             "interaction": "physical_contact",
@@ -169,10 +244,13 @@ class OrientationPriorityTest(unittest.TestCase):
         decisions_path.write_text(
             json.dumps(
                 {
-                    "schema_version": 2,
+                    "schema_version": 4,
                     "report_sha256": _sha256(report_path),
                     "stage_id": "press",
-                    "decisions": decisions,
+                    "decisions": [
+                        {**decision, "angle_status": "valid"}
+                        for decision in decisions
+                    ],
                 }
             ),
             encoding="utf-8",
@@ -189,6 +267,35 @@ class OrientationPriorityTest(unittest.TestCase):
         self.assertEqual(
             gate["stages"][0]["numerically_evaluated_candidate_ids"], []
         )
+
+    def test_angle_decision_does_not_require_agent_depth_judgment(self) -> None:
+        report, decisions, output, temporary = self._case(
+            {"roll_a": 1, "roll_b": 2, "roll_c": 3}
+        )
+        self.addCleanup(temporary.cleanup)
+        gate = apply_decisions(report, decisions, output)
+        self.assertEqual(gate["stages"][0]["agent_decision_scope"], "wrist_angle_only")
+
+    def test_gate_assigns_depth_to_rule_based_search(self) -> None:
+        report, decisions, output, temporary = self._case(
+            {"roll_a": 1, "roll_b": 2, "roll_c": 3}
+        )
+        self.addCleanup(temporary.cleanup)
+        gate = apply_decisions(report, decisions, output)
+        self.assertEqual(
+            gate["stages"][0]["grasp_depth_owner"],
+            "application_rule_based_dense_search",
+        )
+
+    def test_gate_records_angle_only_evidence(self) -> None:
+        report, decisions, output, temporary = self._case(
+            {"roll_a": 1, "roll_b": 2, "roll_c": 3}
+        )
+        self.addCleanup(temporary.cleanup)
+        gate = apply_decisions(report, decisions, output)
+        row = gate["stages"][0]
+        self.assertFalse(row["nominal_contact_geometry_frozen_by_visual_gate"])
+        self.assertEqual(row["selected_angle_status"], "valid")
 
     def test_all_visual_candidates_reach_placement_in_priority_order(self) -> None:
         report, decisions, output, temporary = self._case(
@@ -226,25 +333,50 @@ class OrientationPriorityTest(unittest.TestCase):
             [1.0, 0.0, 2.0],
         )
 
-    def test_lateral_refinement_uses_only_best_centerline_distance(self) -> None:
-        attempts = [
-            self._placement_attempt(0.45, -0.030),
-            self._placement_attempt(0.55, -0.004),
-            self._placement_attempt(0.65, -0.012),
-            # A lateral row must never become the seed for another refinement.
-            self._placement_attempt(0.45, 0.0, lateral=0.1),
-        ]
-        seed = _best_centerline_attempt(attempts, ["roll_best"])
-        self.assertIsNotNone(seed)
-        self.assertEqual(seed["contact_facing_distance_m"], 0.55)
-        self.assertTrue(
-            _matches_lateral_refinement_seed(
-                (0.0, 0.0, 0.55, 0.0, -0.1), seed
-            )
+    def test_sparse_matrix_contains_every_distance_lateral_cell(self) -> None:
+        matrix = _contact_facing_sparse_matrix(
+            [0.0], [0.0], [0.45, 0.55, 0.65], [0.0], [0.0, -0.1, 0.1]
         )
-        self.assertFalse(
-            _matches_lateral_refinement_seed(
-                (0.0, 0.0, 0.45, 0.0, -0.1), seed
+        self.assertEqual(len(matrix), 9)
+        self.assertEqual(
+            {(row[2], row[4]) for row in matrix},
+            {
+                (distance, lateral)
+                for distance in (0.45, 0.55, 0.65)
+                for lateral in (0.0, -0.1, 0.1)
+            },
+        )
+
+    def test_rule_based_depth_search_preserves_one_depth_per_sequence(self) -> None:
+        record = {
+            "_candidate_execution": {
+                "stages": [
+                    {
+                        "id": "turn",
+                        "interaction": "explicit_ideal_feasibility",
+                        "contact_sequence": "door",
+                        "grasp_depth_m": 0.0,
+                    },
+                    {
+                        "id": "pull",
+                        "interaction": "explicit_ideal_feasibility",
+                        "contact_sequence": "door",
+                        "grasp_depth_m": 0.0,
+                    },
+                ]
+            }
+        }
+        expanded = _expand_rule_based_grasp_depths([record])
+        self.assertEqual(len(expanded), 6)
+        self.assertEqual(
+            expanded[0]["rule_based_grasp_depth_m_by_group"],
+            {"sequence:door": 0.015},
+        )
+        self.assertTrue(
+            all(
+                row["_candidate_execution"]["stages"][0]["grasp_depth_m"]
+                == row["_candidate_execution"]["stages"][1]["grasp_depth_m"]
+                for row in expanded
             )
         )
 
@@ -375,8 +507,7 @@ class OrientationPriorityTest(unittest.TestCase):
                 "maximum_ik_position_error_m": 0.002,
             },
         ]
-        seed = _best_centerline_attempt([greedy, balanced])
-        self.assertEqual(seed["contact_facing_distance_m"], 0.60)
+        self.assertLess(_candidate_rank(balanced), _candidate_rank(greedy))
 
     def test_feasible_region_is_intersection_of_all_blocks(self) -> None:
         def attempt(x: float, block_ok: tuple[bool, bool]) -> dict:

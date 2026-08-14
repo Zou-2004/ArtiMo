@@ -10,7 +10,7 @@ without dense video review. Also flag any missing/duplicate plan-control owner,
 causal actuation of a `robot_contact` phase, robot-owned stage without positive
 contact evidence, or release/re-approach inserted inside one declared continuous
 contact sequence. These flags may rank planning candidates and remain in
-`result.json`, but they never truncate the 65-sample trajectory, skip later
+`result.json`, but they never truncate the dense trajectory, skip later
 phases, suppress video export, or make the runner return a failure status.
 
 ## 2. Diagnosis order
@@ -38,7 +38,7 @@ phases, suppress video export, or make the runner return a failure status.
 
 Change one execution-data class at a time in this order: contact point, contact
 orientation, precontact offset, link-centered base distance, bounded lateral
-base offset, intermediate waypoint, camera, then collision proxy. Arm controller
+base offset, intermediate waypoint, then camera. Arm controller
 gain/force and grasp physics are fixed by the harness and are never repair
 variables. Keep object orientation and facing construction fixed while
 tuning distance/lateral reach unless the declared contact surface itself was
@@ -65,19 +65,27 @@ wait, poll, resume, or rerun the byte-identical numerical command. A placement
 result without an emitted `execution.json` cannot enter release planning or a
 physical rollout.
 
-Never infer wrist roll from a quaternion tuple, comparison sheet, tiled card,
-or one occluded full-scene render. After fixing point, surface normal, and grasp
-depth, run
+Never author or infer the common contact frame from a quaternion tuple. The
+application derives it from the collision-surface normal and principal tangent;
+an input quaternion is ignored. Never infer the remaining wrist-roll choice
+from a quaternion tuple, comparison sheet, tiled card,
+or one occluded full-scene render. After fixing the point and grasp depth, run
 `applications/artimo_robot_contact/render_artimo_grasp_orientation_candidates.py` once for the complete
 roll batch. Open all four separate files for every candidate. Use the isolated
 surface-normal and tangent views with cyan/magenta opposing contact links to
 verify that the jaws straddle the intended feature; do not accept a roll merely
 because finger shafts appear parallel to a handle or rim. Mark every candidate
-visual-valid or visual-invalid with a reason, then apply the manifest through
+angle-valid or angle-invalid first. For every angle-valid row, independently
+judge the declared contact offset. A shallow, deep, off-target, or occluded
+offset must be repaired in execution data and the complete five-roll batch must
+be rerendered; never discard a correct angle to hide an incorrect offset. Only
+then mark every candidate visual-valid or visual-invalid with a reason and apply the manifest through
 `applications/artimo_robot_contact/apply_artimo_grasp_orientation_decisions.py`. Visual-invalid candidates
 are not low-ranked candidates: the visual pass runs no IK, and invalid rolls are
-absent before placement. IK, target contact geometry, and whole-arm clearance
-may reject only the visual-valid set. Rank that set first by visual semantics
+absent before placement. IK and whole-arm clearance may reject only the
+visual-valid set. Sparse and dense base search do not repeat finger-gap queries
+for contact geometry already frozen by the visual offset gate, and rollout uses
+the disclosed ideal grasp after closure rather than rechecking the depth. Rank that set first by visual semantics
 with unique contiguous priorities, but use priority only as a deterministic
 tie-break after joint whole-task geometry. Preserve all valid candidates for the
 base-and-block contact combination search. Do not use a default/template
@@ -92,17 +100,28 @@ candidate has both the required visual relationship and
 valid measurements, report the bounded orientation gap instead of manually
 inventing another pose.
 
-If a visually correct roll leaves either opposing finger with a positive gap at
-the final aperture, do not call it acquired and do not attach it. Reduce the
-non-negative `grasp_depth_m` in execution data, rerender the immutable roll
-batch, and require simultaneous PyBullet target contact from every declared
-grasp link. A single allowed fingertip touching the target is not a grasp.
+If a visually correct roll still places the feature at the fingertips or leaves
+the grasp looking shallow, keep the angle decision and run placement's
+application-owned depth search. Do not ask the agent to edit `grasp_depth_m`.
+For centered Panda `open_then_close`, value zero includes the robot-defined
+0.015 m inward useful-finger inset and equals an effective `-0.015 m`; the bounded
+rule-based lattice applies continuous adjustments around that baseline and
+orders them shallow-to-deep. The visual gate requires a
+convincing opposed grasp but does not require physical collision/contact from
+the no-IK proxy. Simultaneous numerical target contact from every declared
+grasp link is confirmed only for the dense shortlist and final rollout. A
+single allowed fingertip touching the target is not a grasp.
 
 Dense IK continuation is harness-fixed to a 0.08-rad local trust region around
 the preceding command. This prevents redundant-joint null-space wandering and
 remote branch switches while preserving a finite best-local trajectory. A pose
 residual at a joint limit remains diagnostic data; never remove the trust region,
 restart global IK mid-trajectory, or stop the remaining rollout to reduce it.
+The first IK configuration of an independent acquisition is not adjacent to
+home or the preceding retreat in this sense. Its raw entry joint delta is a
+diagnostic for the transit planner, not a placement rejection gate; the actual
+approach/transit must be interpolated or routed with cuRobo MotionGen when the
+GPU backend is selected; bounded CPU RRT is only Bullet mode or explicit fallback.
 Read the reported minimum joint-limit margin and its stage sample/joint. If the
 margin reaches the numerical boundary while Cartesian residual grows, classify
 the candidate as a local-branch dead end. Do not hide it with a remote global
@@ -120,17 +139,21 @@ Read the diagnostics before choosing a repair:
   asset-specific rule.
 
 - `surface_outward_axis_world`, `grasp_target_world_m`, and
-  `precontact_world_m` must place every positive offset outside the object.
+  `precontact_world_m` must place every positive precontact offset outside the object.
   Contact local +Z is outward and robot motion toward contact is -Z; never
-  repair a reversed approach by making a distance negative. Panda grasptarget
+  repair a reversed approach by making `precontact_offset_m` negative. The
+  final `grasp_depth_m` is signed and application-selected around the centered Panda
+  baseline (`effective offset = -0.015 m + grasp_depth_m` for centered
+  `open_then_close`). The bounded solver selects it only after exact dense
+  bilateral target-gap and collision validation. Panda grasptarget
   +Z runs from palm to fingertips and is converted by the harness to contact
   -Z. If the palm faces the object while fingertips point outward, repair the
   shared frame conversion, not the task quaternion.
 - `precontact_offset_m` vanishes when manipulation starts, while
   `grasp_depth_m` remains. If IK succeeds but the gripper misses, read
-  `target_link_gap_by_allowed_robot_link_m`; repair the declared final depth
-  until the target grasp geometry is real. Do not use a large grasp depth as
-  approach clearance.
+  `target_link_gap_by_allowed_robot_link_m` and the runtime
+  `grasp_acquisition` record; the rule-based search must reject that depth.
+  Do not use a large grasp depth as approach clearance.
 - If contact is a large, short impulse followed by a miss, inspect
   `contact_acquisition` before changing offset. A grasp target approached with
   `maintain_width` or with an already-closed aperture can strike the target end
@@ -194,15 +217,21 @@ Read the diagnostics before choosing a repair:
   repair the scheduler rather than moving the base around the manufactured
   detour. If the direct segment intersects an obstacle moved by the prior
   stage, run `applications/artimo_robot_contact/propose_artimo_transit_routes.py` against the frozen placed
-  execution. It applies preceding endpoints, measures the smallest intersecting
+  execution. A dense candidate whose only failing pair is such a moved-link
+  `transit_in` collision must be marked
+  `prior_plan_moved_link_blocks_transit` and sent to this bounded solver before
+  rejection; it must not be promoted directly to rollout. It applies preceding endpoints, measures the smallest intersecting
   forbidden-link AABB, and emits four lateral plus three top-corner route
   candidates without knowing the asset. Evaluate that immutable batch once
-  with `applications/artimo_robot_contact/solve_artimo_transit_clearance.py --jobs 4`. Each candidate runs
-  in isolation; direct joint interpolation is attempted before bounded
-  deterministic RRT, and the accepted exact joint path is serialized for
+  with `applications/artimo_robot_contact/solve_artimo_transit_clearance.py`. Direct joint
+  interpolation is attempted first. With cuRobo selected, one persistent GPU
+  MotionGen worker evaluates blocked segments and GPU collision worlds; exact
+  PyBullet swept-clearance then verifies the returned path. CPU RRT may run only
+  in Bullet mode or with explicit `allow_bullet_fallback: true`. The accepted path is used for
   rollout. Rank by full-robot swept clearance and path length, freeze the
   least-cost feasible route, and never replay it on retreat. If all candidates
-  fail, report the exact unreachable-waypoint, joint-limit, collision, or RRT
+  fail, report the exact unreachable-waypoint, joint-limit, collision, MotionGen
+  status, or (only when applicable) RRT
   exhaustion gate instead of hand-authoring another asset-specific route.
 - `physical.causal_rule_states[]` shows whether each rule triggered, enabled its
   effects, and released. A rule that triggered but never released usually means
@@ -227,10 +256,10 @@ Read the diagnostics before choosing a repair:
   Declare `release_before_phase` no later than the earliest dependent moving
   phase, run
   `applications/artimo_robot_contact/solve_artimo_release_clearance.py`, copy the chosen world-frame retreat
-  waypoint into `release_retreat_waypoints_world`, and require the declared
-  nonnegative `minimum_release_swept_clearance_m`. A task may declare zero when
-  exact non-penetration is sufficient; no hidden positive margin may override
-  it. The solver route must replace, not follow,
+  waypoint into `release_retreat_waypoints_world`, and copy its measured
+  `minimum_release_swept_clearance_m`. Any strictly positive whole-route
+  separation passes; there is no fixed 20 mm or other hidden positive margin.
+  Zero or penetration fails. The solver route must replace, not follow,
   the default link-relative withdrawal and must start at the release command;
   validate and execute its exact dense joint path rather than an endpoint chord.
   Verify that release, retreat, and the nonzero safe-endpoint settle finish
@@ -240,8 +269,10 @@ Read the diagnostics before choosing a repair:
   base: an old world-frame release waypoint must never reject a new placement.
   If rollout collides with an internally moved link while the solver reports
   clearance, verify it projected every endpoint before `release_before_phase`
-  and swept every later plan endpoint at the retreat pose. Checking only robot
-  drivers or passive returns is a generic solver failure.
+  and swept every applicable plan endpoint before the next robot-contact
+  acquisition at the retreat pose. Sweeping a later manipulation after its
+  reacquisition is also a generic solver failure; that motion belongs to the
+  later block, while the path between contacts belongs to transit.
 - If a joint reaches its target without target contact in the phase assigned to
   `robot_contact`, inspect phase ownership first. Do not lower contact gates or
   relabel the phase as an internal mechanism to preserve a passing rollout.
@@ -252,19 +283,12 @@ Read the diagnostics before choosing a repair:
   closed. A transit, retreat, release/reacquire, or sample-zero IK call between
   same-link stages is a harness failure, not a task-specific waypoint problem.
 
-If a non-target contact is an artifact of convex-hull inflation rather than real
-geometry, build a collision proxy with `applications/artimo_robot_contact/build_artimo_collision_proxy.py`
-under the current task's `.artimo-runs/` debug directory and pass its path as the
-root `physics_urdf` field of execution data. Never edit the immutable task spec
-to add a generated proxy. Never store an asset URDF, proxy spec, proxy mesh, or
-report in a reusable tool/input directory; read the original URDF from the
-supplied asset/data tree.
-Verify the reported per-link AABB extents match the real part before trusting a
-run made with it.
-
-For collision-proxy repair, preserve source visuals, joint origins, axes, and
-limits. Replace only invalid collision geometry with documented conservative
-primitives. Never open a passage absent from source visual geometry.
+Convex-hull inflation is not an agent repair variable. Sparse GPU collision
+uses the locked source meshes directly. Do not automatically replace them with
+whole-mesh hulls or V-HACD parts: either can close real free space and reject a
+valid path. If a PyBullet-only check disagrees with the source-mesh GPU result,
+report a generic checker mismatch; do not write a proxy spec or
+`physics_urdf` execution field and do not lower collision thresholds.
 
 Do not spend a repair iteration re-discovering the object-side joint or effect
 topology: those semantics come from `plan.json`. Repair the declared robot

@@ -17,10 +17,12 @@ The generic harness code and all frozen inputs must be byte-identical between
 handoff and release. Per-task poses, gains, mechanisms, camera, and seeds are
 execution data stored in `grasp.json` and debug evidence.
 
-A collision-only URDF generated after handoff is execution data, not a source
-input or config. Store it only below the current `.artimo-runs/<task_id>/`,
-record its path in `grasp.json` root `physics_urdf`, verify its mechanism against
-the locked source URDF, and hash the exact simulated file in both clean runs.
+Collision representation is a locked input, not agent-authored execution data.
+Ordinary runs use the source URDF meshes byte-for-byte; they must not silently
+replace them with whole-mesh convex hulls or V-HACD parts. A task may supply a
+separately locked `inputs.physics_urdf`, whose mechanism must match the source.
+The agent never writes `physics_urdf` execution data, and the exact simulated
+file is hashed in the result.
 
 The trajectory is optional and is never an animation source. If supplied, only
 its first `joint_angles` row establishes a non-zero initial object state. With
@@ -38,12 +40,13 @@ no trajectory, initialize every URDF joint at its default zero state.
   mixed-owner controls in the same phase remain separate. Every
   `robot_contact` control has its own contact stage and positive measured target
   contact; no causal actuator may command its joint target. Consecutive stages
-  before any intervening plan `control_release` use the same contact link and
-  one `contact_sequence`; `causal.json` is not an action-authority input. Preserve
-  the same grasp without finger opening, retreat, constraint recreation, or a
-  sample-zero IK resolve between plan phases. A link change is the normal
-  release/reacquire boundary; same-link release needs an explicit plan-semantic
-  boundary such as passive return.
+  on the same contact link before any intervening plan `control_release` use one
+  `contact_sequence`; `causal.json` is not an action-authority input. Preserve
+  that grasp without finger opening, retreat, constraint recreation, or a
+  sample-zero IK resolve between plan phases. A change to a different physical
+  contact link is itself the required robot release/retreat/reacquire boundary,
+  even when the object-motion plan has no standalone release phase; same-link
+  release still needs an explicit plan-semantic boundary such as passive return.
 - Execute the agent-declared contact acquisition exactly. `open_then_close`
   keeps the gripper open through transit/approach, closes while the arm holds
   the first contact pose, settles, manipulates, then opens before retreat.
@@ -60,7 +63,7 @@ no trajectory, initialize every URDF joint at its default zero state.
   tool surface covering the intended button along its surface normal without
   sweeping the housing, not by opposing-jaw straddle. Switching from centered
   grasptarget geometry to a tool offset invalidates prior visual decisions and
-  requires a fresh full eight-roll visual-only gate before placement.
+  requires a fresh full five-roll visual-only gate before placement.
 - Keep robot/object collision response enabled except nominated contact pairs
   in the hidden negative control.
 - Record every robot/object contact pair, constraint, joint reset,
@@ -97,17 +100,19 @@ no trajectory, initialize every URDF joint at its default zero state.
   `applications/artimo_robot_contact/propose_artimo_transit_routes.py`, using the moved state and the
   smallest expanded forbidden-link AABB intersecting the direct Cartesian
   segment. Evaluate that immutable table in one
-  `applications/artimo_robot_contact/solve_artimo_transit_clearance.py --jobs 4` invocation. Every
-  candidate runs in an isolated process, first with direct interpolation and
-  then, when needed, bounded deterministic joint-space RRT. Planning and
-  rollout consume the exact same serialized accepted joint path.
-  An
-  `open_then_close` stage has measured near-target
-  geometry for the required gripper links at every sampled pose; EEF IK alone
-  is not grasp evidence. Near-target geometry is only a cheap precheck. At the
-  closed aperture, PyBullet must report simultaneous target contact from every
-  declared `allowed_robot_contact_links` member; a positive gap or one-finger
-  contact cannot trigger the disclosed ideal attachment.
+  `applications/artimo_robot_contact/solve_artimo_transit_clearance.py` invocation. Direct
+  interpolation is tested first. When execution selects cuRobo, one persistent
+  GPU worker uses MotionGen graph search/trajectory optimization and GPU world
+  collision for blocked segments; candidate evaluation is intentionally
+  serialized through that worker to avoid multiplying VRAM. PyBullet performs
+  the final exact swept-path verification. CPU RRT is allowed only in explicit
+  Bullet mode or when `allow_bullet_fallback` is true. Planning and rollout
+  consume the same accepted joint path.
+  For an `open_then_close` stage, the no-IK visual review selects only the
+  wrist-angle class. EEF IK alone is not grasp evidence. The application owns
+  depth search; dense placement requires both finger links within the target
+  gap and rollout requires sustained opposed bilateral target contact with
+  settled finger motion. The ideal attachment is created only after that gate.
 - On the declared target contact link, collision allowance applies only to the
   declared `allowed_robot_contact_links`. Every other robot link plus the fixed
   support remains a non-target collision and is checked over the same dense
@@ -130,11 +135,15 @@ no trajectory, initialize every URDF joint at its default zero state.
   the default link-normal retreat, and is serialized as the same dense joint
   path used by planning and rollout. The full robot,
   fixed base, and support satisfy `minimum_release_swept_clearance_m` throughout
-  retreat, endpoint settle, and every sampled later mechanism/return state.
+  retreat, endpoint settle, and every sampled mechanism/return state before
+  the next robot-contact acquisition. Later manipulation is checked by its own
+  block, and cross-contact motion is checked only as transit.
 - Every `open_then_close` stage uses one disclosed ideal fixed constraint after
-  physical acquisition and removes it only at the explicit release boundary.
-  The acquisition tick must contain simultaneous target contact from every
-  declared allowed robot contact link.
+  its mandatory runtime bilateral-contact dwell gate and removes it only at the
+  explicit release boundary. Both application-owned finger links must contact
+  the nominated object link from opposed sides while finger velocities are
+  settled and closure has progressed. A failed gate stops before manipulation;
+  the hidden negative control replays the same robot-command prefix.
   The output states that it tests contact-pose/IK trajectory feasibility, not
   frictional force closure. `maintain_width` physical pushes create no fixed
   constraint.
@@ -165,21 +174,33 @@ Before placement is frozen, retain four separate full-resolution view files for
 every wrist roll generated by
 `applications/artimo_robot_contact/render_artimo_grasp_orientation_candidates.py`; comparison sheets and
 tiled multi-view cards are forbidden. Every candidate keeps the same contact
-point, surface normal, and grasp depth. Record a `valid`/`invalid` visual decision
-and reason for every candidate. Apply those decisions through
+point and surface normal. Record `angle_status` first and independently record
+`contact_offset_status` for the rendered contact translation, grasp depth, tool
+offset, finger opening, and visible gap. An angle-valid candidate whose offset
+is shallow, deep, off-target, or occluded requires execution-data repair and a
+fresh complete five-roll render; it may not be hidden as an invalid angle.
+Record a final `valid`/`invalid` decision and reason for every candidate only
+after the retained angle's offset passes. Apply those decisions through
 `applications/artimo_robot_contact/apply_artimo_grasp_orientation_decisions.py`. The render pass uses only a
 kinematic-free parallel-jaw proxy and must prove that it ran no IK. Visual-
 invalid rolls are removed before placement and never enter an IK call,
 trajectory, transit, or rollout. Give every visual-valid roll a unique
 contiguous visual priority starting at 1. The decision gate itself runs no IK.
-Placement retains every visual-valid roll for joint whole-task search. It
+Placement treats that reviewed nominal contact geometry as frozen and retains
+every visual-valid roll for joint whole-task search. It
 combines one candidate per independent manipulation block with each bounded base,
 projects the authoritative future object state before every block, and ranks the
 result by its worst block. Visual priority is only a deterministic tie-break
 after geometric feasibility; it may not commit the first block before later
-blocks are checked. A sparse
-template-base orientation IK pass is not acceptance evidence. `open_then_close` candidates
-also require bilateral contact, while `maintain_width` physical pushes prove
+blocks are checked. The placement coverage pass is the complete bounded sparse
+Cartesian product of declared forward distances, lateral offsets, and every
+visual-valid orientation. It must evaluate every cell and every manipulation
+stage before dense Top-K selection. Sparse GPU collision uses the actual object
+collision meshes at each sampled state, not whole-link AABBs; dense Top-K and
+the final rollout provide exact target-contact confirmation. A sparse
+template-base orientation IK pass is not acceptance evidence. `open_then_close`
+candidates require opposed contact in the visual offset gate and numerical
+confirmation on the dense shortlist/final rollout, while `maintain_width` physical pushes prove
 actual contact/dwell in rollout. One decision covers every consecutive
 stage in the same `contact_sequence`: all members receive the same rotation,
 only the acquisition stage is probed, and full placement validates the inherited

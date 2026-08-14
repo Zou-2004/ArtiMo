@@ -22,10 +22,15 @@ from pathlib import Path
 
 import numpy as np
 
+import run_artimo_physics as ph
+
 APP_ROOT = Path(__file__).resolve().parent
 REPO = APP_ROOT.parents[1]
 SCENE_RENDERER = APP_ROOT / "visualize_artimo_scene.py"
-DEFAULT_ROLL_DEGREES = (-180.0, -135.0, -90.0, -45.0, 0.0, 45.0, 90.0, 135.0)
+# A parallel-jaw gripper is geometrically invariant under a 180-degree roll:
+# the two fingers merely exchange names. These four rolls cover the unique
+# 45-degree families without sending duplicate contact geometry to planning.
+DEFAULT_ROLL_DEGREES = ph.DEFAULT_CONTACT_ROLL_DEGREES
 
 
 def _normalized_quaternion(values: list[float]) -> np.ndarray:
@@ -96,6 +101,8 @@ def covered_stage_indices(execution: dict, stage_index: int) -> list[int]:
         "interaction",
         "contact_link",
         "contact_pose_link",
+        "contact_roll_deg",
+        "contact_frame_source",
         "allowed_robot_contact_links",
         "finger_opening_m",
         "grasp_depth_m",
@@ -222,7 +229,10 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    execution = json.loads(args.execution.read_text(encoding="utf-8"))
+    task = ph._read_json(args.task_spec.expanduser().resolve())
+    execution = ph.materialize_execution_defaults(
+        task, json.loads(args.execution.read_text(encoding="utf-8"))
+    )
     if not 0 <= args.stage < len(execution.get("stages", [])):
         raise IndexError(
             f"Stage index {args.stage} outside execution stages "
@@ -230,8 +240,23 @@ def main() -> int:
         )
     stage = execution["stages"][args.stage]
     covered_indices = covered_stage_indices(execution, int(args.stage))
-    base_quaternion = list(stage["contact_pose_link"]["rotation_xyzw"])
+    input_grasp_depth_m = float(stage.get("grasp_depth_m", 0.0))
+    if stage.get("interaction") == "explicit_ideal_feasibility":
+        for covered_index in covered_indices:
+            execution["stages"][covered_index]["grasp_depth_m"] = 0.0
+        stage = execution["stages"][args.stage]
+    # Always restart the immutable five-roll batch from the application-owned
+    # geometry frame.  The input quaternion (including one authored by a fresh
+    # agent or retained from a prior selected roll) cannot redefine roll zero.
+    base_quaternion, contact_frame = ph._canonical_contact_rotation_xyzw(
+        task, stage, 0.0
+    )
     rolls = [float(value) for value in args.roll_deg]
+    if tuple(rolls) != DEFAULT_ROLL_DEGREES:
+        raise ValueError(
+            "The immutable grasp-orientation batch is exactly the five robot-IK "
+            "rolls 0/45/90/135/180 degrees"
+        )
     if len({_roll_id(value) for value in rolls}) != len(rolls):
         raise ValueError("--roll-deg contains duplicate candidate angles")
     if args.jobs < 1:
@@ -250,6 +275,12 @@ def main() -> int:
             base_quaternion, roll_degrees
         )
         for covered_index in covered_indices:
+            candidate_execution["stages"][covered_index]["contact_roll_deg"] = float(
+                roll_degrees
+            )
+            candidate_execution["stages"][covered_index]["contact_frame_source"] = (
+                contact_frame["source"]
+            )
             candidate_execution["stages"][covered_index]["contact_pose_link"][
                 "rotation_xyzw"
             ] = candidate_quaternion
@@ -332,15 +363,43 @@ def main() -> int:
         "contact_link": str(stage["contact_link"]),
         "contact_translation_m": list(stage["contact_pose_link"]["translation_m"]),
         "base_contact_rotation_xyzw": base_quaternion,
+        "base_contact_frame": contact_frame,
+        "base_contact_rotation_policy": (
+            "application_collision_surface_normal_and_principal_tangent; "
+            "input quaternion ignored"
+        ),
         "execution_template_sha256": _sha256(args.execution.expanduser().resolve()),
         "roll_axis": "contact_local_+Z_surface_normal",
         "maximum_target_gap_m": float(args.maximum_target_gap_m),
+        "contact_offset_under_review": {
+            "contact_translation_m": list(stage["contact_pose_link"]["translation_m"]),
+            "grasp_depth_m": float(stage.get("grasp_depth_m", 0.0)),
+            "robot_tool_contact_offset_eef_m": stage.get(
+                "robot_tool_contact_offset_eef_m"
+            ),
+            "finger_opening_m": float(stage["finger_opening_m"]),
+        },
+        "grasp_depth_rerender": {
+            "input_grasp_depth_m": input_grasp_depth_m,
+            "rendered_grasp_depth_m": float(stage.get("grasp_depth_m", 0.0)),
+            "effective_robot_contact_offset_m": ph._effective_grasp_depth(stage),
+            "centered_grasp_zero_baseline_m": ph.PANDA_CENTERED_GRASP_BASELINE_M,
+            "zero_value_is_special_case": False,
+            "selection_basis": "application_rule_based_dense_search_after_angle_gate",
+            "agent_supplied_depth_ignored": bool(
+                stage.get("interaction") == "explicit_ideal_feasibility"
+            ),
+        },
         "visual_render_ik_was_run": False,
         "rendering_policy": "separate_candidate_and_view_files_no_composite",
         "selection": None,
         "selection_policy": (
             "Agent must open all four separate images for every candidate and mark "
-            "every roll visual-valid or visual-invalid before any IK. Assign every "
+            "every roll visual-valid or visual-invalid before any IK. The images place "
+            "the gripper at the centered robot baseline. The agent classifies only "
+            "whether the wrist angle can place the jaws on opposed sides of the target; "
+            "it must not edit or judge grasp depth. Placement later searches depth with "
+            "exact bilateral target-gap and forbidden-collision rules. Assign every "
             "visual-valid roll a unique contiguous visual_priority starting at 1, "
             "with the single best visual choice ranked first. A visual-invalid roll "
             "is a hard exclusion and cannot enter placement, trajectory, transit, "
@@ -357,7 +416,7 @@ def main() -> int:
         json.dumps(report, indent=2) + "\n", encoding="utf-8"
     )
     decision_template = {
-        "schema_version": 2,
+        "schema_version": 4,
         "report_sha256": _sha256(output / "report.json"),
         "stage_id": str(stage["id"]),
         "decisions": [
@@ -365,6 +424,7 @@ def main() -> int:
                 "id": candidate["id"],
                 "visual_status": None,
                 "visual_priority": None,
+                "angle_status": None,
                 "reason": "",
                 "reviewed_images": list(candidate["orientation_images"].values()),
             }

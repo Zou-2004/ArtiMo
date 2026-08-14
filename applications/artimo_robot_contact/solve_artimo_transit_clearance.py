@@ -17,6 +17,7 @@ from typing import Any, Iterable
 import numpy as np
 
 import run_artimo_physics as ph
+from artimo_curobo import create_curobo_backend
 
 
 POSITION_LIMIT_M = 0.004
@@ -189,6 +190,7 @@ def _evaluate_candidate(
     object_plan: dict[str, Any],
     transit_start: list[float],
     transit_end: list[float],
+    ik_path_solver: Any | None = None,
 ) -> dict[str, Any]:
     candidate_execution = copy.deepcopy(grounded)
     candidate_execution["stages"][stage_index]["transit_waypoints_world"] = copy.deepcopy(
@@ -208,6 +210,7 @@ def _evaluate_candidate(
             initial,
             validate_release_clearance=False,
             object_plan=object_plan,
+            ik_path_solver=ik_path_solver,
         )
     except Exception as exc:
         return {
@@ -264,7 +267,9 @@ def solve(
     if jobs < 1:
         raise ValueError("jobs must be positive")
     config = _normalize_config(config)
-    execution = ph._read_json(ph._resolve(config["execution_template_path"]))
+    execution = ph.materialize_execution_defaults(
+        task, ph._read_json(ph._resolve(config["execution_template_path"]))
+    )
     ph._validate_execution_schema(execution)
     matches = [
         index
@@ -290,34 +295,40 @@ def solve(
     grounded = ph._ground_execution_scene(
         simulation_urdf, robot_urdf, copy.deepcopy(execution), initial
     )["execution"]
-    if jobs == 1 or len(config["candidates"]) == 1:
-        attempts = [
-            _evaluate_candidate(
-                candidate,
-                grounded,
-                stage_index,
-                simulation_urdf,
-                robot_urdf,
-                initial,
-                object_plan,
-                config["transit_endpoints_world_m"]["start"],
-                config["transit_endpoints_world_m"]["end"],
-            )
-            for candidate in config["candidates"]
-        ]
-    else:
+    ik_path_solver = create_curobo_backend(execution, robot_urdf, execution["robot"])
+    try:
+        if ik_path_solver is not None or jobs == 1 or len(config["candidates"]) == 1:
+            # One persistent GPU worker reuses its CUDA graphs and collision
+            # allocations. Spawning jobs separate workers would multiply VRAM
+            # and lose the warm-cache latency advantage.
+            attempts = [
+                _evaluate_candidate(
+                    candidate,
+                    grounded,
+                    stage_index,
+                    simulation_urdf,
+                    robot_urdf,
+                    initial,
+                    object_plan,
+                    config["transit_endpoints_world_m"]["start"],
+                    config["transit_endpoints_world_m"]["end"],
+                    ik_path_solver,
+                )
+                for candidate in config["candidates"]
+            ]
+        else:
         # Each immutable candidate owns a separate PyBullet DIRECT client.
         # Ordinary child interpreters avoid both the GIL and restricted
         # process-pool semaphore APIs. Each request is immutable and futures
         # are consumed in config order, so output remains deterministic.
-        with tempfile.TemporaryDirectory(prefix="artimo-transit-candidates-") as raw_temp:
-            temporary = Path(raw_temp)
-            requests = []
-            responses = []
-            for candidate_index, candidate in enumerate(config["candidates"]):
-                request_path = temporary / f"request-{candidate_index:03d}.json"
-                response_path = temporary / f"response-{candidate_index:03d}.json"
-                request_path.write_text(
+            with tempfile.TemporaryDirectory(prefix="artimo-transit-candidates-") as raw_temp:
+                temporary = Path(raw_temp)
+                requests = []
+                responses = []
+                for candidate_index, candidate in enumerate(config["candidates"]):
+                    request_path = temporary / f"request-{candidate_index:03d}.json"
+                    response_path = temporary / f"response-{candidate_index:03d}.json"
+                    request_path.write_text(
                     json.dumps(
                         {
                             "candidate": candidate,
@@ -335,21 +346,24 @@ def solve(
                     + "\n",
                     encoding="utf-8",
                 )
-                requests.append(request_path)
-                responses.append(response_path)
-            with concurrent.futures.ThreadPoolExecutor(
-                max_workers=min(jobs, len(requests))
-            ) as executor:
-                futures = [
-                    executor.submit(_run_candidate_worker, request, response)
-                    for request, response in zip(requests, responses)
+                    requests.append(request_path)
+                    responses.append(response_path)
+                with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=min(jobs, len(requests))
+                ) as executor:
+                    futures = [
+                        executor.submit(_run_candidate_worker, request, response)
+                        for request, response in zip(requests, responses)
+                    ]
+                    for future in futures:
+                        future.result()
+                attempts = [
+                    json.loads(response.read_text(encoding="utf-8"))
+                    for response in responses
                 ]
-                for future in futures:
-                    future.result()
-            attempts = [
-                json.loads(response.read_text(encoding="utf-8"))
-                for response in responses
-            ]
+    finally:
+        if ik_path_solver is not None:
+            ik_path_solver.close()
     feasible_attempts = [attempt for attempt in attempts if attempt["feasible"]]
     chosen = min(feasible_attempts, key=_rank_key) if feasible_attempts else None
     return {

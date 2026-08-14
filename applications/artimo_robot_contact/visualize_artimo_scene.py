@@ -289,7 +289,9 @@ def main() -> int:
     args = ap.parse_args()
 
     task = json.loads(args.task_spec.read_text())
-    ex = json.loads(args.execution.read_text())
+    ex = ph.materialize_execution_defaults(
+        task, json.loads(args.execution.read_text())
+    )
     inp = task["inputs"]
     source_urdf = ph._resolve(inp["urdf"])
     sim_urdf = ph.resolve_simulation_urdf(task, ex, source_urdf)
@@ -363,7 +365,7 @@ def main() -> int:
         ob,
         ol[stage["contact_link"]],
         stage["contact_pose_link"],
-        float(stage.get("grasp_depth_m", 0.0)),
+        ph._effective_grasp_depth(stage),
         client,
         stage.get("robot_tool_contact_offset_eef_m"),
     )
@@ -569,7 +571,7 @@ def main() -> int:
         surface_wp, wq = ph._target_pose(
             ob, ol[stage["contact_link"]], stage["contact_pose_link"], 0.0, client
         )
-        grasp_depth = float(stage.get("grasp_depth_m", 0.0))
+        grasp_depth = ph._effective_grasp_depth(stage)
         wp, wq = ph._target_pose(
             ob,
             ol[stage["contact_link"]],
@@ -584,30 +586,32 @@ def main() -> int:
         set_robot_arm(rb, arm, np.asarray(ans["q"], dtype=np.float64), client)
         p.performCollisionDetection(physicsClientId=client)
         touching = {}
-        for pt in p.getClosestPoints(rb, ob, 0.0, physicsClientId=client):
+        for pt in ph.object_closest_points(rb, ob, 0.0, client):
             key = (inv_r.get(pt[3], pt[3]), inv_o.get(pt[4], pt[4]))
             touching[key] = min(touching.get(key, 0.0), float(pt[8]))
         if robot_support is not None:
-            for pt in p.getClosestPoints(robot_support, ob, 0.0, physicsClientId=client):
+            for pt in ph.object_closest_points(
+                robot_support, ob, 0.0, client
+            ):
                 key = ("robot_support", inv_o.get(pt[4], pt[4]))
                 touching[key] = min(touching.get(key, 0.0), float(pt[8]))
         target_gaps = {}
         for robot_link_name in stage["allowed_robot_contact_links"]:
-            near = p.getClosestPoints(
+            near = ph.object_closest_points(
                 rb,
                 ob,
                 0.10,
-                linkIndexA=rl[robot_link_name],
-                linkIndexB=ol[stage["contact_link"]],
-                physicsClientId=client,
+                client,
+                link_index_a=rl[robot_link_name],
+                link_index_b=ol[stage["contact_link"]],
             )
             target_gaps[robot_link_name] = (
                 min(float(point[8]) for point in near) if near else 0.10
             )
         target_contacting_robot_links = {
             inv_r.get(int(point[3]), str(point[3]))
-            for point in p.getContactPoints(
-                rb, ob, physicsClientId=client
+            for point in ph.object_contact_points(
+                rb, ob, client
             )
             if int(point[4]) == ol[stage["contact_link"]]
             and int(point[3]) in {
@@ -632,24 +636,24 @@ def main() -> int:
         forbidden_clearances = {}
         required_clearance = float(stage.get("minimum_swept_clearance_m", 0.0))
         for object_link_name in stage.get("forbidden_contact_links", []):
-            for point in p.getClosestPoints(
+            for point in ph.object_closest_points(
                 rb,
                 ob,
                 max(required_clearance, 0.10),
-                linkIndexB=ol[object_link_name],
-                physicsClientId=client,
+                client,
+                link_index_b=ol[object_link_name],
             ):
                 key = f"{inv_r.get(int(point[3]), point[3])}|{object_link_name}"
                 forbidden_clearances[key] = min(
                     forbidden_clearances.get(key, float("inf")), float(point[8])
                 )
             if robot_support is not None:
-                for point in p.getClosestPoints(
+                for point in ph.object_closest_points(
                     robot_support,
                     ob,
                     max(required_clearance, 0.10),
-                    linkIndexB=ol[object_link_name],
-                    physicsClientId=client,
+                    client,
+                    link_index_b=ol[object_link_name],
                 ):
                     key = f"robot_support|{object_link_name}"
                     forbidden_clearances[key] = min(
@@ -765,7 +769,7 @@ def main() -> int:
             ob,
             ol[stage["contact_link"]],
             stage["contact_pose_link"],
-            float(stage.get("grasp_depth_m", 0.0)),
+            ph._effective_grasp_depth(stage),
             client,
             stage.get("robot_tool_contact_offset_eef_m"),
         )

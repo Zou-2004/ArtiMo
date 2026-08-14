@@ -200,7 +200,8 @@ def _free_space_map(body, client, height, links, span=0.6, steps=13, probe_radiu
 def survey(task_spec: Path, out: Path, driver_links: dict[str, str], samples: int) -> dict[str, Any]:
     task = ph._read_json(task_spec)
     inputs = task["inputs"]
-    simulation_urdf = ph._resolve(inputs.get("physics_urdf") or inputs["urdf"])
+    source_urdf = ph._resolve(inputs["urdf"])
+    simulation_urdf = ph.resolve_simulation_urdf(task, {}, source_urdf)
     plan = artimo_plan.read_plan(ph._resolve(inputs["plan"]))
     initial = ph.task_initial_joint_values(task)
     requested = artimo_plan.requested_extrema(plan)

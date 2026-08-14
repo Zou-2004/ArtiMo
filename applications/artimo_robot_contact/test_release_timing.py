@@ -48,6 +48,7 @@ def _execution(release_before_phase: str) -> dict:
                 "source_phase": "contact",
                 "source_control_index": 0,
                 "driver_joint": "driver",
+                "interaction": "explicit_ideal_feasibility",
                 "release_before_phase": release_before_phase,
                 "finger_opening_m": 0.02,
                 "hold_s": 0.0,
@@ -112,6 +113,93 @@ def _stage_plan(execution: dict) -> physics.StagePlan:
 
 
 class ReleaseTimingTest(unittest.TestCase):
+    def test_terminal_plan_hold_omits_release_retreat_and_home(self) -> None:
+        object_plan = {
+            "timeline": [
+                {
+                    "name": "contact",
+                    "controls": [
+                        {
+                            "joint": "driver",
+                            "mode": "joint_position",
+                            "q_target_rad": 1.0,
+                        }
+                    ],
+                },
+                {
+                    "name": "terminal_hold",
+                    "controls": [
+                        {"joint": "driver", "mode": "hold_position"}
+                    ],
+                },
+            ]
+        }
+        execution = _execution("mechanism_motion")
+        stage = execution["stages"][0]
+        stage.pop("release_before_phase")
+        execution["control_execution"] = [
+            {
+                "source_phase": "contact",
+                "source_control_index": 0,
+                "motion_owner": "robot_contact",
+                "stage_id": "contact-stage",
+            },
+            {
+                "source_phase": "terminal_hold",
+                "source_control_index": 0,
+                "motion_owner": "hold",
+            },
+        ]
+        execution["causal_rules"] = []
+        self.assertEqual(
+            physics._terminal_plan_hold_phase_index(
+                object_plan, execution, stage
+            ),
+            1,
+        )
+        commands = physics._schedule(
+            [_stage_plan(execution)], execution, object_plan
+        )
+        phases = {command["phase"] for command in commands}
+        self.assertNotIn("contact_release", phases)
+        self.assertNotIn("retreat", phases)
+        phase_sequence = [command["phase"] for command in commands]
+        self.assertLess(
+            max(
+                index
+                for index, phase in enumerate(phase_sequence)
+                if phase == "transit"
+            ),
+            phase_sequence.index("manipulate"),
+        )
+        self.assertEqual(commands[-1]["finger"], stage["finger_opening_m"])
+
+    def test_grasp_is_closed_and_settled_before_attach_and_manipulate(self) -> None:
+        execution = _execution("mechanism_motion")
+        acquisition = execution["stages"][0]["contact_acquisition"]
+        acquisition.update(
+            {
+                "mode": "open_then_close",
+                "approach_finger_opening_m": 0.04,
+                "close_s": 0.05,
+                "settle_s": 0.05,
+                "release_s": 0.05,
+            }
+        )
+        commands = physics._schedule([_stage_plan(execution)], execution, _plan())
+        phases = [command["phase"] for command in commands]
+        last_close = max(i for i, phase in enumerate(phases) if phase == "contact_acquire")
+        last_unattached_settle = max(
+            i for i, phase in enumerate(phases) if phase == "contact_settle"
+        )
+        attach = phases.index("contact_attach")
+        first_stabilize = phases.index("grasp_stabilize")
+        first_manipulate = phases.index("manipulate")
+        self.assertLess(last_close, last_unattached_settle)
+        self.assertLess(last_unattached_settle, attach)
+        self.assertLess(attach, first_stabilize)
+        self.assertLess(first_stabilize, first_manipulate)
+
     def test_planning_can_defer_release_route_but_physics_cannot(self) -> None:
         stages = _execution("mechanism_motion")["stages"]
         with self.assertRaisesRegex(ValueError, "release_retreat_waypoints_world"):
