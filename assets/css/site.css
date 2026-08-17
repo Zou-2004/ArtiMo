@@ -387,6 +387,36 @@ a.author:hover {
   scrollbar-color: var(--accent) rgba(0, 0, 0, 0.08);
 }
 
+.rollout-grid {
+  gap: 0;
+  scroll-padding-inline: 24px;
+  touch-action: pan-x;
+}
+
+.rollout-card {
+  flex: 0 0 100%;
+  scroll-snap-align: center;
+}
+
+.rollout-video-block {
+  padding: clamp(12px, 2vw, 24px);
+  background: var(--video-bg);
+}
+
+.rollout-video {
+  aspect-ratio: 16 / 9;
+  max-height: min(720px, 62vw);
+  object-fit: contain;
+  background: #000;
+}
+
+.gallery-swipe-hint {
+  margin: 14px 0 0;
+  color: var(--muted);
+  font-size: 14px;
+  text-align: center;
+}
+
 .model-grid {
   display: flex;
   gap: 22px;

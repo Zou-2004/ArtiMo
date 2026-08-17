@@ -89,6 +89,11 @@ def apply_decisions(
     if not isinstance(rows, list):
         raise ValueError("Visual decisions decisions[] is required")
     interaction = str(report.get("interaction", "explicit_ideal_feasibility"))
+    contact_advisory_present = bool(
+        report.get("contact_offset_under_review", {}).get(
+            "candidate_specific_contact_advisory", False
+        )
+    )
     by_id = {str(item.get("id")): item for item in candidates}
     decision_by_id: dict[str, dict[str, Any]] = {}
     for row in rows:
@@ -109,9 +114,17 @@ def apply_decisions(
             raise ValueError(f"{candidate_id}.reason must explain the visual decision")
         priority = row.get("visual_priority")
         angle_status = row.get("angle_status")
+        contact_point_status = row.get("contact_point_status")
         if angle_status not in {"valid", "invalid"}:
             raise ValueError(
                 f"{candidate_id}.angle_status must be 'valid' or 'invalid'"
+            )
+        if contact_advisory_present and contact_point_status not in {
+            "valid",
+            "adjust",
+        }:
+            raise ValueError(
+                f"{candidate_id}.contact_point_status must be 'valid' or 'adjust'"
             )
         if status == "valid":
             if angle_status != "valid":
@@ -122,6 +135,11 @@ def apply_decisions(
                 raise ValueError(
                     f"{candidate_id}.visual_priority must be a positive integer "
                     "for every visual-valid roll"
+                )
+            if contact_advisory_present and contact_point_status != "valid":
+                raise ValueError(
+                    f"{candidate_id} cannot be visual-valid while the agent says "
+                    "the contact point needs adjustment"
                 )
         else:
             if priority is not None:
@@ -242,7 +260,18 @@ def apply_decisions(
         "selected_angle_status": str(
             decision_by_id[str(chosen["id"])]["angle_status"]
         ),
-        "contact_offset_under_review": report["contact_offset_under_review"],
+        "contact_offset_under_review": {
+            **report["contact_offset_under_review"],
+            "selected_contact_translation_m": list(
+                report.get("contact_translation_m", [0.0, 0.0, 0.0])
+            ),
+            "selected_contact_point_advisory": chosen.get(
+                "contact_point_advisory"
+            ),
+            "selected_contact_point_status": decision_by_id[str(chosen["id"])].get(
+                "contact_point_status"
+            ),
+        },
         "maximum_target_gap_m": float(report["maximum_target_gap_m"]),
         "contact_sequence": report.get("contact_sequence"),
         "covered_stage_ids": list(covered_stage_ids),

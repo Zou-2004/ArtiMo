@@ -24,9 +24,9 @@ phases, suppress video export, or make the runner return a failure status.
 3. robot stages versus justified internal mechanisms, including uninterrupted
    `contact_sequence` boundaries;
 4. declared control contact point, normal/wrist orientation, and approach;
-5. link-centered robot stance, fixed facing direction, and centerline distance;
-6. continuous waypoint IK and swept-path clearance, then bounded lateral stance
-   refinement only if the centered distances fail;
+5. whole-task contact-keyframe reference and its initial bounded base stance;
+6. center-out placement cell, continuous waypoint IK, dense path result, and
+   swept-path clearance;
 7. release retreat and the full passive-return swept-volume clearance;
 8. target contact pair, direction, travel, and dwell for every
    robot-owned stage;
@@ -37,29 +37,31 @@ phases, suppress video export, or make the runner return a failure status.
 ## 3. Bounded repairs
 
 Change one execution-data class at a time in this order: contact point, contact
-orientation, precontact offset, link-centered base distance, bounded lateral
-base offset, intermediate waypoint, then camera. Arm controller
+orientation, precontact offset, center-out base search, intermediate
+waypoint, then camera. Arm controller
 gain/force and grasp physics are fixed by the harness and are never repair
 variables. Keep object orientation and facing construction fixed while
 tuning distance/lateral reach unless the declared contact surface itself was
 wrong. Keep search bounds and rejected candidates in debug evidence.
 
-Use one consolidated candidate batch per variable class. The visual pass freezes
-only the hard-valid contact set; it does not choose one grasp before placement.
-Merge uninterrupted contacts into manipulation blocks, project every future
-plan state, and jointly score base plus one visual-valid contact candidate per
-block by the worst block. Select a centerline row only after this whole-task
-batch, and permit one lateral batch only when all centered rows fail. When they
-all fail, freeze the single closest-to-feasible whole-task centerline row and
-test the declared symmetric lateral offsets only at that distance; never
-multiply every failed distance by the lateral batch. Do not repeatedly invoke the planner for individual candidates,
+The visual pass freezes only the hard-valid contact set; it does not choose one
+grasp before placement. Merge uninterrupted contacts into manipulation blocks,
+project every future plan state, and build the base initializer from world
+centers of every unique plan-driven moving child link sampled across every
+block. Average samples within each moving link first, then weight all moving
+links equally so the first or most frequently sampled link cannot dominate.
+Order the complete declared
+contact-facing grid from that whole-task center outward and evaluate consecutive
+bounded batches on GPU. Do not move the center, reorder later cells from failure
+scores, or add failure-derived directions. Evaluate every visual-valid roll in
+the same declared order. Do not repeatedly invoke the planner for individual candidates,
 replay the complete object motion merely to score a wrist roll, or cycle back to
 a frozen class after trying later classes. If the bounded batches cannot produce
 a valid path, record the exact failed clearance/IK gate as a generic gap.
 
 Elapsed time is never a repair variable or a stopping rule. Do not shrink a
-batch, keep only a candidate that happened to finish first, skip lateral
-refinement, or convert a failed diagnostic row into rollout data because a
+batch, keep only a candidate that happened to finish first, skip a declared grid
+cell, or convert a failed diagnostic row into rollout data because a
 command is slow or an interactive tool window ends. Keep the same inputs and
 wait, poll, resume, or rerun the byte-identical numerical command. A placement
 result without an emitted `execution.json` cannot enter release planning or a
@@ -69,28 +71,31 @@ Never author or infer the common contact frame from a quaternion tuple. The
 application derives it from the collision-surface normal and principal tangent;
 an input quaternion is ignored. Never infer the remaining wrist-roll choice
 from a quaternion tuple, comparison sheet, tiled card,
-or one occluded full-scene render. After fixing the point and grasp depth, run
+or one occluded full-scene render. After choosing the semantic point, run
 `applications/artimo_robot_contact/render_artimo_grasp_orientation_candidates.py` once for the complete
 roll batch. Open all four separate files for every candidate. Use the isolated
 surface-normal and tangent views with cyan/magenta opposing contact links to
 verify that the jaws straddle the intended feature; do not accept a roll merely
 because finger shafts appear parallel to a handle or rim. Mark every candidate
 angle-valid or angle-invalid first. For every angle-valid row, independently
-judge the declared contact offset. A shallow, deep, off-target, or occluded
-offset must be repaired in execution data and the complete five-roll batch must
-be rerendered; never discard a correct angle to hide an incorrect offset. Only
+record `contact_point_status=valid/adjust`. A high, low, or off-target point, or
+the absence of any isolated view that clearly proves the feature lies between
+opposed pads, must be repaired in execution data and the complete five-roll
+batch must be rerendered. An occluded view alone does not veto another clear
+proving view. Never discard a correct angle to hide an incorrect offset. Only
 then mark every candidate visual-valid or visual-invalid with a reason and apply the manifest through
 `applications/artimo_robot_contact/apply_artimo_grasp_orientation_decisions.py`. Visual-invalid candidates
 are not low-ranked candidates: the visual pass runs no IK, and invalid rolls are
 absent before placement. IK and whole-arm clearance may reject only the
 visual-valid set. Sparse and dense base search do not repeat finger-gap queries
 for contact geometry already frozen by the visual offset gate, and rollout uses
-the disclosed ideal grasp after closure rather than rechecking the depth. Rank that set first by visual semantics
+the disclosed verified contact gate after closure rather than rechecking the depth. Rank that set first by visual semantics
 with unique contiguous priorities, but use priority only as a deterministic
 tie-break after joint whole-task geometry. Preserve all valid candidates for the
 base-and-block contact combination search. Do not use a default/template
-Panda base plus five sparse driver samples as a preliminary gate. Require
-two-sided target contact for an `open_then_close` grasp; do not require it for a
+Panda base plus five sparse driver samples as a preliminary gate. Require a
+visually plausible two-sided jaw relationship for an `open_then_close` grasp;
+exact target contact is confirmed only by dense validation and rollout. Do not require it for a
 `maintain_width` physical push, whose actual contact/dwell is measured
 during rollout. For one uninterrupted `contact_sequence`, render and probe only
 the first acquisition stage, apply its roll to every member, and validate the
@@ -100,8 +105,12 @@ candidate has both the required visual relationship and
 valid measurements, report the bounded orientation gap instead of manually
 inventing another pose.
 
-If a visually correct roll still places the feature at the fingertips or leaves
-the grasp looking shallow, keep the angle decision and run placement's
+If a visually correct roll places the feature high, low, or outside the jaw
+span, keep the angle decision, mark the point `adjust`, repair only the
+task-local contact translation, and rerender all five rolls. Static proxy
+collision is advisory rather than a hard gate. If the semantic point is
+plausible but the grasp still looks shallow along the surface normal, keep the
+angle decision and run placement's
 application-owned depth search. Do not ask the agent to edit `grasp_depth_m`.
 For centered Panda `open_then_close`, value zero includes the robot-defined
 0.015 m inward useful-finger inset and equals an effective `-0.015 m`; the bounded
@@ -157,8 +166,10 @@ Read the diagnostics before choosing a repair:
 - If contact is a large, short impulse followed by a miss, inspect
   `contact_acquisition` before changing offset. A grasp target approached with
   `maintain_width` or with an already-closed aperture can strike the target end
-  face without ever acquiring it. Use `open_then_close` only when the open
-  aperture can surround the target; tune only close duration from measured
+  face without ever acquiring it. The generic `open_then_close` approach
+  aperture is the selected final aperture plus 5 mm total clearance; do not
+  replace it with a maximum-width opening that sweeps adjacent housing. Use
+  `open_then_close` only when that aperture can surround the target; tune only close duration from measured
   contact/dwell. Finger servo force is a harness constant. For a button or direct push, deliberately choose
   `maintain_width` instead of inserting a fictitious grasp.
 - If a button probe has valid IK but the centered closed gripper overlaps the
@@ -176,15 +187,22 @@ Read the diagnostics before choosing a repair:
   do not inspect one face axis and then expand adaptively. Freeze the
   least-offset feasible tool frame, rerender
   the final immutable visual batch, and only then form the placement gate.
-- If an `open_then_close` grasp loses the target before its explicit release,
-  report a shared ideal-constraint lifecycle regression. Do not tune friction,
-  finger force, arm force/gain, penetration, or motion gates. Timing repair with
-  `manipulation_sample_hold_s` applies only to unconstrained physical pushes.
+- If an `open_then_close` stage passes bilateral verification but its object
+  joint does not follow, inspect measured dense-sample robot-path progress,
+  progress residual, task-actuator target, object tracking error, and motor
+  ownership. Do not tune friction,
+  finger force, arm force/gain, penetration, or elapsed-time gates. Timing
+  repair with `manipulation_sample_hold_s` applies only to physical pushes.
 - If an object drifts during a same-joint `hold_position` immediately after a
   robot-contact phase, inspect the serialized command schedule. A release,
   retreat, or home transit before that hold is a shared scheduler regression;
   preserve the acquired grasp through the hold instead of adding friction,
   damping, a task-specific motor, or a longer pre-release dwell.
+- If an upstream driver refuses to move during a later stage of one
+  uninterrupted grasp, inspect controller ownership and confirm the current
+  task actuator is the final write before the physics step. The current object
+  target must follow measured progress along that stage's robot path; completed
+  drivers hold their achieved targets until explicit release.
 - `robot_base_outward_halfspace_m` must be positive and
   `panda_eef_to_contact_inward_alignment_cosine` must be near +1 in the scene
   report. A negative half-space value means the arm is reaching around the
@@ -254,9 +272,10 @@ Read the diagnostics before choosing a repair:
 - If any causally triggered moving link or released spring-return link hits or
   is blocked by the gripper, arm, base, or support, do not increase its force.
   Declare `release_before_phase` no later than the earliest dependent moving
-  phase, run
-  `applications/artimo_robot_contact/solve_artimo_release_clearance.py`, copy the chosen world-frame retreat
-  waypoint into `release_retreat_waypoints_world`, and copy its measured
+  phase. The placement solver runs
+  `applications/artimo_robot_contact/solve_artimo_release_clearance.py` as the
+  final per-candidate gate, copies the chosen world-frame retreat waypoint into
+  `release_retreat_waypoints_world`, and copies its measured
   `minimum_release_swept_clearance_m`. Any strictly positive whole-route
   separation passes; there is no fixed 20 mm or other hidden positive margin.
   Zero or penetration fails. The solver route must replace, not follow,
@@ -265,8 +284,9 @@ Read the diagnostics before choosing a repair:
   Verify that release, retreat, and the nonzero safe-endpoint settle finish
   before the internal effect or passive motor is enabled. A later control-return
   phase is not a valid boundary when another triggered link moves earlier.
-  Re-run this solver after fixing the robot
-  base: an old world-frame release waypoint must never reject a new placement.
+  Re-run placement after fixing the robot base: an old world-frame release
+  waypoint must never reject a new placement. If one dense candidate has no
+  release path, record that rejection and continue to the next candidate.
   If rollout collides with an internally moved link while the solver reports
   clearance, verify it projected every endpoint before `release_before_phase`
   and swept every applicable plan endpoint before the next robot-contact
@@ -279,7 +299,7 @@ Read the diagnostics before choosing a repair:
 - For a continued grasp, verify adjacent stages share `contact_sequence` and
   invariant contact data. The next stage's sample-zero arm command must equal
   the preceding stage's final command exactly; re-solving the unchanged pose
-  can produce a redundant-joint twitch even when fingers and attachment remain
+  can produce a redundant-joint twitch even when fingers and the verified gate remain
   closed. A transit, retreat, release/reacquire, or sample-zero IK call between
   same-link stages is a harness failure, not a task-specific waypoint problem.
 

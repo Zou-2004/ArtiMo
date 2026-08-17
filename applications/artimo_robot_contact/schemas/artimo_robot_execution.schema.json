@@ -131,11 +131,11 @@
           "release_before_phase": {
             "type": "string",
             "minLength": 1,
-            "description": "Optional explicit release boundary. It is required when this contact triggers later mechanism motion or precedes a passive return, and may not be later than the earliest such moving phase. The harness retains contact through preceding plan-owned holds, opens/removes any disclosed attachment, executes the solved retreat, holds briefly at the safe endpoint, and only then enters the named phase."
+            "description": "Optional explicit release boundary. It is required when this contact triggers later mechanism motion or precedes a passive return, and may not be later than the earliest such moving phase. The harness retains the verified contact gate through preceding plan-owned holds, opens the gripper and ends contact-gated actuation, executes the solved retreat, holds briefly at the safe endpoint, and only then enters the named phase."
           },
           "interaction": {
             "enum": ["physical_push", "explicit_ideal_feasibility"],
-            "description": "Invariant benchmark policy: physical_push for maintain_width controls; disclosed explicit_ideal_feasibility for open_then_close grasps. Frictional force-closure tuning is outside this benchmark."
+            "description": "Invariant benchmark policy: physical_push for maintain_width controls; explicit_ideal_feasibility is the legacy schema name for verified contact-gated object-joint actuation used by open_then_close grasps. After sustained bilateral contact, the plan-authoritative object-joint target follows the measured fractional dense-sample index along the current IK path through the identical smoothstep used during planning. The verified fingers and their nearest common rigid palm parent stop responding only to the target link to avoid a redundant solver loop; the remaining arm and every non-target object link stay collision-authoritative. No runtime grasp constraint is created. Frictional force-closure tuning is outside this benchmark."
           },
           "driver_joint": {"type": "string", "minLength": 1},
           "contact_link": {"type": "string", "minLength": 1},
@@ -202,7 +202,7 @@
               "approach_finger_opening_m": {
                 "type": "number",
                 "minimum": 0,
-                "description": "Finger joint position during transit and approach. For open_then_close it must exceed finger_opening_m; for maintain_width it must equal finger_opening_m."
+                "description": "Per-finger joint position during transit and approach. For open_then_close the generic application sets it from the selected final grasp width plus 0.005 m total jaw-aperture clearance (0.0025 m per finger); for maintain_width it equals finger_opening_m."
               },
               "close_s": {
                 "type": "number",

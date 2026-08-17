@@ -59,11 +59,30 @@ def _candidate_sort_key(
     )
 
 
-def solve(task_path: Path, execution_path: Path) -> dict[str, Any]:
-    task = ph._read_json(task_path)
-    execution = ph.materialize_execution_defaults(
-        task, ph._read_json(execution_path)
+def solve(
+    task_path: Path | dict[str, Any],
+    execution_path: Path | dict[str, Any],
+    *,
+    planned_stages: list[ph.StagePlan] | None = None,
+) -> dict[str, Any]:
+    """Solve release clearance from files or an in-memory dense candidate.
+
+    Placement already owns a fully planned dense trajectory.  Passing that
+    trajectory here avoids planning the same manipulation a second time merely
+    to recover its final arm command.  The path-based CLI remains unchanged for
+    standalone diagnostics and older callers.
+    """
+    task = (
+        task_path
+        if isinstance(task_path, dict)
+        else ph._read_json(task_path)
     )
+    execution_input = (
+        execution_path
+        if isinstance(execution_path, dict)
+        else ph._read_json(execution_path)
+    )
+    execution = ph.materialize_execution_defaults(task, execution_input)
     inputs = task["inputs"]
     source_urdf = ph._resolve(inputs["urdf"])
     robot_urdf = ph._resolve(inputs["robot_urdf"])
@@ -73,17 +92,19 @@ def solve(task_path: Path, execution_path: Path) -> dict[str, Any]:
     grounded = ph._ground_execution_scene(
         simulation_urdf, robot_urdf, execution, initial
     )["execution"]
-    plans = ph._plan_stages(
-        simulation_urdf,
-        robot_urdf,
-        grounded,
-        initial,
-        allow_partial_debug=True,
-        # Placement fixes the base first; this solver is responsible for
-        # replacing any stale world-frame release waypoint from an older base.
-        validate_release_clearance=False,
-        object_plan=plan,
-    )
+    plans = planned_stages
+    if plans is None:
+        plans = ph._plan_stages(
+            simulation_urdf,
+            robot_urdf,
+            grounded,
+            initial,
+            allow_partial_debug=True,
+            # Placement fixes the base first; this solver is responsible for
+            # replacing any stale world-frame release waypoint from an older base.
+            validate_release_clearance=False,
+            object_plan=plan,
+        )
     release_indices = [
         index
         for index, item in enumerate(plans)

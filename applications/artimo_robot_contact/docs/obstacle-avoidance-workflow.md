@@ -93,8 +93,8 @@ the direct inter-stage transit clear in the already moved scene.
 If the plan immediately follows the last robot-contact stage with
 `hold_position` on the same driver joint, preserve the acquired grasp and final
 arm pose through the hold and rendered settle frames. Do not release, retreat,
-or return home first. Simulator cleanup removes the disclosed ideal constraint
-only after evidence capture.
+or return home first. Simulator cleanup ends the disclosed verified contact gate
+only after evidence capture; no runtime grasp constraint exists.
 
 ## Bounded failure
 

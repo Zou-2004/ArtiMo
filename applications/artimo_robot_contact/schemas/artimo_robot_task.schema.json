@@ -48,7 +48,7 @@
       "properties": {
         "require_zero_fixed_constraints": {
           "const": false,
-          "description": "The invariant benchmark permits disclosed ideal fixed grasp constraints for open_then_close stages; maintain_width pushes still create none."
+          "description": "The invariant benchmark creates no runtime grasp constraints. Open_then_close stages use sustained bilateral contact to gate plan-authoritative object-joint actuation tied to measured robot-path progress."
         },
         "minimum_joint_motion_ratio": {
           "type": "number",

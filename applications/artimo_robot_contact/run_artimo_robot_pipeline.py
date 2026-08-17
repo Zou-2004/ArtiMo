@@ -101,10 +101,10 @@ def _task_spec(args: argparse.Namespace) -> dict[str, Any]:
             args.out or (REPO_ROOT / "outputs" / "robot_contact" / task_id)
         ),
         "acceptance": {
-            # Grasping stages use the benchmark's disclosed ideal attachment;
-            # pushing stages still create no constraint.  This is invariant
-            # across assets and is not selected by the task agent.
-            "require_zero_fixed_constraints": False,
+            # Verified contact gates plan-authoritative joint actuation without
+            # creating a runtime grasp constraint. This invariant applies to
+            # every asset and is not selected by the task agent.
+            "require_zero_fixed_constraints": True,
             "minimum_joint_motion_ratio": args.minimum_joint_motion_ratio,
             "minimum_continuous_contact_s": args.minimum_continuous_contact_s,
             "visual_review_fps": args.visual_review_fps,

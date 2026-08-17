@@ -50,8 +50,10 @@ no trajectory, initialize every URDF joint at its default zero state.
 - Execute the agent-declared contact acquisition exactly. `open_then_close`
   keeps the gripper open through transit/approach, closes while the arm holds
   the first contact pose, settles, manipulates, then opens before retreat.
+  Its approach aperture is the selected final grasp aperture plus 0.005 m total
+  clearance (0.0025 m per finger), rather than the robot's maximum aperture.
   `maintain_width` keeps one declared width throughout contact. Record the
-  invariant 200 N per-finger servo force in the serialized robot commands.
+  invariant 20 N per-finger servo force in the serialized robot commands.
   When a physical push selects one fingertip/tool surface, record its
   robot-EEF-frame surface vector as `robot_tool_contact_offset_eef_m`; the
   declared object contact point remains on the object surface. Planning and
@@ -65,7 +67,9 @@ no trajectory, initialize every URDF joint at its default zero state.
   grasptarget geometry to a tool offset invalidates prior visual decisions and
   requires a fresh full five-roll visual-only gate before placement.
 - Keep robot/object collision response enabled except nominated contact pairs
-  in the hidden negative control.
+  in the hidden negative control and, after a real bilateral gate passes, the
+  verified fingers plus their nearest common rigid palm parent against only the
+  nominated target link.
 - Record every robot/object contact pair, constraint, joint reset,
   joint state, robot command, and causal-state transition each simulation step.
 - For each causal rule, record first target contact, trigger-driver first
@@ -112,7 +116,14 @@ no trajectory, initialize every URDF joint at its default zero state.
   wrist-angle class. EEF IK alone is not grasp evidence. The application owns
   depth search; dense placement requires both finger links within the target
   gap and rollout requires sustained opposed bilateral target contact with
-  settled finger motion. The ideal attachment is created only after that gate.
+  settled finger motion. Only after that gate, the object-joint target may
+  follow the measured fractional dense-sample index along the current
+  serialized IK path and pass it through the identical smoothstep used to
+  generate the object targets during planning. This preserves exact
+  robot/object correspondence; joint-space arc length and linear joint
+  interpolation are not used as proxies. Elapsed time is never actuation
+  authority: if robot progress stalls or leaves the path tolerance, object
+  progress stalls as well. No runtime grasp constraint is created.
 - On the declared target contact link, collision allowance applies only to the
   declared `allowed_robot_contact_links`. Every other robot link plus the fixed
   support remains a non-target collision and is checked over the same dense
@@ -138,20 +149,29 @@ no trajectory, initialize every URDF joint at its default zero state.
   retreat, endpoint settle, and every sampled mechanism/return state before
   the next robot-contact acquisition. Later manipulation is checked by its own
   block, and cross-contact motion is checked only as transit.
-- Every `open_then_close` stage uses one disclosed ideal fixed constraint after
-  its mandatory runtime bilateral-contact dwell gate and removes it only at the
-  explicit release boundary. Both application-owned finger links must contact
-  the nominated object link from opposed sides while finger velocities are
-  settled and closure has progressed. A failed gate stops before manipulation;
-  the hidden negative control replays the same robot-command prefix.
-  The output states that it tests contact-pose/IK trajectory feasibility, not
-  frictional force closure. `maintain_width` physical pushes create no fixed
-  constraint.
+- Every `open_then_close` stage uses one disclosed contact-gated object-joint
+  actuator after its mandatory runtime bilateral-contact dwell gate. Both
+  application-owned finger links must contact the nominated object link from
+  opposed sides while finger velocities are settled and closure has
+  progressed. Once verified, the two fingers and their nearest common rigid
+  palm parent stop responding only to the nominated target link so they cannot
+  form a redundant solver loop with the task actuator; the remaining arm and
+  every non-target object link stay collision-authoritative. The actuator target
+  interpolates the authoritative ArtiMo joint endpoint by monotonic measured
+  robot dense-sample progress along the current IK path. Require the measured
+  object-joint tracking error to remain within the harness tolerance. A failed gate never enables object
+  actuation, and the hidden negative control replays the identical robot
+  commands with no gate transition. No runtime grasp constraint is created.
+  During a multi-joint uninterrupted contact sequence, verification persists
+  across its stages and completed drivers remain at their achieved targets
+  until explicit release or a later declared controller takes ownership.
+  The output states that it tests contact-pose/IK trajectory feasibility and
+  contact-gated plan execution, not frictional force closure.
 - A plan-owned `hold_position` immediately following robot contact on the same
-  driver joint retains the acquired grasp and endpoint. A terminal hold remains
-  attached through the final settle and rendered frames; simulator cleanup is
-  not a visible or semantic release. No release, retreat, or home transit may
-  precede the declared hold.
+  driver joint retains the verified gate, final arm pose, and object endpoint.
+  A terminal hold remains active through the final settle and rendered frames;
+  simulator cleanup is not a visible or semantic release. No release, retreat,
+  or home transit may precede the declared hold.
 
 An internal effect actuator is permitted only when execution data assigns that
 specific phase to `internal_mechanism`, supplies an auditable physical
@@ -175,9 +195,19 @@ every wrist roll generated by
 `applications/artimo_robot_contact/render_artimo_grasp_orientation_candidates.py`; comparison sheets and
 tiled multi-view cards are forbidden. Every candidate keeps the same contact
 point and surface normal. Record `angle_status` first and independently record
-`contact_offset_status` for the rendered contact translation, grasp depth, tool
-offset, finger opening, and visible gap. An angle-valid candidate whose offset
-is shallow, deep, off-target, or occluded requires execution-data repair and a
+`contact_point_status=valid/adjust` for the rendered semantic translation and
+visible jaw relationship. Except for a one-tool `physical_push`, `valid`
+requires the target feature cross-section to appear inside the open gap between
+the cyan and magenta contact pads, with the pads on opposite sides, in at least
+one isolated view that clearly exposes the jaw-closing cross-section. Every
+required view must be opened, but an occluded view does not veto `valid` when
+another isolated view clearly proves the relationship. Feature-pad overlap or
+same-side pads in the proving view, or the absence of any proving view, is
+`adjust`. This is a
+plausibility review; it does not require exact static proxy collision. An
+angle-valid candidate whose point is shallow, deep, off-target, or lacks any
+clear proving view
+requires execution-data repair and a
 fresh complete five-roll render; it may not be hidden as an invalid angle.
 Record a final `valid`/`invalid` decision and reason for every candidate only
 after the retained angle's offset passes. Apply those decisions through
@@ -192,15 +222,24 @@ combines one candidate per independent manipulation block with each bounded base
 projects the authoritative future object state before every block, and ranks the
 result by its worst block. Visual priority is only a deterministic tie-break
 after geometric feasibility; it may not commit the first block before later
-blocks are checked. The placement coverage pass is the complete bounded sparse
-Cartesian product of declared forward distances, lateral offsets, and every
-visual-valid orientation. It must evaluate every cell and every manipulation
-stage before dense Top-K selection. Sparse GPU collision uses the actual object
-collision meshes at each sampled state, not whole-link AABBs; dense Top-K and
-the final rollout provide exact target-contact confirmation. A sparse
+blocks are checked. Placement constructs five representative object-side
+fractions for every robot-contact stage and records the world AABB center of the
+child link controlled by that stage's `driver_joint`, after all authoritative
+prior plan controls. It averages samples per unique moving link and then equally
+averages all moving-link centers into one whole-task reference. The initial base
+is offset from that reference, not from the first contact or first moving link.
+The complete declared distance/lateral/height/yaw/orientation grid is ordered
+deterministically from its center outward and split into consecutive bounded GPU
+batches. Failure scores cannot move the center, introduce new directions, or
+reorder remaining cells. As soon as a batch contains a complete sparse path,
+run its survivors through dense and release checks in candidate order. Stop only
+when one candidate passes sparse, the complete dense path, and release, or after
+the declared bounded grid is exhausted. Sparse GPU collision uses the actual object collision
+meshes at each sampled state, not whole-link AABBs; dense validation and the
+final rollout provide exact target-contact confirmation. A sparse
 template-base orientation IK pass is not acceptance evidence. `open_then_close`
-candidates require opposed contact in the visual offset gate and numerical
-confirmation on the dense shortlist/final rollout, while `maintain_width` physical pushes prove
+candidates require a visually plausible opposed-jaw relationship and numerical
+confirmation during dense validation/final rollout, while `maintain_width` physical pushes prove
 actual contact/dwell in rollout. One decision covers every consecutive
 stage in the same `contact_sequence`: all members receive the same rotation,
 only the acquisition stage is probed, and full placement validates the inherited
@@ -208,6 +247,22 @@ arm reference throughout the complete sequence. The final chained
 orientation gate covers every robot-contact stage and hashes the byte-identical execution supplied to
 placement. Candidate previews are planning evidence and never appear in the
 physical rollout video.
+
+Independent application-owned grasp-depth groups use deterministic coordinate
+search, never a Cartesian depth product. Begin from the agent value as an
+untrusted search center, expand symmetrically through the application-owned
+one-dimensional depths, retain the nearest best dense
+evidence, and then advance to the next failed group.
+Within each bounded sparse GPU batch, all sparse survivors remain eligible for
+serial dense verification in deterministic cost order. Dense stops on the first
+full manipulation-plus-release pass; rejection of the first survivor cannot
+discard later survivors, and an already-passing depth group is not enumerated
+to repair a different failed contact sequence.
+
+Placement append-flushes a diagnostic `progress.jsonl` containing the whole-task
+reference, every center-out sparse batch, dense candidate, release, and terminal
+transition. It is monitoring evidence only and cannot participate
+in acceptance or change the declared bounds and gates.
 
 `video.mp4` is H.264, decodes completely, and shows only the physical rollout.
 Keep robot, object, target contact, and resulting motion visible. A crop must be

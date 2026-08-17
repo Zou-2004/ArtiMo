@@ -13,3 +13,4 @@ benchmark_release/
 data/
 asset/
 record_materialization/
+applications\artimo_robot_contact\__pycache__

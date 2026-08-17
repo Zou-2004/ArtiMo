@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Render one immutable batch of wrist-roll candidates for an ArtiMo stage.
 
-The contact point and approach normal remain fixed.  Each candidate rotates the
-declared contact frame only about its local +Z surface-normal axis, then reuses
-``visualize_artimo_scene.py`` to show the object and a kinematic-free parallel-
-jaw proxy. This pass and the decision tool never run IK. After visual decisions,
-the placement solver retains every visual-valid roll and jointly scores the
-base plus one contact choice per manipulation block.
+The agent-declared contact translation is a semantic anchor.  The application
+never moves it automatically.  For every wrist roll, the agent must review the
+same cyan/magenta jaw proxy and separately accept the point or request a point
+adjustment followed by a complete rerender.  This pass and the decision tool
+never run arm IK.  After visual decisions, placement retains every visual-valid
+roll and jointly scores the base plus one contact choice per manipulation block.
 """
 from __future__ import annotations
 
@@ -240,6 +240,9 @@ def main() -> int:
         )
     stage = execution["stages"][args.stage]
     covered_indices = covered_stage_indices(execution, int(args.stage))
+    input_contact_translation_m = list(
+        stage["contact_pose_link"]["translation_m"]
+    )
     input_grasp_depth_m = float(stage.get("grasp_depth_m", 0.0))
     if stage.get("interaction") == "explicit_ideal_feasibility":
         for covered_index in covered_indices:
@@ -284,6 +287,29 @@ def main() -> int:
             candidate_execution["stages"][covered_index]["contact_pose_link"][
                 "rotation_xyzw"
             ] = candidate_quaternion
+        contact_advisory = {
+            "status": "agent_visual_contact_point_review_required",
+            "advisory_only": True,
+            "numerical_collision_query_ran": False,
+            "contact_translation_was_modified": False,
+            "contact_translation_m": list(
+                candidate_execution["stages"][args.stage]["contact_pose_link"][
+                    "translation_m"
+                ]
+            ),
+            "agent_instruction": (
+                "Inspect the isolated surface-normal and tangent images. Mark "
+                "contact_point_status=valid only when, except for a one-tool "
+                "physical_push, the intended feature cross-section is visibly in "
+                "the open gap between the cyan and magenta contact pads with the "
+                "pads on opposite sides in at least one isolated view that clearly "
+                "exposes the jaw-closing cross-section. Open every required view. "
+                "Occlusion in another view is not by itself grounds for adjust if a "
+                "clear proving view exists. Feature-pad overlap or same-side pads in "
+                "the proving view, or no proving view, means adjust. Edit only the task-local contact "
+                "translation, and rerender the complete five-roll batch."
+            ),
+        }
         execution_path = candidate_directory / "execution.json"
         execution_path.write_text(
             json.dumps(candidate_execution, indent=2) + "\n", encoding="utf-8"
@@ -293,6 +319,7 @@ def main() -> int:
                 "id": candidate_id,
                 "roll_degrees": roll_degrees,
                 "contact_rotation_xyzw": candidate_quaternion,
+                "contact_point_advisory": contact_advisory,
                 "execution": str(execution_path),
                 "scene_image": str(scene_directory / "scene.png"),
                 "candidate_directory": candidate_directory,
@@ -361,7 +388,7 @@ def main() -> int:
         "contact_sequence": stage.get("contact_sequence"),
         "interaction": str(stage["interaction"]),
         "contact_link": str(stage["contact_link"]),
-        "contact_translation_m": list(stage["contact_pose_link"]["translation_m"]),
+        "contact_translation_m": input_contact_translation_m,
         "base_contact_rotation_xyzw": base_quaternion,
         "base_contact_frame": contact_frame,
         "base_contact_rotation_policy": (
@@ -372,7 +399,9 @@ def main() -> int:
         "roll_axis": "contact_local_+Z_surface_normal",
         "maximum_target_gap_m": float(args.maximum_target_gap_m),
         "contact_offset_under_review": {
-            "contact_translation_m": list(stage["contact_pose_link"]["translation_m"]),
+            "input_semantic_anchor_translation_m": input_contact_translation_m,
+            "candidate_specific_contact_advisory": True,
+            "application_does_not_modify_contact_translation": True,
             "grasp_depth_m": float(stage.get("grasp_depth_m", 0.0)),
             "robot_tool_contact_offset_eef_m": stage.get(
                 "robot_tool_contact_offset_eef_m"
@@ -386,7 +415,7 @@ def main() -> int:
             "centered_grasp_zero_baseline_m": ph.PANDA_CENTERED_GRASP_BASELINE_M,
             "zero_value_is_special_case": False,
             "selection_basis": "application_rule_based_dense_search_after_angle_gate",
-            "agent_supplied_depth_ignored": bool(
+            "agent_supplied_depth_is_rule_based_search_center_only": bool(
                 stage.get("interaction") == "explicit_ideal_feasibility"
             ),
         },
@@ -396,9 +425,20 @@ def main() -> int:
         "selection_policy": (
             "Agent must open all four separate images for every candidate and mark "
             "every roll visual-valid or visual-invalid before any IK. The images place "
-            "the gripper at the centered robot baseline. The agent classifies only "
-            "whether the wrist angle can place the jaws on opposed sides of the target; "
-            "it must not edit or judge grasp depth. Placement later searches depth with "
+            "the gripper at the centered robot baseline and include a mandatory "
+            "visual point-review reminder for the unchanged semantic anchor. The agent must "
+            "classify whether the wrist angle is correct and whether, except for a "
+            "one-tool physical_push, the semantic feature cross-section is visibly "
+            "inside the open gap between the cyan and magenta contact pads with the "
+            "pads on opposite sides in at least one isolated view that clearly exposes "
+            "the jaw-closing cross-section. Every required view must still be opened, "
+            "but occlusion in another view is not by itself grounds for adjust when a "
+            "clear proving view exists. Pad overlap or same-side pads in the proving "
+            "view, or the absence of any proving view, means adjust. If needed, adjust the task-local "
+            "contact translation and rerender the complete five-roll batch. The "
+            "application never moves the point automatically, and the agent must not "
+            "edit grasp depth. "
+            "Placement later searches depth with "
             "exact bilateral target-gap and forbidden-collision rules. Assign every "
             "visual-valid roll a unique contiguous visual_priority starting at 1, "
             "with the single best visual choice ranked first. A visual-invalid roll "
@@ -419,12 +459,22 @@ def main() -> int:
         "schema_version": 4,
         "report_sha256": _sha256(output / "report.json"),
         "stage_id": str(stage["id"]),
+        "contact_point_validity_rule": (
+            "Except for a one-tool physical_push, the target feature cross-section "
+            "must be visibly inside the open gap between the cyan and magenta contact "
+            "pads, with the pads on opposite sides, in at least one isolated view that "
+            "clearly exposes the jaw-closing cross-section. Every required view must be "
+            "opened, but occlusion in another view is not itself grounds for adjust when "
+            "a clear proving view exists. Feature-pad overlap or same-side pads in the "
+            "proving view, or no proving view, requires contact_point_status=adjust."
+        ),
         "decisions": [
             {
                 "id": candidate["id"],
                 "visual_status": None,
                 "visual_priority": None,
                 "angle_status": None,
+                "contact_point_status": None,
                 "reason": "",
                 "reviewed_images": list(candidate["orientation_images"].values()),
             }

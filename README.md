@@ -144,8 +144,8 @@ python applications/artimo_robot_contact/run_artimo_robot_pipeline.py \
 
 This is the full pipeline: it freezes the inputs, gives the English application
 prompt to the agent, performs visual contact selection, collision-aware IK and
-placement, causal PyBullet rollout, hidden negative control, clean second run,
-video review, and delivery verification. The final directory is printed when
+placement, one causal PyBullet rollout with its hidden negative control, video
+review, and delivery verification. The final directory is printed when
 the command finishes and contains exactly:
 
 ```text

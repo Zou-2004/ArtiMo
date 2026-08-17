@@ -242,6 +242,7 @@ class CuroboBatchIK:
         robot_base_quaternion_xyzw_world: Sequence[float],
         obstacle_worlds_by_sample: Sequence[Sequence[dict[str, Any]]],
         required_clearance_m: float = 0.0,
+        finger_opening_m: float | None = None,
     ) -> dict[str, Any]:
         """Check an already selected joint path against source-mesh worlds."""
         if self.process.poll() is not None:
@@ -257,6 +258,9 @@ class CuroboBatchIK:
             ),
             "obstacle_worlds_by_sample": obstacle_worlds_by_sample,
             "required_clearance_m": float(required_clearance_m),
+            "finger_opening_m": (
+                None if finger_opening_m is None else float(finger_opening_m)
+            ),
         }
         assert self.process.stdin is not None and self.process.stdout is not None
         self.process.stdin.write(json.dumps(request, separators=(",", ":")) + "\n")

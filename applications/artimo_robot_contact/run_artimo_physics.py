@@ -44,33 +44,40 @@ DT = 1.0 / 240.0
 # task/asset calibration. Signed execution depth remains a continuous
 # adjustment around this zero point.
 PANDA_CENTERED_GRASP_BASELINE_M = -0.015
-# Preserve simulation-time playback while reducing expensive PyBullet pixel
-# renders from 30 to 20 per second.  NVENC still encodes every emitted frame;
-# the lower capture rate removes one third of TinyRenderer calls without
-# lowering spatial resolution or changing physical timing.
-VIDEO_FPS = 20
-CAPTURE_EVERY = 12
+# Preserve simulation-time playback while reducing expensive PyBullet CPU
+# rasterization. Ten frames per second is still twice the contract's default
+# 5 fps review rate; 640x480 plus the same-frame contact inset keeps the grasp
+# legible while cutting TinyRenderer pixel work by more than 4x versus the old
+# 20 fps 960x720 stream. NVENC still handles H.264 encoding when available.
+VIDEO_FPS = 10
+CAPTURE_EVERY = 24
+VIDEO_WIDTH = 640
+VIDEO_HEIGHT = 480
 # A small, generic separation from the support surface prevents numerical
 # penetration while keeping the placement independent of asset identity.
 GROUND_CLEARANCE_M = 0.002
 # This benchmark evaluates contact-pose/IK feasibility rather than actuator
 # limits.  Keep one invariant stiff Panda servo for every asset so a new agent
 # cannot "repair" geometry by tuning torque or gravity sag.
-PANDA_ARM_FORCE_N = 87.0
+PANDA_ARM_FORCE_N = 1000.0
 PANDA_ARM_FORCE_SCALE = 1.0
 PANDA_ARM_POSITION_GAIN = 0.2
 PANDA_FINGER_FORCE_N = 20.0
-IDEAL_GRASP_CONSTRAINT_FORCE_N = 180.0
-IDEAL_GRASP_CONSTRAINT_ERP = 0.35
-IDEAL_GRASP_CONSTRAINT_STABILIZE_S = 0.15
-# A fixed constraint is only a post-acquisition stabilizer.  It may not be
-# created from elapsed schedule time alone: both application-owned finger links
-# must sustain opposed, low-velocity contact with the nominated object link.
+# A physically verified grasp gates a plan-authoritative object-joint actuator.
+# The actuator target is tied to measured dense-sample robot progress along the
+# current IK path, never elapsed time. This deliberately evaluates contact/plan causality
+# rather than frictional force closure or Bullet constraint propagation.
+CONTACT_GATED_ACTUATION_FORCE_OR_TORQUE = 1000.0
+CONTACT_GATED_ACTUATION_POSITION_GAIN = 1.0
+CONTACT_GATED_PROGRESS_MAXIMUM_RESIDUAL_RAD = 0.10
+CONTACT_GATED_OBJECT_TRACKING_TOLERANCE_RAD = 0.01
 GRASP_ACQUISITION_DWELL_S = 0.05
+GRASP_PRE_CLOSE_SETTLE_S = 0.25
+GRASP_VERIFICATION_STABILIZE_S = 0.15
 GRASP_CONTACT_NORMAL_MAXIMUM_DOT = -0.25
 GRASP_FINGER_MAXIMUM_SPEED_M_S = 0.01
 GRASP_MINIMUM_CLOSURE_FRACTION = 0.25
-DEFAULT_OBJECT_HOLD_FORCE_OR_TORQUE = 100.0
+DEFAULT_OBJECT_HOLD_FORCE_OR_TORQUE = 1000.0
 OBJECT_JOINT_STABILITY_TOLERANCE_M_OR_RAD = 1e-4
 # A release retreat is a real motion segment, not a zero-time phase boundary.
 # Hold the solved safe endpoint long enough to produce multiple physics/video
@@ -98,7 +105,13 @@ DEFAULT_CONTACT_ROLL_DEGREES = (0.0, 45.0, 90.0, 135.0, 180.0)
 DENSE_MANIPULATION_PATH_SAMPLES = 257
 DEFAULT_PRECONTACT_OFFSET_M = 0.10
 DEFAULT_FINAL_FINGER_OPENING_M = 0.0064
-DEFAULT_APPROACH_FINGER_OPENING_M = 0.04
+# ``finger_opening_m`` is one Panda finger-joint position, so the physical jaw
+# aperture is twice this value.  Transit/approach needs only a small clearance
+# around the width selected for the final grasp; opening every grasp to the
+# Panda's 80 mm maximum makes the outside of a finger sweep nearby housing long
+# before the selected feature reaches the pads.  Add 5 mm to the *total* jaw
+# aperture (2.5 mm per finger) instead of using one fixed maximum-width pose.
+DEFAULT_APPROACH_TOTAL_JAW_CLEARANCE_M = 0.005
 DEFAULT_CONTACT_CLOSE_S = 0.50
 DEFAULT_CONTACT_SETTLE_S = 0.30
 DEFAULT_CONTACT_RELEASE_S = 0.50
@@ -107,7 +120,12 @@ DEFAULT_IK_RANDOM_RESTARTS = 64
 DEFAULT_IK_MAX_ITERATIONS = 4000
 DEFAULT_SEARCH_SEED = 27024
 DEFAULT_PHYSICS_SEED = 1101
-DEFAULT_PASSIVE_RETURN_FORCE = 5.0
+# Missing URDF inertials make Bullet assign unit mass to articulated links. A
+# passive return must therefore overcome at least a few unit-mass gravity
+# loads in any orientation; the former 5 N/Nm cap could saturate before a
+# declared spring return moved at all. Keep one bounded application value well
+# below the task/hold actuator while preserving the plan-owned return target.
+DEFAULT_PASSIVE_RETURN_FORCE = 50.0
 DEFAULT_PASSIVE_RETURN_POSITION_GAIN = 0.5
 
 
@@ -344,6 +362,24 @@ def _install_static_concave_overlays(
                     baseOrientation=world_rotation,
                     physicsClientId=client,
                 )
+                # The overlay is a collision-only replacement for one fixed
+                # link of this same articulated object.  As a separate Bullet
+                # body it would otherwise collide with movable sibling links,
+                # reintroducing self-collisions that the source multibody does
+                # not have and mechanically locking doors/drawers.  Disable
+                # only these internal object-overlay pairs; robot-overlay
+                # collision remains enabled and is queried explicitly below.
+                for source_object_link in range(
+                    -1, p.getNumJoints(object_body, physicsClientId=client)
+                ):
+                    p.setCollisionFilterPair(
+                        object_body,
+                        overlay_body,
+                        source_object_link,
+                        -1,
+                        0,
+                        physicsClientId=client,
+                    )
                 pending.append(
                     _StaticConcaveOverlay(
                         body=int(overlay_body),
@@ -704,6 +740,12 @@ def _quaternion_multiply_xyzw(left: Iterable[float], right: Iterable[float]) -> 
     )
 
 
+def _smoothstep01(value: float | np.ndarray) -> float | np.ndarray:
+    """The single object-trajectory parameterization used by plan and rollout."""
+    clipped = np.clip(value, 0.0, 1.0)
+    return 3.0 * clipped * clipped - 2.0 * clipped * clipped * clipped
+
+
 def _canonical_contact_frame(
     task: dict[str, Any], stage: dict[str, Any]
 ) -> dict[str, Any]:
@@ -1007,22 +1049,41 @@ def materialize_execution_defaults(
             stage["contact_sequence"] = sequence
             stage.pop("release_before_phase", None)
         final_phase_index = group[-1][0]
-        # A switch to another physical contact link necessarily releases and
-        # retreats before the next robot phase even if the object-only plan has
-        # no explicit control_release phase (for example door -> dishwasher
-        # tray).  Otherwise use the next plan-declared release boundary.
+        # Materialize the earliest release boundary implied by plan ownership.
+        # A later robot-contact group requires release/reacquisition before its
+        # first phase.  A causal mechanism requires the triggering contact
+        # sequence to clear before its effect starts.  Passive return and an
+        # explicit control_release are also plan-derived release boundaries.
+        # This is deliberately expressed only in generic plan semantics; asset
+        # identity never participates in execution materialization.
         next_group = groups[group_index + 1] if group_index + 1 < len(groups) else None
-        release_phase = (
-            str(next_group[0][2]["source_phase"])
-            if next_group is not None
-            else next(
-                (
-                    str(phase["name"])
-                    for phase in plan["timeline"][final_phase_index + 1 :]
-                    if str(phase.get("phase_type", "")) == "control_release"
-                ),
-                None,
-            )
+        group_stage_ids = {str(item[2]["id"]) for item in group}
+        group_driver_joints = {str(item[2]["driver_joint"]) for item in group}
+        release_candidates: set[str] = set()
+        if next_group is not None:
+            release_candidates.add(str(next_group[0][2]["source_phase"]))
+        release_candidates.update(
+            str(rule["source_effect_phase"])
+            for rule in execution.get("causal_rules", [])
+            if str(rule.get("trigger_stage", "")) in group_stage_ids
+        )
+        for row in execution["control_execution"]:
+            if row.get("motion_owner") != "passive_return":
+                continue
+            phase_name = str(row["source_phase"])
+            control_index = int(row["source_control_index"])
+            control = phases[phase_name]["controls"][control_index]
+            if str(control.get("joint", "")) in group_driver_joints:
+                release_candidates.add(phase_name)
+        release_candidates.update(
+            str(phase["name"])
+            for phase in plan["timeline"][final_phase_index + 1 :]
+            if str(phase.get("phase_type", "")) == "control_release"
+        )
+        release_phase = min(
+            release_candidates,
+            key=phase_order.__getitem__,
+            default=None,
         )
         if release_phase is not None:
             group[-1][2]["release_before_phase"] = release_phase
@@ -1042,7 +1103,9 @@ def materialize_execution_defaults(
         stage["contact_acquisition"] = {
             "mode": mode,
             "approach_finger_opening_m": (
-                DEFAULT_APPROACH_FINGER_OPENING_M if mode == "open_then_close" else final_opening
+                final_opening + 0.5 * DEFAULT_APPROACH_TOTAL_JAW_CLEARANCE_M
+                if mode == "open_then_close"
+                else final_opening
             ),
             "close_s": DEFAULT_CONTACT_CLOSE_S if mode == "open_then_close" else 0.0,
             "settle_s": DEFAULT_CONTACT_SETTLE_S,
@@ -2145,7 +2208,7 @@ def _plan_stages(
             # articulated contact sweep. 257 object samples halve the step of
             # the prior 129-point proof without weakening that invariant.
             u = np.linspace(0.0, 1.0, DENSE_MANIPULATION_PATH_SAMPLES)
-            object_path = start + (target - start) * (3.0 * u * u - 2.0 * u * u * u)
+            object_path = start + (target - start) * _smoothstep01(u)
             opening = float(stage["finger_opening_m"])
             set_fingers(robot_body, fingers, opening, client)
             # The IK budget is execution data: a contact pose near the arm's
@@ -2486,8 +2549,9 @@ def _plan_stages(
                 phase: str,
                 obstacle_worlds: list[list[dict[str, Any]]] | None = None,
             ) -> tuple[float | None, list[dict[str, Any]], dict[str, Any] | None]:
-                """Use source-mesh GPU collision plus target-only Bullet semantics."""
+                """Use GPU screening plus exact PyBullet path authority."""
                 rows = [np.asarray(row, dtype=np.float64) for row in configurations]
+                included_indices = [int(value) for value in included_object_links]
                 if not rows:
                     return None, [], None
                 if ik_path_solver is None or not ik_path_solver.environment_collision:
@@ -2499,7 +2563,7 @@ def _plan_stages(
                         robot_support_body,
                         {
                             object_link_names[index]: index
-                            for index in included_object_links
+                            for index in included_indices
                         },
                         target_semantics,
                         rows,
@@ -2512,7 +2576,7 @@ def _plan_stages(
                     one_world = _curobo_collision_obstacles(
                         object_body,
                         object_link_names,
-                        included_object_links,
+                        included_indices,
                         object_urdf,
                         client,
                     )
@@ -2535,27 +2599,33 @@ def _plan_stages(
                         "distance_m": float(minimum or 0.0),
                         "reason": "gpu_source_mesh_collision",
                     })
-                if target_semantics is not None:
-                    target_minimum, target_found = _swept_clearance(
-                        robot_body,
-                        object_body,
-                        arm,
-                        robot_link_names,
-                        robot_support_body,
-                        {},
-                        target_semantics,
-                        rows,
-                        phase + "_target_semantics",
-                        search_distance,
-                        client,
+                # GPU source-mesh checking uses the configured robot collision
+                # spheres and remains the high-throughput planner screen.  The
+                # exact PyBullet robot geometry is still the final dense/path
+                # authority because sphere models may under-cover a real link.
+                bullet_minimum, bullet_found = _swept_clearance(
+                    robot_body,
+                    object_body,
+                    arm,
+                    robot_link_names,
+                    robot_support_body,
+                    {
+                        object_link_names[index]: index
+                        for index in included_indices
+                    },
+                    target_semantics,
+                    rows,
+                    phase + "_pybullet_exact",
+                    search_distance,
+                    client,
+                )
+                if bullet_minimum is not None:
+                    minimum = (
+                        float(bullet_minimum)
+                        if minimum is None
+                        else min(float(minimum), float(bullet_minimum))
                     )
-                    if target_minimum is not None:
-                        minimum = (
-                            float(target_minimum)
-                            if minimum is None
-                            else min(float(minimum), float(target_minimum))
-                        )
-                    found.extend(target_found)
+                found.extend(bullet_found)
                 return (
                     None if minimum is None else float(minimum),
                     found,
@@ -3116,7 +3186,7 @@ def _plan_stages(
                     arm,
                     robot_link_names,
                     robot_support_body,
-                    {},
+                    forbidden,
                     target_contact,
                     [manipulation[sample_index]],
                     "manipulate",
@@ -3510,10 +3580,53 @@ def _inherited_contact_sequence_answer(reference: np.ndarray) -> dict[str, Any]:
     }
 
 
-def _grasp_constraint_key(stage: dict[str, Any], stage_index: int) -> str:
-    """Identify one persistent ideal grasp across an adjacent contact sequence."""
+def _grasp_verification_key(stage: dict[str, Any], stage_index: int) -> str:
+    """Identify one persistent verified contact gate across a contact sequence."""
     sequence = stage.get("contact_sequence")
     return f"sequence:{sequence}" if sequence is not None else f"stage:{stage_index}"
+
+
+def _verified_gripper_collision_links(
+    robot_body: int,
+    verified_finger_links: set[int],
+    client: int,
+) -> set[int]:
+    """Return verified fingers plus their nearest common rigid palm parent.
+
+    After bilateral verification, target-link response for this compact
+    gripper assembly is replaced by the semantic joint actuator. Keeping the
+    palm/target pair active can still close a solver loop even when the two
+    fingertip pairs are disabled. Arm links above the nearest common ancestor
+    are deliberately excluded and remain collision-authoritative.
+    """
+    fingers = sorted(int(index) for index in verified_finger_links)
+    if not fingers:
+        return set()
+
+    def ancestor_chain(link_index: int) -> list[int]:
+        chain: list[int] = []
+        current = int(link_index)
+        while current >= 0:
+            chain.append(current)
+            current = int(
+                p.getJointInfo(
+                    robot_body, current, physicsClientId=client
+                )[16]
+            )
+        return chain
+
+    chains = [ancestor_chain(index) for index in fingers]
+    common = set(chains[0])
+    for chain in chains[1:]:
+        common.intersection_update(chain)
+    nearest_common = next(
+        (index for index in chains[0] if index in common),
+        None,
+    )
+    result = set(fingers)
+    if nearest_common is not None:
+        result.add(int(nearest_common))
+    return result
 
 
 def _bilateral_grasp_sample(
@@ -3748,6 +3861,25 @@ def _schedule(
                         "approach", index, q, approach_opening, finger_force, timeline_phase
                     )
             if acquisition_mode == "open_then_close":
+                # Reach the final contact-pose IK with the fingers still open
+                # before closure begins.  Closing while the arm is still
+                # traversing precontact -> contact can brush one side of a
+                # held feature and finish with both fingers beside it.  This
+                # deterministic convergence dwell is application policy, not
+                # an agent-supplied timing knob.
+                preclose_ticks = max(
+                    1, int(round(GRASP_PRE_CLOSE_SETTLE_S / DT))
+                )
+                for _ in range(preclose_ticks):
+                    append_command(
+                        "contact_preclose_settle",
+                        index,
+                        plan.manipulation[0],
+                        approach_opening,
+                        finger_force,
+                        timeline_phase,
+                        0,
+                    )
                 close_ticks = max(1, int(round(float(acquisition["close_s"]) / DT)))
                 for finger in np.linspace(approach_opening, opening, close_ticks):
                     append_command(
@@ -3773,9 +3905,11 @@ def _schedule(
             if plan.stage["interaction"] == "explicit_ideal_feasibility":
                 # Acquisition is deliberately split into three ordered pieces:
                 # close the fingers, let the real robot converge while the
-                # object driver remains locked, then create the single disclosed
-                # ideal constraint and stabilize it before manipulation.  The
-                # old schedule attached on the first contact-settle tick; a
+                # object driver remains locked, then verify the single disclosed
+                # contact gate and stabilize it before manipulation.  The
+                # legacy phase label is kept for serialized-command compatibility;
+                # no Bullet attachment is created.  A gate on the first
+                # contact-settle tick could let a
                 # lagging arm could therefore drag an unlatched door before the
                 # commanded grasp pose had actually settled.
                 append_command(
@@ -3787,10 +3921,10 @@ def _schedule(
                     timeline_phase,
                     0,
                 )
-                constraint_settle_ticks = max(
-                    1, int(round(IDEAL_GRASP_CONSTRAINT_STABILIZE_S / DT))
+                verification_settle_ticks = max(
+                    1, int(round(GRASP_VERIFICATION_STABILIZE_S / DT))
                 )
-                for _ in range(constraint_settle_ticks):
+                for _ in range(verification_settle_ticks):
                     append_command(
                         "grasp_stabilize",
                         index,
@@ -3997,33 +4131,50 @@ def _schedule(
     return commands
 
 
-def _attach(robot: int, eef: int, object_body: int, object_link: int, client: int) -> int:
-    parent_world = link_world_pose(robot, eef, client)
-    child_world = link_world_pose(object_body, object_link, client)
-    inverse_child = p.invertTransform(child_world[0], child_world[1], physicsClientId=client)
-    child_frame = p.multiplyTransforms(
-        inverse_child[0], inverse_child[1], parent_world[0], parent_world[1], physicsClientId=client
-    )
-    constraint = p.createConstraint(
-        robot,
-        eef,
-        object_body,
-        object_link,
-        p.JOINT_FIXED,
-        [0.0, 0.0, 0.0],
-        [0.0, 0.0, 0.0],
-        child_frame[0],
-        parentFrameOrientation=[0.0, 0.0, 0.0, 1.0],
-        childFrameOrientation=child_frame[1],
-        physicsClientId=client,
-    )
-    p.changeConstraint(
-        constraint,
-        maxForce=IDEAL_GRASP_CONSTRAINT_FORCE_N,
-        erp=IDEAL_GRASP_CONSTRAINT_ERP,
-        physicsClientId=client,
-    )
-    return constraint
+def _robot_path_sample_progress(
+    path: np.ndarray,
+    configuration: np.ndarray,
+    maximum_sample: int | None = None,
+) -> tuple[float, float]:
+    """Return dense-sample progress and residual to a robot joint path.
+
+    The nearest projected point is capped by the currently commanded sample,
+    preventing a self-intersecting path from jumping ahead.  Rollout keeps the
+    returned progress monotonic and accepts it only when ``residual`` is within
+    the application-owned tracking bound. Progress is the fractional sample
+    index, not joint-space arc length: dense IK is generated at uniform values
+    of the object trajectory parameter. The caller applies the same smoothstep
+    used during planning to recover the exact ArtiMo joint target.
+    """
+    rows = np.asarray(path, dtype=np.float64)
+    q = np.asarray(configuration, dtype=np.float64)
+    if rows.ndim != 2 or len(rows) == 0 or rows.shape[1] != len(q):
+        raise ValueError("Robot progress path/configuration shape mismatch")
+    if len(rows) == 1:
+        return 1.0, float(np.max(np.abs(q - rows[0])))
+    segment_vectors = rows[1:] - rows[:-1]
+    if float(np.max(np.abs(segment_vectors))) <= 1e-12:
+        return 1.0, float(np.max(np.abs(q - rows[-1])))
+    last_segment = len(segment_vectors) - 1
+    if maximum_sample is not None:
+        last_segment = min(last_segment, max(0, int(maximum_sample) - 1))
+    best_distance = float("inf")
+    best_progress = 0.0
+    for index in range(last_segment + 1):
+        vector = segment_vectors[index]
+        squared_length = float(np.dot(vector, vector))
+        alpha = 0.0 if squared_length <= 1e-18 else float(
+            np.clip(np.dot(q - rows[index], vector) / squared_length, 0.0, 1.0)
+        )
+        projected = rows[index] + alpha * vector
+        residual = float(np.max(np.abs(q - projected)))
+        if residual < best_distance:
+            best_distance = residual
+            best_progress = float((index + alpha) / (len(rows) - 1))
+    if maximum_sample is not None:
+        cap_index = min(max(0, int(maximum_sample)), len(rows) - 1)
+        best_progress = min(best_progress, float(cap_index / (len(rows) - 1)))
+    return float(np.clip(best_progress, 0.0, 1.0)), best_distance
 
 
 def _project_pixel(
@@ -4055,19 +4206,27 @@ def _render_frame(
     eye = camera.get("eye_m", [1.2, -1.2, 0.9])
     target = camera.get("target_m", [0.0, 0.0, 0.35])
     view = p.computeViewMatrix(eye, target, [0.0, 0.0, 1.0])
-    projection = p.computeProjectionMatrixFOV(float(camera.get("fov_deg", 50.0)), 4.0 / 3.0, 0.02, 6.0)
+    projection = p.computeProjectionMatrixFOV(
+        float(camera.get("fov_deg", 50.0)),
+        VIDEO_WIDTH / VIDEO_HEIGHT,
+        0.02,
+        6.0,
+    )
     _, _, rgba, _, _ = p.getCameraImage(
-        960,
-        720,
+        VIDEO_WIDTH,
+        VIDEO_HEIGHT,
         view,
         projection,
         renderer=renderer,
         physicsClientId=client,
     )
-    image = Image.fromarray(np.asarray(rgba, dtype=np.uint8).reshape(720, 960, 4), "RGBA").convert("RGB")
+    image = Image.fromarray(
+        np.asarray(rgba, dtype=np.uint8).reshape(VIDEO_HEIGHT, VIDEO_WIDTH, 4),
+        "RGBA",
+    ).convert("RGB")
     draw = ImageDraw.Draw(image)
-    draw.rectangle((0, 0, 960, 34), fill=(18, 22, 29))
-    draw.text((12, 10), status, fill=(245, 248, 252), font=ImageFont.load_default())
+    draw.rectangle((0, 0, VIDEO_WIDTH, 28), fill=(18, 22, 29))
+    draw.text((9, 8), status, fill=(245, 248, 252), font=ImageFont.load_default())
     if phase in {
         "approach",
         "contact_acquire",
@@ -4077,18 +4236,48 @@ def _render_frame(
         "contact_release",
         "retreat",
     } and target_world is not None:
-        pixel = _project_pixel(target_world, view, projection, 960, 720)
+        pixel = _project_pixel(
+            target_world, view, projection, VIDEO_WIDTH, VIDEO_HEIGHT
+        )
         if pixel is not None:
-            half_width, half_height = 115, 86
-            left = max(0, min(960 - 2 * half_width, pixel[0] - half_width))
-            top = max(34, min(720 - 2 * half_height, pixel[1] - half_height))
+            half_width, half_height = 80, 60
+            left = max(
+                0,
+                min(VIDEO_WIDTH - 2 * half_width, pixel[0] - half_width),
+            )
+            top = max(
+                28,
+                min(VIDEO_HEIGHT - 2 * half_height, pixel[1] - half_height),
+            )
             inset = image.crop((left, top, left + 2 * half_width, top + 2 * half_height))
-            inset = inset.resize((320, 240), Image.Resampling.BICUBIC)
-            image.paste(inset, (12, 466))
+            inset_width, inset_height = 240, 180
+            inset_x, inset_y = 8, VIDEO_HEIGHT - inset_height - 8
+            inset = inset.resize(
+                (inset_width, inset_height), Image.Resampling.BICUBIC
+            )
+            image.paste(inset, (inset_x, inset_y))
             draw = ImageDraw.Draw(image)
-            draw.rectangle((10, 444, 334, 708), outline=(240, 117, 30), width=2)
-            draw.rectangle((12, 446, 332, 466), fill=(18, 22, 29))
-            draw.text((18, 451), "TARGET CONTACT — SAME FRAME", fill=(255, 181, 92), font=ImageFont.load_default())
+            label_top = inset_y - 22
+            draw.rectangle(
+                (
+                    inset_x - 2,
+                    label_top,
+                    inset_x + inset_width + 2,
+                    inset_y + inset_height + 2,
+                ),
+                outline=(240, 117, 30),
+                width=2,
+            )
+            draw.rectangle(
+                (inset_x, label_top + 2, inset_x + inset_width, inset_y),
+                fill=(18, 22, 29),
+            )
+            draw.text(
+                (inset_x + 6, label_top + 6),
+                "TARGET CONTACT - SAME FRAME",
+                fill=(255, 181, 92),
+                font=ImageFont.load_default(),
+            )
     return np.asarray(image, dtype=np.uint8)
 
 
@@ -4181,19 +4370,14 @@ def _rollout(
         robot_spec = execution["robot"]
         arm = [robot_joints[name] for name in robot_spec["arm_joint_names"]]
         fingers = [robot_joints[name] for name in robot_spec["finger_joint_names"]]
+        # The Panda is a stiff position-controlled trajectory executor in this
+        # benchmark.  Do not silently cap it to the robot URDF's nominal effort
+        # fields. These application-owned constants are deliberately absent
+        # from per-task execution data.
         arm_effort_limits = [
-            (
-                float(p.getJointInfo(robot_body, joint, physicsClientId=client)[10])
-                or PANDA_ARM_FORCE_N
-            )
-            * PANDA_ARM_FORCE_SCALE
-            for joint in arm
+            PANDA_ARM_FORCE_N * PANDA_ARM_FORCE_SCALE for _ in arm
         ]
-        finger_effort_limits = [
-            float(p.getJointInfo(robot_body, joint, physicsClientId=client)[10])
-            or PANDA_FINGER_FORCE_N
-            for joint in fingers
-        ]
+        finger_effort_limits = [PANDA_FINGER_FORCE_N for _ in fingers]
         eef = robot_links[robot_spec["end_effector_link"]]
         for name, value in initial.items():
             if name in object_joints:
@@ -4260,7 +4444,7 @@ def _rollout(
             )
             video_encoding["frame_rendering"] = frame_rendering
             video_encoding["fps"] = VIDEO_FPS
-            video_encoding["resolution"] = [960, 720]
+            video_encoding["resolution"] = [VIDEO_WIDTH, VIDEO_HEIGHT]
         stage_metrics = [
             {
                 "stage_id": plan.stage["id"],
@@ -4269,6 +4453,11 @@ def _rollout(
                 "non_target_contact_observations": 0,
                 "effect_link_contact_observations": 0,
                 "maximum_driver_displacement": 0.0,
+                "maximum_absolute_driver_motor_torque": 0.0,
+                "driver_motor_torque_by_phase": {},
+                "maximum_robot_execution_progress": 0.0,
+                "last_contact_gated_actuation_target": None,
+                "maximum_contact_gated_tracking_error": 0.0,
                 "maximum_continuous_contact_ticks": 0,
                 "first_target_contact_tick": None,
                 "unexpected_contact_pairs": {},
@@ -4308,16 +4497,16 @@ def _rollout(
             }
             for _ in execution.get("causal_rules", [])
         ]
-        # An ideal grasp belongs to the uninterrupted contact sequence, not to
-        # each individual object-motion stage.  Keying it by stage used to add
-        # a second attachment during e.g. handle-turn -> door-pull and made the
-        # lifecycle ambiguous.  One sequence now creates exactly one disclosed
-        # attachment and retains it until the scheduled release/retreat.
-        constraints: dict[str, int] = {}
-        created_constraints = 0
-        maximum_constraints = 0
-        required_constraint_keys = {
-            _grasp_constraint_key(plan.stage, index)
+        # Verification belongs to the uninterrupted contact sequence, not to
+        # each object-motion stage.  Once established, it gates object-joint
+        # actuation until the explicit release boundary.  No runtime constraint
+        # or hidden attachment is created.
+        verified_grasps: set[str] = set()
+        verified_disabled_collision_pairs: dict[
+            str, list[tuple[int, int]]
+        ] = {}
+        required_grasp_keys = {
+            _grasp_verification_key(plan.stage, index)
             for index, plan in enumerate(plans)
             if plan.stage["interaction"] == "explicit_ideal_feasibility"
         }
@@ -4329,11 +4518,11 @@ def _rollout(
                 "consecutive_pass_ticks": 0,
                 "maximum_consecutive_pass_ticks": 0,
                 "acquired": False,
-                "attach_tick": None,
-                "failed_attach_tick": None,
+                "verified_tick": None,
+                "failed_verification_tick": None,
                 "last_sample": None,
             }
-            for key in required_constraint_keys
+            for key in required_grasp_keys
         }
         aborted_after_failed_acquisition = False
         executed_command_count = 0
@@ -4342,7 +4531,27 @@ def _rollout(
         }
         precontact_driver_holds = _precontact_driver_hold_targets(plans, initial)
         contact_released_driver_joints: set[str] = set()
+        completed_driver_holds: dict[str, float] = {}
+        actuation_start_positions: dict[int, float] = {}
+        actuation_progress: dict[int, float] = {
+            index: 0.0 for index in range(len(plans))
+        }
+        actuation_targets: dict[int, float] = {}
         timeline_phase_order = _timeline_phase_order(object_plan)
+
+        def release_verified_grasp(grasp_key: str) -> None:
+            verified_grasps.discard(grasp_key)
+            for robot_link, object_link in verified_disabled_collision_pairs.pop(
+                grasp_key, []
+            ):
+                p.setCollisionFilterPair(
+                    robot_body,
+                    object_body,
+                    robot_link,
+                    object_link,
+                    1,
+                    physicsClientId=client,
+                )
 
         scheduled_commands = (
             commands
@@ -4353,6 +4562,31 @@ def _rollout(
             executed_command_count = tick + 1
             stage_index = command.get("stage")
             phase = str(command["phase"])
+            active_robot_driver_joint: str | None = None
+            if stage_index is not None:
+                active_plan_for_control = plans[int(stage_index)]
+                active_grasp_key_for_control = _grasp_verification_key(
+                    active_plan_for_control.stage, int(stage_index)
+                )
+                candidate_driver_joint = str(
+                    active_plan_for_control.stage["driver_joint"]
+                )
+                if _robot_driver_actuation_is_enabled(
+                    interaction=str(
+                        active_plan_for_control.stage["interaction"]
+                    ),
+                    phase=phase,
+                    condition=condition,
+                    grasp_verified=(
+                        active_grasp_key_for_control in verified_grasps
+                    ),
+                    target_contact_observed=(
+                        candidate_driver_joint
+                        in contact_released_driver_joints
+                    ),
+                ):
+                    active_robot_driver_joint = candidate_driver_joint
+                    contact_released_driver_joints.add(active_robot_driver_joint)
             p.setJointMotorControlArray(
                 robot_body,
                 arm,
@@ -4364,18 +4598,19 @@ def _rollout(
                 physicsClientId=client,
             )
             active_passive_joints = set(command.get("active_passive_joints", []))
-            # A robot-owned object joint is not a free animation channel before
-            # physical acquisition.  Hold it at initialization until its own
-            # active stage observes nominated target contact.  The physical run
-            # releases it on the following tick so contact can drive it; the
-            # contact-disabled control never releases it and therefore cannot
-            # move the button/handle under gravity before the robot arrives.
+            # A robot-owned object joint is free only while its own contact
+            # stage is actively manipulating it.  Before acquisition it holds
+            # the initial state; after reaching an endpoint it holds that
+            # endpoint until a declared passive-return controller takes over.
+            # This keeps earlier joints in a multi-joint contact sequence from
+            # drifting without making the current driver fight the robot.
             for name, target in precontact_driver_holds.items():
                 joint = object_joints[name]
-                if name in contact_released_driver_joints:
-                    # PyBullet retains the last motor mode until explicitly
-                    # replaced. Omitting this driver would leave the POSITION
-                    # controller fighting the real robot push.
+                if condition == "physical" and name == active_robot_driver_joint:
+                    # The contact-gated actuator is written after every other
+                    # object controller immediately before the physics step.
+                    # Clear the prior hold here so no stale POSITION controller
+                    # survives if progress validation rejects this tick.
                     p.setJointMotorControl2(
                         object_body,
                         joint,
@@ -4385,6 +4620,7 @@ def _rollout(
                         physicsClientId=client,
                     )
                     continue
+                hold_target = completed_driver_holds.get(name, float(target))
                 maximum_force = max(
                     DEFAULT_OBJECT_HOLD_FORCE_OR_TORQUE,
                     float(
@@ -4397,7 +4633,7 @@ def _rollout(
                     object_body,
                     joint,
                     p.POSITION_CONTROL,
-                    targetPosition=float(target),
+                    targetPosition=float(hold_target),
                     force=maximum_force,
                     positionGain=1.0,
                     velocityGain=1.0,
@@ -4437,11 +4673,11 @@ def _rollout(
             )
             if stage_index is not None:
                 active_stage_plan = plans[int(stage_index)]
-                constraint_key = _grasp_constraint_key(
+                grasp_key = _grasp_verification_key(
                     active_stage_plan.stage, int(stage_index)
                 )
-                if phase in {"contact_release", "retreat"} and constraint_key in constraints:
-                    p.removeConstraint(constraints.pop(constraint_key), physicsClientId=client)
+                if phase in {"contact_release", "retreat"}:
+                    release_verified_grasp(grasp_key)
 
             for rule_index, rule in enumerate(execution.get("causal_rules", [])):
                 state = rule_states[rule_index]
@@ -4558,6 +4794,73 @@ def _rollout(
                         physicsClientId=client,
                     )
 
+            # This is intentionally the final object-controller write before
+            # stepping physics. The interaction-specific real-contact gate
+            # enables it, and its target is determined by the measured
+            # dense-sample parameter along the current IK path, not elapsed
+            # schedule time or joint-space arc length. If the arm stalls away
+            # from the path, progress and therefore object motion stop.
+            if active_robot_driver_joint is not None and stage_index is not None:
+                active_index = int(stage_index)
+                active_plan = plans[active_index]
+                actual_arm_q = np.asarray(
+                    [
+                        p.getJointState(
+                            robot_body, joint, physicsClientId=client
+                        )[0]
+                        for joint in arm
+                    ],
+                    dtype=np.float64,
+                )
+                maximum_sample = int(
+                    command.get("sample", len(active_plan.manipulation) - 1)
+                )
+                measured_progress, progress_residual = _robot_path_sample_progress(
+                    active_plan.manipulation,
+                    actual_arm_q,
+                    maximum_sample,
+                )
+                if (
+                    progress_residual
+                    <= CONTACT_GATED_PROGRESS_MAXIMUM_RESIDUAL_RAD
+                ):
+                    actuation_progress[active_index] = max(
+                        float(actuation_progress[active_index]),
+                        float(measured_progress),
+                    )
+                driver_index = object_joints[active_robot_driver_joint]
+                start_position = actuation_start_positions.setdefault(
+                    active_index,
+                    float(
+                        p.getJointState(
+                            object_body, driver_index, physicsClientId=client
+                        )[0]
+                    ),
+                )
+                target_position = float(
+                    start_position
+                    + float(_smoothstep01(actuation_progress[active_index]))
+                    * (
+                        float(active_plan.stage["target_joint_position"])
+                        - start_position
+                    )
+                )
+                actuation_targets[active_index] = target_position
+                p.setJointMotorControl2(
+                    object_body,
+                    driver_index,
+                    p.POSITION_CONTROL,
+                    targetPosition=target_position,
+                    force=CONTACT_GATED_ACTUATION_FORCE_OR_TORQUE,
+                    positionGain=CONTACT_GATED_ACTUATION_POSITION_GAIN,
+                    velocityGain=1.0,
+                    physicsClientId=client,
+                )
+                if phase == "hold":
+                    completed_driver_holds[active_robot_driver_joint] = (
+                        target_position
+                    )
+
             p.stepSimulation(physicsClientId=client)
             p.performCollisionDetection(physicsClientId=client)
             all_object_contacts = object_contact_points(
@@ -4565,14 +4868,14 @@ def _rollout(
             )
             if stage_index is not None:
                 acquisition_plan = plans[int(stage_index)]
-                acquisition_key = _grasp_constraint_key(
+                acquisition_key = _grasp_verification_key(
                     acquisition_plan.stage, int(stage_index)
                 )
                 if (
                     condition == "physical"
                     and acquisition_plan.stage["interaction"]
                     == "explicit_ideal_feasibility"
-                    and acquisition_key not in constraints
+                    and acquisition_key not in verified_grasps
                     and phase in {"contact_settle", "contact_attach"}
                 ):
                     allowed_robot, allowed_object = allowed_by_stage[
@@ -4610,26 +4913,41 @@ def _rollout(
                         int(state["consecutive_pass_ticks"])
                         >= acquisition_required_ticks
                     ):
-                        # Transition as soon as the measured dwell is complete;
-                        # the remaining settle commands then stabilize an
-                        # already-proven grasp instead of waiting for a timer.
-                        constraints[acquisition_key] = _attach(
+                        # The real bilateral dwell is the only transition into
+                        # semantic actuation. No attachment is created. The
+                        # verified fingers and their nearest common rigid palm
+                        # parent stop responding only to the target link, so
+                        # the task actuator and contact solver do not form a
+                        # redundant closed loop. The rest of the arm and every
+                        # non-target object link remain collision-authoritative.
+                        verified_grasps.add(acquisition_key)
+                        disabled_pairs: list[tuple[int, int]] = []
+                        verified_gripper_links = _verified_gripper_collision_links(
                             robot_body,
-                            eef,
-                            object_body,
-                            allowed_object,
+                            allowed_robot,
                             client,
                         )
-                        created_constraints += 1
+                        for robot_link in sorted(verified_gripper_links):
+                            p.setCollisionFilterPair(
+                                robot_body,
+                                object_body,
+                                robot_link,
+                                allowed_object,
+                                0,
+                                physicsClientId=client,
+                            )
+                            disabled_pairs.append((robot_link, allowed_object))
+                        verified_disabled_collision_pairs[acquisition_key] = (
+                            disabled_pairs
+                        )
                         state["acquired"] = True
-                        state["attach_tick"] = int(tick)
+                        state["verified_tick"] = int(tick)
                     elif phase == "contact_attach":
                             # Do not execute even one manipulation command after
                             # a failed physical acquisition.  The negative
                             # control later receives this exact command prefix.
-                            state["failed_attach_tick"] = int(tick)
+                            state["failed_verification_tick"] = int(tick)
                             aborted_after_failed_acquisition = True
-            maximum_constraints = max(maximum_constraints, p.getNumConstraints(physicsClientId=client))
             command_q = np.asarray(command["arm"], dtype=np.float64)
             actual_q = np.asarray(
                 [
@@ -4684,24 +5002,62 @@ def _rollout(
                     float(metric["maximum_driver_displacement"]),
                     current_driver_displacement[index],
                 )
-                constraint_key = _grasp_constraint_key(
+                metric["maximum_robot_execution_progress"] = max(
+                    float(metric["maximum_robot_execution_progress"]),
+                    float(actuation_progress[index]),
+                )
+                if index in actuation_targets:
+                    metric["last_contact_gated_actuation_target"] = float(
+                        actuation_targets[index]
+                    )
+                driver_state = p.getJointState(
+                    object_body,
+                    object_joints[plans[index].stage["driver_joint"]],
+                    physicsClientId=client,
+                )
+                metric["maximum_absolute_driver_motor_torque"] = max(
+                    float(metric["maximum_absolute_driver_motor_torque"]),
+                    abs(float(driver_state[3])),
+                )
+                phase_torque = metric["driver_motor_torque_by_phase"].setdefault(
+                    phase,
+                    {"maximum_absolute": 0.0, "last": 0.0, "samples": 0},
+                )
+                phase_torque["maximum_absolute"] = max(
+                    float(phase_torque["maximum_absolute"]),
+                    abs(float(driver_state[3])),
+                )
+                phase_torque["last"] = float(driver_state[3])
+                phase_torque["samples"] = int(phase_torque["samples"]) + 1
+                if (
+                    stage_index is not None
+                    and int(stage_index) == index
+                    and active_robot_driver_joint
+                    == str(plans[index].stage["driver_joint"])
+                    and index in actuation_targets
+                ):
+                    metric["maximum_contact_gated_tracking_error"] = max(
+                        float(metric["maximum_contact_gated_tracking_error"]),
+                        abs(float(driver_state[0]) - float(actuation_targets[index])),
+                    )
+                grasp_key = _grasp_verification_key(
                     plans[index].stage, index
                 )
-                ideal_contact_active = bool(
+                verified_contact_active = bool(
                     plans[index].stage["interaction"]
                     == "explicit_ideal_feasibility"
-                    and constraint_key in constraints
+                    and grasp_key in verified_grasps
                     and condition == "physical"
                 )
-                target_observed = ideal_contact_active
-                if ideal_contact_active:
-                    # The stabilizing constraint can only exist after the
-                    # measured bilateral-contact dwell gate has passed.
+                target_observed = verified_contact_active
+                if verified_contact_active:
+                    # Once the physical dwell gate passes, the uninterrupted
+                    # grasp remains the disclosed causal gate until release.
                     metric["target_contact_observations"] += 1
                 for point in all_object_contacts:
                     robot_link, object_link = int(point[3]), int(point[4])
                     if robot_link in allowed_robot and object_link == allowed_object:
-                        if not ideal_contact_active:
+                        if not verified_contact_active:
                             metric["target_contact_observations"] += 1
                         target_observed = True
                     else:
@@ -4752,13 +5108,13 @@ def _rollout(
                         metric["first_target_contact_tick"] = int(tick)
                     # A raw fingertip contact during closing is not permission
                     # to unlatch an explicit ideal interaction.  Release that
-                    # object driver only once the constraint is active and the
+                    # object driver only once the contact gate is active and the
                     # first manipulation command has begun.  This prevents a
                     # door from moving backwards before the grasp is complete.
                     if (
                         plans[index].stage["interaction"]
                         != "explicit_ideal_feasibility"
-                        or (ideal_contact_active and phase == "manipulate")
+                        or (verified_contact_active and phase == "manipulate")
                     ):
                         contact_released_driver_joints.add(
                             str(plans[index].stage["driver_joint"])
@@ -4787,9 +5143,9 @@ def _rollout(
                         execution,
                         (
                             (
-                                "FULL IDEAL-GRASP ROLLOUT (IK DIAGNOSTICS RECORDED)"
+                                "FULL CONTACT-GATED ROLLOUT (IK DIAGNOSTICS RECORDED)"
                                 if debug_partial
-                                else "IDEAL-GRASP IK/TRAJECTORY FEASIBILITY"
+                                else "VERIFIED CONTACT-GATED IK/TRAJECTORY FEASIBILITY"
                             )
                             if any(
                                 item.stage["interaction"] == "explicit_ideal_feasibility"
@@ -4811,8 +5167,8 @@ def _rollout(
             if aborted_after_failed_acquisition:
                 break
 
-        for constraint in list(constraints.values()):
-            p.removeConstraint(constraint, physicsClientId=client)
+        for grasp_key in list(verified_grasps):
+            release_verified_grasp(grasp_key)
         summarized = []
         diagnostics = []
         for metric in stage_metrics:
@@ -4927,11 +5283,14 @@ def _rollout(
             "causal_timing": causal_timing,
             "object_joint_first_motion_ticks": first_motion_ticks,
             "object_joint_maximum_initial_displacements": maximum_initial_displacements,
-            "created_fixed_constraints": created_constraints,
-            "required_ideal_grasp_constraints": len(required_constraint_keys),
+            "created_fixed_constraints": 0,
+            "verified_grasp_count": sum(
+                bool(state["acquired"]) for state in acquisition_states.values()
+            ),
+            "required_verified_grasps": len(required_grasp_keys),
             "grasp_acquisition": [
                 {
-                    "constraint_key": key,
+                    "grasp_key": key,
                     "required_consecutive_ticks": acquisition_required_ticks,
                     "required_dwell_s": GRASP_ACQUISITION_DWELL_S,
                     **state,
@@ -4942,7 +5301,7 @@ def _rollout(
                 aborted_after_failed_acquisition
             ),
             "executed_command_count": int(executed_command_count),
-            "maximum_runtime_constraint_count": maximum_constraints,
+            "maximum_runtime_constraint_count": 0,
             "object_joint_resets_after_initialization": 0,
             "undeclared_object_joints": undeclared_object_joints,
             "robot_command_schedule_sha256": _canonical_hash(
@@ -5044,6 +5403,24 @@ def _passive_driver_is_enabled(
         joint not in precontact_driver_holds
         or joint in contact_released_driver_joints
     )
+
+
+def _robot_driver_actuation_is_enabled(
+    *,
+    interaction: str,
+    phase: str,
+    condition: str,
+    grasp_verified: bool,
+    target_contact_observed: bool,
+) -> bool:
+    """Gate robot-owned object motion by the declared contact semantics."""
+    if condition != "physical" or phase not in {"manipulate", "hold"}:
+        return False
+    if interaction == "explicit_ideal_feasibility":
+        return bool(grasp_verified)
+    if interaction == "physical_push":
+        return bool(target_contact_observed)
+    return False
 
 
 def _object_joint_state_before_control(
@@ -5492,8 +5869,15 @@ def run(
                 for item in physical["grasp_acquisition"]
             )
             and
-            int(physical["created_fixed_constraints"])
-            == int(physical["required_ideal_grasp_constraints"])
+            int(physical["verified_grasp_count"])
+            == int(physical["required_verified_grasps"])
+            and int(physical["maximum_runtime_constraint_count"]) == 0
+        ),
+        "contact_gated_object_tracking": all(
+            float(metric["maximum_contact_gated_tracking_error"])
+            <= CONTACT_GATED_OBJECT_TRACKING_TOLERANCE_RAD
+            for metric, plan in zip(physical["contacts"], plans)
+            if plan.stage["interaction"] == "explicit_ideal_feasibility"
         ),
         "non_target_contact_zero": all(item["non_target_contact_observations"] == 0 for item in physical["contacts"]),
         "effect_link_contact_zero": all(item["effect_link_contact_observations"] == 0 for item in physical["contacts"]),

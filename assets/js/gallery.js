@@ -180,6 +180,27 @@ const CASES = [
   },
 ];
 
+const ROLLOUTS = [
+  {
+    id: "kettle13",
+    title: "Electric Kettle 13",
+    action: "Press the button and open the kettle lid.",
+    src: "assets/videos/application/kettle13.mp4",
+  },
+  {
+    id: "door1",
+    title: "Door 1",
+    action: "Approach the door and open it from the front.",
+    src: "assets/videos/application/door1.mp4",
+  },
+  {
+    id: "dishwasher1",
+    title: "Dishwasher 1",
+    action: "Approach the dishwasher and open the front door.",
+    src: "assets/videos/application/dishwasher1.mp4",
+  },
+];
+
 const MODES = ["mesh", "action", "animation"];
 
 function applyTheme(theme) {
@@ -243,6 +264,27 @@ function actionPanel(item) {
       </div>
       ${image}
     </div>
+  `;
+}
+
+function rolloutCard(item) {
+  return `
+    <article class="asset-card rollout-card" data-rollout-card="${item.id}">
+      <header>
+        <h3>${item.title}</h3>
+        <p>${item.action}</p>
+      </header>
+      <div class="video-block rollout-video-block">
+        <video
+          class="rollout-video"
+          preload="none"
+          playsinline
+          controls
+          data-video-src="${item.src}"
+          aria-label="${item.title} ArtiMo application rollout"
+        ></video>
+      </div>
+    </article>
   `;
 }
 
@@ -358,6 +400,66 @@ if (gallery) {
   } else {
     cards.forEach(loadModel);
   }
+}
+
+function loadRolloutVideo(video) {
+  if (!video || video.getAttribute("src")) return;
+  const source = video.dataset.videoSrc;
+  if (!source) return;
+  video.src = source;
+  video.load();
+}
+
+function unloadRolloutVideo(video) {
+  if (!video) return;
+  video.pause();
+  if (!video.getAttribute("src")) return;
+  video.removeAttribute("src");
+  video.load();
+}
+
+const rolloutGallery = document.querySelector("#rollout-gallery");
+if (rolloutGallery) {
+  rolloutGallery.innerHTML = ROLLOUTS.map(rolloutCard).join("");
+  const rolloutCards = Array.from(rolloutGallery.querySelectorAll("[data-rollout-card]"));
+  let activeIndex = 0;
+
+  const setActiveRollout = (nextCard) => {
+    const nextIndex = rolloutCards.indexOf(nextCard);
+    if (nextIndex < 0) return;
+    activeIndex = nextIndex;
+    rolloutCards.forEach((card, index) => {
+      const video = card.querySelector("video");
+      const isActive = index === activeIndex;
+      card.toggleAttribute("data-active", isActive);
+      if (isActive) loadRolloutVideo(video);
+      else unloadRolloutVideo(video);
+    });
+  };
+
+  setActiveRollout(rolloutCards[0]);
+
+  if ("IntersectionObserver" in window) {
+    const rolloutObserver = new IntersectionObserver(
+      (entries) => {
+        const visible = entries
+          .filter((entry) => entry.isIntersecting)
+          .sort((a, b) => b.intersectionRatio - a.intersectionRatio)[0];
+        if (visible) setActiveRollout(visible.target);
+      },
+      { root: rolloutGallery, threshold: [0.6, 0.8, 1] }
+    );
+    rolloutCards.forEach((card) => rolloutObserver.observe(card));
+  }
+
+  rolloutGallery.addEventListener("keydown", (event) => {
+    if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+    event.preventDefault();
+    const direction = event.key === "ArrowRight" ? 1 : -1;
+    const nextIndex = Math.max(0, Math.min(rolloutCards.length - 1, activeIndex + direction));
+    rolloutCards[nextIndex].scrollIntoView({ behavior: "smooth", block: "nearest", inline: "center" });
+    setActiveRollout(rolloutCards[nextIndex]);
+  });
 }
 
 function activateVideo(el) {

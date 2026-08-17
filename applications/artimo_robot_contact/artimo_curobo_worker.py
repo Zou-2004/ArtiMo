@@ -11,6 +11,7 @@ authoritative only for target-contact semantics and physical rollout.
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import math
 import sys
@@ -136,8 +137,16 @@ class Worker:
         kinematics["lock_joints"] = {"panda_finger_joint1": 0.005}
         for key in ("joint_names", "retract_config", "null_space_weight", "cspace_distance_weight"):
             kinematics["cspace"][key] = kinematics["cspace"][key][:7]
+        # Keep a task-neutral template so path-clearance requests can use the
+        # physical gripper aperture for their phase.  The old worker locked the
+        # fingers at 5 mm for every request, so an open 40 mm approach could
+        # miss a cabinet strike by more than 3 cm.
+        self.robot_dict_template = copy.deepcopy(robot_dict)
         robot = RobotConfig.from_dict(robot_dict, self.tensor_args)
         self.robot_config = robot
+        self.robot_configs_by_finger_joint_value: dict[int, RobotConfig] = {
+            5000: robot
+        }
         self.arm_joint_names = list(args.arm_joint_names)
         model_names = list(robot.kinematics.kinematics_config.joint_names)
         missing = set(self.arm_joint_names) - set(model_names)
@@ -148,7 +157,7 @@ class Worker:
         self.return_seeds = int(args.return_seeds)
         self.use_cuda_graph = bool(args.cuda_graph)
         self.self_collision = not bool(args.disable_self_collision)
-        self.solvers: dict[tuple[int, int, int], IKSolver] = {}
+        self.solvers: dict[tuple[int, int, int, int], IKSolver] = {}
         self.motion_num_graph_seeds = int(args.motion_num_graph_seeds)
         self.motion_num_trajopt_seeds = int(args.motion_num_trajopt_seeds)
         self.motion_timeout_s = float(args.motion_timeout_s)
@@ -241,16 +250,44 @@ class Worker:
         self.motion_generators[key] = motion_gen
         return motion_gen
 
-    def _solver(self, batch_size: int, worlds: list[WorldConfig]) -> IKSolver:
+    def _robot_config_for_finger_opening(
+        self, finger_opening_m: float | None
+    ) -> tuple[int, RobotConfig]:
+        """Return a Panda sphere model at the requested total finger opening."""
+        if finger_opening_m is None:
+            return 5000, self.robot_config
+        opening = min(0.08, max(0.0, float(finger_opening_m)))
+        finger_joint_value = 0.5 * opening
+        key = int(round(finger_joint_value * 1_000_000.0))
+        cached = self.robot_configs_by_finger_joint_value.get(key)
+        if cached is not None:
+            return key, cached
+        robot_dict = copy.deepcopy(self.robot_dict_template)
+        robot_dict["kinematics"]["lock_joints"] = {
+            "panda_finger_joint1": finger_joint_value
+        }
+        config = RobotConfig.from_dict(robot_dict, self.tensor_args)
+        self.robot_configs_by_finger_joint_value[key] = config
+        return key, config
+
+    def _solver(
+        self,
+        batch_size: int,
+        worlds: list[WorldConfig],
+        finger_opening_m: float | None = None,
+    ) -> IKSolver:
         obstacle_capacity = max((len(world.cuboid) for world in worlds), default=0)
         mesh_capacity = max((len(world.mesh) for world in worlds), default=0)
-        key = (batch_size, obstacle_capacity, mesh_capacity)
+        finger_key, robot_config = self._robot_config_for_finger_opening(
+            finger_opening_m
+        )
+        key = (finger_key, batch_size, obstacle_capacity, mesh_capacity)
         solver = self.solvers.get(key)
         if solver is not None:
             solver.world_coll_checker.load_batch_collision_model(worlds)
             return solver
         config = IKSolverConfig.load_from_robot_config(
-            self.robot_config,
+            robot_config,
             worlds,
             tensor_args=self.tensor_args,
             num_seeds=self.num_seeds,
@@ -766,7 +803,9 @@ class Worker:
                 "joint_path must be a non-empty matrix matching configured arm joints"
             )
         worlds = self._worlds(request, count=len(path))
-        solver = self._solver(len(path), worlds)
+        solver = self._solver(
+            len(path), worlds, request.get("finger_opening_m")
+        )
         path_full = self.tensor_args.to_device(path)
         minimum, by_sample = self._environment_clearance_m(
             solver, path_full, worlds
@@ -785,6 +824,7 @@ class Worker:
             "minimum_environment_clearance_m": minimum,
             "environment_clearance_by_sample_m": by_sample,
             "required_clearance_m": required,
+            "finger_opening_m": request.get("finger_opening_m"),
             "failed_sample": (
                 None
                 if minimum is None or minimum >= required
