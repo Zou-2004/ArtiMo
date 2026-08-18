@@ -8,7 +8,7 @@
       name="description"
       content="Project page for ArtiMo, an agent-driven framework for text-guided articulated mesh animation."
     />
-    <link rel="stylesheet" href="assets/css/site.css?v=20260803-1" />
+    <link rel="stylesheet" href="assets/css/site.css?v=20260818-1" />
   </head>
   <body>
     <header class="site-header">
@@ -18,8 +18,8 @@
           <a href="#abstract">Abstract</a>
           <a href="#method">Method</a>
           <a href="#demo">Demo</a>
-          <a href="#application">Application</a>
           <a href="#gallery">Gallery</a>
+          <a href="#application">Application</a>
           <button class="theme-toggle" type="button" data-theme-toggle aria-label="Switch to night mode">
             Night
           </button>
@@ -178,6 +178,18 @@
         </article>
       </section>
 
+      <section id="gallery" class="section">
+        <div class="section-heading">
+          <h2>Interactive 4D Mesh Gallery</h2>
+          <p>
+            Swipe through cases and switch between the aligned first-frame mesh,
+            the action condition, and the exported animated GLB. The initial
+            camera follows the coverage-loop selected view.
+          </p>
+        </div>
+        <div id="asset-gallery" class="model-grid" aria-live="polite"></div>
+      </section>
+
       <section id="application" class="section">
         <div class="section-heading">
           <h2>ArtiMo Application Rollouts</h2>
@@ -196,20 +208,8 @@
         ></div>
         <p class="gallery-swipe-hint">
           Swipe horizontally, or use the left and right arrow keys, to switch
-          between rollouts. Only the visible video is loaded.
+          between rollouts. Videos load as their cards enter the viewport.
         </p>
-      </section>
-
-      <section id="gallery" class="section">
-        <div class="section-heading">
-          <h2>Interactive 4D Mesh Gallery</h2>
-          <p>
-            Swipe through cases and switch between the aligned first-frame mesh,
-            the action condition, and the exported animated GLB. The initial
-            camera follows the coverage-loop selected view.
-          </p>
-        </div>
-        <div id="asset-gallery" class="model-grid" aria-live="polite"></div>
       </section>
     </main>
 
@@ -217,12 +217,18 @@
       <p>
         ArtiMo: Agent-Driven Articulated Mesh Animation.
       </p>
+      <p>
+        <a href="LICENSE" target="_blank" rel="noreferrer"
+          >Apache License 2.0</a
+        >
+        &middot; Third-party assets retain their original licenses.
+      </p>
     </footer>
 
     <script
       type="module"
       src="assets/js/model-viewer.min.js"
     ></script>
-    <script src="assets/js/gallery.js?v=20260519-9"></script>
+    <script src="assets/js/gallery.js?v=20260818-1"></script>
   </body>
 </html>

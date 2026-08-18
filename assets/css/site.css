@@ -398,6 +398,10 @@ a.author:hover {
   scroll-snap-align: center;
 }
 
+.rollout-grid .rollout-card {
+  flex-basis: min(920px, calc(100vw - 48px));
+}
+
 .rollout-video-block {
   padding: clamp(12px, 2vw, 24px);
   background: var(--video-bg);
@@ -408,6 +412,25 @@ a.author:hover {
   max-height: min(720px, 62vw);
   object-fit: contain;
   background: #000;
+}
+
+.rollout-speed {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 10px 12px 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.rollout-speed select {
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 4px 7px;
+  background: var(--paper);
+  color: var(--ink);
+  font: inherit;
 }
 
 .gallery-swipe-hint {

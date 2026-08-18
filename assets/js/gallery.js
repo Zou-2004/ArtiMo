@@ -185,19 +185,19 @@ const ROLLOUTS = [
     id: "kettle13",
     title: "Electric Kettle 13",
     action: "Press the button and open the kettle lid.",
-    src: "assets/videos/application/kettle13.mp4",
+    src: "assets/videos/application/kettle13-clear-20260817.mp4?v=20260818-clear",
   },
   {
     id: "door1",
     title: "Door 1",
     action: "Approach the door and open it from the front.",
-    src: "assets/videos/application/door1.mp4",
+    src: "assets/videos/application/door1-clear-20260818-validation.mp4?v=20260818-validation",
   },
   {
     id: "dishwasher1",
     title: "Dishwasher 1",
     action: "Approach the dishwasher and open the front door.",
-    src: "assets/videos/application/dishwasher1.mp4",
+    src: "assets/videos/application/dishwasher1-clear-20260817.mp4?v=20260818-clear",
   },
 ];
 
@@ -283,6 +283,16 @@ function rolloutCard(item) {
           data-video-src="${item.src}"
           aria-label="${item.title} ArtiMo application rollout"
         ></video>
+        <label class="rollout-speed">
+          Playback speed
+          <select data-rollout-speed aria-label="${item.title} playback speed">
+            <option value="0.5">0.5×</option>
+            <option value="1" selected>1×</option>
+            <option value="1.5">1.5×</option>
+            <option value="2">2×</option>
+            <option value="3">3×</option>
+          </select>
+        </label>
       </div>
     </article>
   `;
@@ -407,6 +417,8 @@ function loadRolloutVideo(video) {
   const source = video.dataset.videoSrc;
   if (!source) return;
   video.src = source;
+  const speed = video.closest("[data-rollout-card]")?.querySelector("[data-rollout-speed]");
+  if (speed) video.playbackRate = Number(speed.value) || 1;
   video.load();
 }
 
@@ -429,15 +441,20 @@ if (rolloutGallery) {
     if (nextIndex < 0) return;
     activeIndex = nextIndex;
     rolloutCards.forEach((card, index) => {
-      const video = card.querySelector("video");
       const isActive = index === activeIndex;
       card.toggleAttribute("data-active", isActive);
-      if (isActive) loadRolloutVideo(video);
-      else unloadRolloutVideo(video);
     });
   };
 
   setActiveRollout(rolloutCards[0]);
+
+  rolloutGallery.addEventListener("change", (event) => {
+    const speed = event.target.closest("[data-rollout-speed]");
+    if (!speed) return;
+    const card = speed.closest("[data-rollout-card]");
+    const video = card?.querySelector("video");
+    if (video) video.playbackRate = Number(speed.value) || 1;
+  });
 
   if ("IntersectionObserver" in window) {
     const rolloutObserver = new IntersectionObserver(
@@ -446,10 +463,21 @@ if (rolloutGallery) {
           .filter((entry) => entry.isIntersecting)
           .sort((a, b) => b.intersectionRatio - a.intersectionRatio)[0];
         if (visible) setActiveRollout(visible.target);
+
+        for (const entry of entries) {
+          const video = entry.target.querySelector("video");
+          if (entry.isIntersecting) {
+            loadRolloutVideo(video);
+          } else if (rolloutCards.indexOf(entry.target) !== activeIndex) {
+            unloadRolloutVideo(video);
+          }
+        }
       },
-      { root: rolloutGallery, threshold: [0.6, 0.8, 1] }
+      { root: rolloutGallery, rootMargin: "72px", threshold: [0, 0.05, 0.6, 1] }
     );
     rolloutCards.forEach((card) => rolloutObserver.observe(card));
+  } else {
+    rolloutCards.forEach((card) => loadRolloutVideo(card.querySelector("video")));
   }
 
   rolloutGallery.addEventListener("keydown", (event) => {

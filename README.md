@@ -138,6 +138,14 @@ ArtiMo/
   examples/     Small example assets.
 ```
 
+## License
+
+The ArtiMo source code is released under the
+[Apache License 2.0](LICENSE).
+
+Third-party assets and datasets retain their original licenses. See the
+corresponding license files and source metadata.
+
 <!-- ## Notes
 
 - Do not commit `.env` or API keys.
