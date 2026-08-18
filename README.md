@@ -131,6 +131,46 @@ ffmpeg -version
 ffprobe -version
 ```
 
+The robot-contact requirements above do not install cuRobo. cuRobo is an
+optional GPU IK and motion-planning backend. If it is unavailable, the
+application automatically uses the PyBullet/Bullet backend instead; the
+workflow remains functional but placement and dense IK can be substantially
+slower.
+
+### Optional GPU IK backend (cuRobo)
+
+To reproduce the GPU planning path, install cuRobo in a separate Python
+environment with a CUDA-enabled PyTorch build, following the
+[cuRobo installation instructions](https://curobo.org/get_started/1_install_instructions.html).
+The cuRobo environment must be able to import `curobo`, `torch`, and the
+matching CUDA runtime. Keep the CUDA, PyTorch, and cuRobo versions compatible;
+the application does not download or install any of them automatically.
+
+The cuRobo library installation itself is typically:
+
+```bash
+git clone https://github.com/NVlabs/curobo.git
+cd curobo
+python -m pip install -e . --no-build-isolation
+```
+
+Install a compatible CUDA-enabled PyTorch build in that environment first.
+cuRobo documents Linux as the primary platform and Windows as experimental;
+the CPU fallback remains available when the GPU environment is not usable.
+
+On the reference Windows setup, the application discovers the optional
+backend at:
+
+```text
+C:\ProgramData\miniforge3\envs\artimo-curobo\python.exe
+```
+
+If that executable is not present (or on a system with a different layout),
+the application intentionally falls back to Bullet CPU IK. The Panda URDF and
+meshes themselves are bundled in
+`applications/artimo_robot_contact/assets/panda/`; they are not downloaded at
+runtime.
+
 ### 2. Run the complete workflow
 
 From the repository root, run this command. Replace only the two input paths:
