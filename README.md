@@ -16,9 +16,6 @@ grounding, compiles an executable animation plan, refines the plan through visua
 diagnosis, and exports trajectories, animated GLBs, and optional Isaac Sim
 execution bundles.
 
-Run commands from the repository root so internal `tools/...` paths resolve
-locally.
-
 ## Getting Started
 
 Useful links:
