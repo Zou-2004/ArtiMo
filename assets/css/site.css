@@ -591,7 +591,7 @@ model-viewer:active {
 .video-card h3 {
   padding: 16px 18px;
   border-bottom: 1px solid var(--line);
-  background: #fbfbf9;
+  background: var(--panel-bg);
 }
 
 .paired-videos {
